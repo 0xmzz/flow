@@ -47,6 +47,12 @@ DEFAULTS = {
     "paste_mode": "clipboard",     # "clipboard" (fast, restores clipboard) or "type"
     "mute_output_while_recording": True,  # silence speakers during dictation
     "min_duration_s": 0.3,
+    "save_last_audio": False,      # debug: write each recording to last.wav for tuning
+    # ASR tuning — lower vad thresholds and gain help quiet/whispered speech.
+    "vad_filter": True,
+    "vad_threshold": 0.5,          # lower = keeps quieter speech (0.1-0.3 for whisper)
+    "beam_size": 5,
+    "normalize_gain": False,       # peak-normalize audio before ASR
 }
 
 CLEANUP_PROMPT = (
@@ -167,6 +173,16 @@ def llm_cleanup(text, cfg):
         return text
 
 
+def save_wav(path, audio, sample_rate):
+    import wave
+    pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype("<i2")
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sample_rate)
+        w.writeframes(pcm.tobytes())
+
+
 def foreground_window():
     try:
         import ctypes
@@ -253,10 +269,19 @@ class Flow:
                 dur = len(audio) / self.cfg["sample_rate"]
                 if dur < self.cfg["min_duration_s"]:
                     return
+                if self.cfg.get("save_last_audio"):
+                    save_wav(APP_DIR / "last.wav", audio, self.cfg["sample_rate"])
+                if self.cfg.get("normalize_gain"):
+                    peak = float(np.abs(audio).max()) or 1.0
+                    audio = (audio / peak * 0.95).astype(np.float32)
                 t0 = time.time()
+                vad_params = ({"threshold": self.cfg["vad_threshold"]}
+                              if self.cfg.get("vad_filter") else None)
                 segments, _ = self.model.transcribe(
                     audio, language=self.cfg["language"],
-                    vad_filter=True, beam_size=5,
+                    vad_filter=self.cfg.get("vad_filter", True),
+                    vad_parameters=vad_params,
+                    beam_size=self.cfg.get("beam_size", 5),
                 )
                 text = " ".join(s.text.strip() for s in segments).strip()
                 asr_t = time.time() - t0
@@ -269,11 +294,20 @@ class Flow:
             finally:
                 self.set_icon("idle")
 
+    def _on_key(self, event):
+        # Match the exact key NAME ("right ctrl"), not the scan code — left and
+        # right ctrl share scan code 29, so on_press_key fires for both.
+        if event.name != self.cfg["hotkey"]:
+            return
+        if event.event_type == keyboard.KEY_DOWN:
+            self.on_press()
+        elif event.event_type == keyboard.KEY_UP:
+            self.on_release()
+
     def run(self):
-        # Never suppress: suppressing a modifier key (e.g. right ctrl) eats it
-        # system-wide and breaks every other app's shortcuts.
-        keyboard.on_press_key(self.cfg["hotkey"], lambda _: self.on_press())
-        keyboard.on_release_key(self.cfg["hotkey"], lambda _: self.on_release())
+        # Raw hook (never suppresses) so we can distinguish left vs right ctrl
+        # and never eat the key from other apps.
+        keyboard.hook(self._on_key)
         try:
             import pystray
             from pystray import MenuItem
