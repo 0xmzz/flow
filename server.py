@@ -15,6 +15,7 @@ Auth: Bearer token (server.token) on everything except /health and /.
 
 import json
 import re
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from store import decode_any
@@ -115,7 +116,11 @@ def make_server(flow, host, port, token):
             if path == "/api/history":
                 m = re.search(r"limit=(\d+)", self.path)
                 limit = int(m.group(1)) if m else 200
-                return self._json(200, {"entries": flow.store.read(limit=limit)})
+                sm = re.search(r"since=([^&]+)", self.path)
+                since = urllib.parse.unquote(sm.group(1)) if sm else None
+                entries = flow.store.read(limit=limit, since=since)
+                cursor = entries[-1]["ts"] if entries else since
+                return self._json(200, {"entries": entries, "cursor": cursor})
             if path == "/api/stats":
                 return self._json(200, flow.store.stats())
             if path in ("", "/"):

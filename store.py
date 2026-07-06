@@ -102,12 +102,15 @@ class TranscriptStore:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         return entry
 
-    def read(self, limit=None):
+    def read(self, limit=None, since=None):
         if not self.history_path.exists():
             return []
         with self._lock:
             lines = self.history_path.read_text(encoding="utf-8").splitlines()
         entries = [json.loads(l) for l in lines if l.strip()]
+        if since:
+            # ISO-8601 UTC timestamps sort lexicographically -> string compare is fine.
+            entries = [e for e in entries if e.get("ts", "") > since]
         return entries[-limit:] if limit else entries
 
     def stats(self):
