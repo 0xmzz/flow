@@ -38,6 +38,18 @@ class BubbleService : Service() {
     companion object {
         const val SAMPLE_RATE = 16000
         var running = false
+        private var self: BubbleService? = null
+
+        /** Show the bubble only while a keyboard is up (accessibility tells us).
+         *  If the accessibility service is off we can't know - always show. */
+        fun refreshVisibility() {
+            val s = self ?: return
+            val show = !FlowAccessibilityService.isEnabled() ||
+                FlowAccessibilityService.imeVisible() || s.recording
+            s.main.post {
+                s.bubble?.visibility = if (show) View.VISIBLE else View.GONE
+            }
+        }
     }
 
     private lateinit var wm: WindowManager
@@ -59,13 +71,16 @@ class BubbleService : Service() {
     override fun onCreate() {
         super.onCreate()
         running = true
+        self = this
         startInForeground()
         wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         addBubble()
+        refreshVisibility()
     }
 
     override fun onDestroy() {
         running = false
+        if (self === this) self = null
         stopRecording(discard = true)
         bubble?.let { runCatching { wm.removeView(it) } }
         super.onDestroy()
@@ -216,8 +231,9 @@ class BubbleService : Service() {
                 setTint(v, idle)
                 if (text.isNullOrBlank()) {
                     toast("Flow: transcription failed")
-                } else if (!FlowAccessibilityService.insertText(this, text)) {
-                    toast("Flow: copied — enable the accessibility service to auto-insert")
+                } else {
+                    val fail = FlowAccessibilityService.insertText(this, text)
+                    if (fail != null) toast("Flow: $fail")
                 }
             }
         }

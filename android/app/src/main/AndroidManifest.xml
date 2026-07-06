@@ -10,6 +10,7 @@
 
     <application
         android:label="Flow"
+        android:allowBackup="true"
         android:icon="@android:drawable/ic_btn_speak_now"
         android:usesCleartextTraffic="true"
         android:theme="@android:style/Theme.Material.Light">
