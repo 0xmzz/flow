@@ -119,36 +119,10 @@ class Router:
             return f"I couldn't find {name} to open."
 
     def _fallback(self, text):
-        import requests
-        c = self.cfg["cleanup"]
-        system = ("You are a terse voice assistant. Answer in one or two spoken "
-                  "sentences, no markdown.")
-        try:
-            if c["provider"] == "ollama":  # fully local on the 5090
-                r = requests.post(
-                    (c["base_url"] or "http://127.0.0.1:11434") + "/api/chat",
-                    json={"model": c["model"], "stream": False, "think": False,
-                          "keep_alive": -1,
-                          "messages": [{"role": "system", "content": system},
-                                       {"role": "user", "content": text}]},
-                    timeout=30,
-                )
-                return r.json()["message"]["content"].strip()
-            key = c.get("api_key") or os.environ.get(c["api_key_env"], "")
-            if not key:
-                return "I don't have a skill for that yet."
-            r = requests.post(
-                (c.get("base_url") or "https://api.anthropic.com") + "/v1/messages",
-                headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
-                json={
-                    "model": c["model"],
-                    "max_tokens": 200,
-                    "system": system,
-                    "messages": [{"role": "user", "content": text}],
-                    **c.get("extra_body", {}),
-                },
-                timeout=15,
-            )
-            return r.json()["content"][0]["text"].strip()
-        except Exception:
-            return "I couldn't reach the assistant."
+        import llm
+        out, _ = llm.chain(
+            self.cfg["cleanup"],
+            "You are a terse voice assistant. Answer in one or two spoken "
+            "sentences, no markdown.",
+            text, max_tokens=200)
+        return out or "I couldn't reach the assistant."

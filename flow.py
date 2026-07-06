@@ -27,6 +27,7 @@ import pyperclip
 import sounddevice as sd
 from faster_whisper import WhisperModel
 
+import llm
 from store import TranscriptStore, resample_linear, save_wav
 from commands import Router, speak
 
@@ -49,6 +50,9 @@ DEFAULTS = {
         "api_key_env": "FLOW_API_KEY",
         "api_key": "",             # inline key (config.json is gitignored); wins over env
         "extra_body": {},          # merged into the API request (e.g. z.ai thinking off)
+        # Same-shape block tried when the local model fails (Ollama down, etc.):
+        # {"provider": "anthropic", "base_url": ..., "model": ..., "api_key": ...}
+        "fallback": {},
         # App-aware styling: match against the foreground window title
         # (case-insensitive substring). mode "matched" = only run the LLM pass
         # for windows that match a profile (keeps raw speed elsewhere);
@@ -192,76 +196,21 @@ class OutputMuter:
 
 
 def llm_cleanup(text, cfg, window=None):
-    import requests
-
     c = cfg["cleanup"]
     style = match_profile(cfg, window)
     if style is None and c.get("mode", "matched") == "matched":
-        return text  # unmatched app -> raw fast path, no API call
-    key = c.get("api_key") or os.environ.get(c["api_key_env"], "")
-    if not key and c["provider"] != "ollama":
-        return text
+        return text  # unmatched app -> raw fast path, no LLM call
     system = CLEANUP_PROMPT
     if style:
         system += f"\nTarget style for this app ({window}): {style}"
     t0 = time.time()
-    try:
-        if c["provider"] == "ollama":
-            # Fully local on the 5090 — native API so think:false is honored
-            # (the OpenAI-compat endpoint drops it) and keep_alive pins the
-            # model warm in VRAM next to Whisper.
-            r = requests.post(
-                (c["base_url"] or "http://127.0.0.1:11434") + "/api/chat",
-                json={
-                    "model": c["model"], "stream": False, "think": False,
-                    "keep_alive": -1,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": text},
-                    ],
-                    **c.get("extra_body", {}),
-                },
-                timeout=30,
-            )
-            r.raise_for_status()
-            out = r.json()["message"]["content"].strip()
-        elif c["provider"] == "anthropic":
-            body = {
-                "model": c["model"],
-                "max_tokens": 2048,
-                "system": system,
-                "messages": [{"role": "user", "content": text}],
-                **c.get("extra_body", {}),
-            }
-            r = requests.post(
-                (c["base_url"] or "https://api.anthropic.com") + "/v1/messages",
-                headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
-                json=body, timeout=15,
-            )
-            r.raise_for_status()
-            out = r.json()["content"][0]["text"].strip()
-        else:  # openai-compatible
-            body = {
-                "model": c["model"],
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": text},
-                ],
-                **c.get("extra_body", {}),
-            }
-            r = requests.post(
-                (c["base_url"] or "https://api.openai.com/v1") + "/chat/completions",
-                headers={"Authorization": f"Bearer {key}"},
-                json=body, timeout=15,
-            )
-            r.raise_for_status()
-            out = r.json()["choices"][0]["message"]["content"].strip()
-        print(f"[cleanup] {'styled:' + window if style else 'neutral'} "
-              f"in {time.time() - t0:.2f}s")
-        return out or text
-    except Exception as e:
-        print(f"[cleanup] failed, using raw transcript: {e}")
+    out, lane = llm.chain(c, system, text)
+    if out is None:
+        print("[cleanup] all providers failed, using raw transcript")
         return text
+    print(f"[cleanup] {'styled:' + window if style else 'neutral'} "
+          f"via {lane} in {time.time() - t0:.2f}s")
+    return out
 
 
 def foreground_window():
