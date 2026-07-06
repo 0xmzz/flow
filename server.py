@@ -152,7 +152,9 @@ def make_server(flow, host, port, token):
 
         def do_GET(self):
             path = self.path.split("?")[0].rstrip("/")
-            if path in ("", "/health"):
+            if path == "":
+                return self._html(200, _history_page())
+            if path == "/health":
                 return self._json(200, {"ok": True, "model": flow.cfg["model"]})
             if path == "/apk/version":
                 from pathlib import Path
@@ -192,8 +194,6 @@ def make_server(flow, host, port, token):
                 return self._json(200, {"entries": entries, "cursor": cursor})
             if path == "/api/stats":
                 return self._json(200, flow.store.stats())
-            if path in ("", "/"):
-                return self._html(200, _history_page())
             return self._json(404, {"error": "not found"})
 
         def log_message(self, *a):
@@ -223,6 +223,8 @@ def _history_page():
  <span class=stat id=stat></span></header>
 <div id=list></div>
 <script>
+ const hm=location.hash.match(/tok=([^&]+)/);
+ if(hm){localStorage.setItem('flow_tok',decodeURIComponent(hm[1]));history.replaceState(null,'',location.pathname)}
  const tok=localStorage.getItem('flow_tok')||'';document.getElementById('tok').value=tok;
  function esc(s){return (s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
  async function load(){

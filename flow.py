@@ -291,9 +291,26 @@ class Overlay:
                          font=("Segoe UI", 10))
         label.pack(side="left", padx=(0, 14))
         root.update_idletasks()
-        x = (root.winfo_screenwidth() - root.winfo_reqwidth()) // 2
-        y = root.winfo_screenheight() - 110
-        root.geometry(f"+{x}+{y}")
+
+        def place():
+            # Bottom-center of the ACTIVE window — follows whichever monitor
+            # and app you're dictating into.
+            w = root.winfo_reqwidth()
+            try:
+                import ctypes
+                from ctypes import wintypes
+                h = ctypes.windll.user32.GetForegroundWindow()
+                r = wintypes.RECT()
+                if h and ctypes.windll.user32.GetWindowRect(h, ctypes.byref(r)) \
+                        and r.right - r.left > 200 and r.bottom - r.top > 150:
+                    x = (r.left + r.right) // 2 - w // 2
+                    y = r.bottom - 90
+                    root.geometry(f"+{x}+{y}")
+                    return
+            except Exception:
+                pass
+            x = (root.winfo_screenwidth() - w) // 2
+            root.geometry(f"+{x}+{root.winfo_screenheight() - 110}")
 
         def poll():
             try:
@@ -302,6 +319,7 @@ class Overlay:
                     if state == "rec":
                         canvas.itemconfig(dot, fill="#dc3c3c")
                         label.config(text="Listening")
+                        place()
                         root.deiconify()
                     elif state == "work":
                         canvas.itemconfig(dot, fill="#f0b428")
@@ -619,7 +637,9 @@ class Flow:
                 "flow", make_icon("idle"), "Flow — hold %s to dictate" % self.cfg["hotkey"],
                 menu=pystray.Menu(
                     MenuItem("Open history page",
-                             lambda: webbrowser.open(f"http://127.0.0.1:{port}/")),
+                             lambda: webbrowser.open(
+                                 f"http://127.0.0.1:{port}/#tok="
+                                 + self.cfg["server"]["token"])),
                     MenuItem("Edit config (restart to apply)",
                              lambda: os.startfile(str(CONFIG_PATH))),
                     MenuItem("Open data folder",
