@@ -199,14 +199,33 @@ def llm_cleanup(text, cfg, window=None):
     if style is None and c.get("mode", "matched") == "matched":
         return text  # unmatched app -> raw fast path, no API call
     key = c.get("api_key") or os.environ.get(c["api_key_env"], "")
-    if not key:
+    if not key and c["provider"] != "ollama":
         return text
     system = CLEANUP_PROMPT
     if style:
         system += f"\nTarget style for this app ({window}): {style}"
     t0 = time.time()
     try:
-        if c["provider"] == "anthropic":
+        if c["provider"] == "ollama":
+            # Fully local on the 5090 — native API so think:false is honored
+            # (the OpenAI-compat endpoint drops it) and keep_alive pins the
+            # model warm in VRAM next to Whisper.
+            r = requests.post(
+                (c["base_url"] or "http://127.0.0.1:11434") + "/api/chat",
+                json={
+                    "model": c["model"], "stream": False, "think": False,
+                    "keep_alive": -1,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": text},
+                    ],
+                    **c.get("extra_body", {}),
+                },
+                timeout=30,
+            )
+            r.raise_for_status()
+            out = r.json()["message"]["content"].strip()
+        elif c["provider"] == "anthropic":
             body = {
                 "model": c["model"],
                 "max_tokens": 2048,
@@ -307,9 +326,27 @@ class Flow:
         )
         # Warm up so the first real dictation isn't slow.
         self.model.transcribe(np.zeros(self.cfg["sample_rate"], dtype=np.float32))
+        if self.cfg["cleanup"]["enabled"] and self.cfg["cleanup"]["provider"] == "ollama":
+            threading.Thread(target=self._warm_ollama, daemon=True).start()
         print(f"Model ready in {time.time() - t0:.1f}s. "
               f"Hold [{self.cfg['hotkey']}] to dictate, "
               f"[{self.cfg.get('command_hotkey')}] for a command.")
+
+    def _warm_ollama(self):
+        import requests
+        c = self.cfg["cleanup"]
+        try:
+            t0 = time.time()
+            requests.post(
+                (c["base_url"] or "http://127.0.0.1:11434") + "/api/chat",
+                json={"model": c["model"], "stream": False, "think": False,
+                      "keep_alive": -1,
+                      "messages": [{"role": "user", "content": "hi"}]},
+                timeout=300,
+            ).raise_for_status()
+            print(f"[cleanup] local model {c['model']} warm in {time.time()-t0:.1f}s")
+        except Exception as e:
+            print(f"[cleanup] warmup failed ({e}) — is Ollama running?")
 
     def set_icon(self, state):
         if self.tray:
