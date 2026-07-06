@@ -29,10 +29,17 @@ class FlowAccessibilityService : AccessibilityService() {
                 ?: return "Accessibility service is OFF - enable Flow in Settings > Accessibility"
             val node = svc.findEditTarget()
                 ?: return "No text field focused - tap into a field first (text copied)"
-            // An empty field reports its HINT ("Message"...) as text — ignore it.
+            // PASTE first: inserts at the cursor like a human paste — immune to
+            // the hint-text-as-content quirk (WhatsApp's "Message") and honors
+            // cursor position instead of clobbering the whole field.
+            node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+            if (node.performAction(AccessibilityNodeInfo.ACTION_PASTE))
+                return null
+            // Fallback: replace-with-merge, guarding against hint text.
             val existing = when {
                 node.isShowingHintText -> ""
                 node.text?.toString() == node.hintText?.toString() -> ""
+                node.textSelectionEnd <= 0 && !node.text.isNullOrEmpty() -> ""
                 else -> node.text?.toString().orEmpty()
             }
             val merged = when {
@@ -44,10 +51,6 @@ class FlowAccessibilityService : AccessibilityService() {
             args.putCharSequence(
                 AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, merged)
             if (node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args))
-                return null
-            // Some fields refuse SET_TEXT; try focus + paste of the clipboard.
-            node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
-            if (node.performAction(AccessibilityNodeInfo.ACTION_PASTE))
                 return null
             return "This app blocks text insertion (text copied - long-press to paste)"
         }

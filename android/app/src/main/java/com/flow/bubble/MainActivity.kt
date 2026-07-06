@@ -112,6 +112,7 @@ class MainActivity : Activity() {
         val acc = if (FlowAccessibilityService.isEnabled()) "ON" else
             "OFF - enable 'Flow text inserter' in Accessibility settings"
         val bub = if (BubbleService.running) "running" else "stopped"
-        status.text = "Accessibility: $acc\nBubble: $bub"
+        val v = packageManager.getPackageInfo(packageName, 0).longVersionCode
+        status.text = "Flow v$v\nAccessibility: $acc\nBubble: $bub"
     }
 }
