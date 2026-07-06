@@ -21,18 +21,28 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from store import decode_any
 
 
-def _parse_multipart_file(body, content_type):
-    """Extract the first file part's bytes from a multipart/form-data body."""
+def _parse_multipart(body, content_type):
+    """Parse multipart/form-data -> (first file part's bytes, text fields dict)."""
     m = re.search(r"boundary=([^;]+)", content_type)
     if not m:
-        return None
+        return None, {}
     boundary = ("--" + m.group(1).strip().strip('"')).encode()
+    file_bytes, fields = None, {}
     for part in body.split(boundary):
-        if b"Content-Disposition" in part and b"filename=" in part:
-            idx = part.find(b"\r\n\r\n")
-            if idx != -1:
-                return part[idx + 4:].rstrip(b"\r\n")
-    return None
+        if b"Content-Disposition" not in part:
+            continue
+        idx = part.find(b"\r\n\r\n")
+        if idx == -1:
+            continue
+        head, content = part[:idx], part[idx + 4:].rstrip(b"\r\n")
+        if b"filename=" in head:
+            if file_bytes is None:
+                file_bytes = content
+        else:
+            nm = re.search(rb'name="([^"]+)"', head)
+            if nm:
+                fields[nm.group(1).decode()] = content.decode("utf-8", "replace")
+    return file_bytes, fields
 
 
 def make_server(flow, host, port, token):
@@ -100,11 +110,29 @@ def make_server(flow, host, port, token):
             if path == "/v1/audio/transcriptions":
                 ctype = self.headers.get("Content-Type", "")
                 body = self._body()
-                audio = (_parse_multipart_file(body, ctype)
-                         if "multipart" in ctype else body)
+                if "multipart" in ctype:
+                    audio, fields = _parse_multipart(body, ctype)
+                else:
+                    audio, fields = body, {}
                 if not audio:
                     return self._json(400, {"error": "no audio file in request"})
-                return self._transcribe(audio, "remote", device)
+                try:
+                    a, sr = decode_any(audio)
+                except Exception as e:
+                    return self._json(400, {"error": f"bad audio: {e}"})
+                text, _ = flow.transcribe_and_store(
+                    a, sample_rate=sr, source="remote", window=device)
+                # Strict OpenAI shape: plain text when asked, else {"text"} ONLY —
+                # clients paste extra fields straight into the user's message.
+                if fields.get("response_format") == "text":
+                    raw = (text or "").encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                    return
+                return self._json(200, {"text": text})
             return self._json(404, {"error": "not found"})
 
         def do_GET(self):
