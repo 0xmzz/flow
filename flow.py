@@ -274,10 +274,10 @@ class Flow:
                 self.set_icon("idle")
 
     def run(self):
-        keyboard.on_press_key(self.cfg["hotkey"], lambda _: self.on_press(),
-                              suppress=True)
-        keyboard.on_release_key(self.cfg["hotkey"], lambda _: self.on_release(),
-                                suppress=True)
+        # Never suppress: suppressing a modifier key (e.g. right ctrl) eats it
+        # system-wide and breaks every other app's shortcuts.
+        keyboard.on_press_key(self.cfg["hotkey"], lambda _: self.on_press())
+        keyboard.on_release_key(self.cfg["hotkey"], lambda _: self.on_release())
         try:
             import pystray
             from pystray import MenuItem
