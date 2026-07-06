@@ -73,7 +73,8 @@ DEFAULTS = {
     },
     "paste_mode": "clipboard",     # "clipboard" (fast, restores clipboard) or "type"
     "mute_output_while_recording": True,  # silence speakers during dictation
-    "min_duration_s": 0.3,
+    "min_duration_s": 0.6,         # includes the pre-roll
+    "pre_roll_s": 0.4,             # mic ring buffer prepended on press
     "overlay": True,               # on-screen listening/transcribing pill
     "save_last_audio": False,      # debug: write each recording to last.wav for tuning
     # ASR tuning — the VAD gate is what drops quiet/whispered audio; keep it on
@@ -153,18 +154,52 @@ def _persist_config(patch):
 
 
 class Recorder:
-    def __init__(self, sample_rate):
+    """Always-open mic stream with a pre-roll ring buffer.
+
+    Opening the stream on keypress loses ~100-300ms — the first syllable.
+    Instead the stream runs permanently: while idle, audio goes into a small
+    rolling buffer (RAM only, discarded continuously); on start() the last
+    `pre_roll_s` seconds are prepended, so the recording begins in the past.
+    """
+
+    def __init__(self, sample_rate, pre_roll_s=0.4):
+        from collections import deque
         self.sample_rate = sample_rate
+        self.pre_roll = int(pre_roll_s * sample_rate)
         self._chunks = []
+        self._ring = deque()
+        self._ring_samples = 0
+        self._recording = False
         self._stream = None
+        self._open()
+
+    def _open(self):
+        try:
+            self._stream = sd.InputStream(
+                samplerate=self.sample_rate, channels=1, dtype="float32",
+                callback=self._on_audio,
+            )
+            self._stream.start()
+        except Exception as e:
+            self._stream = None
+            print(f"[mic] open failed: {e}")
+
+    def _on_audio(self, indata, *_):
+        chunk = indata.copy()
+        if self._recording:
+            self._chunks.append(chunk)
+        else:
+            self._ring.append(chunk)
+            self._ring_samples += len(chunk)
+            while (self._ring and
+                   self._ring_samples - len(self._ring[0]) >= self.pre_roll):
+                self._ring_samples -= len(self._ring.popleft())
 
     def start(self):
-        self._chunks = []
-        self._stream = sd.InputStream(
-            samplerate=self.sample_rate, channels=1, dtype="float32",
-            callback=lambda indata, *_: self._chunks.append(indata.copy()),
-        )
-        self._stream.start()
+        if self._stream is None or not self._stream.active:
+            self._open()  # recover from device loss
+        self._chunks = list(self._ring)  # pre-roll: capture speech before the press
+        self._recording = True
 
     def snapshot(self):
         """Audio captured so far (recording continues)."""
@@ -174,9 +209,7 @@ class Recorder:
         return np.concatenate(chunks).flatten()
 
     def stop(self):
-        self._stream.stop()
-        self._stream.close()
-        self._stream = None
+        self._recording = False
         if not self._chunks:
             return np.zeros(0, dtype=np.float32)
         return np.concatenate(self._chunks).flatten()
@@ -495,7 +528,8 @@ def paste_text(text, mode, restore=True):
 class Flow:
     def __init__(self):
         self.cfg = load_config()
-        self.recorder = Recorder(self.cfg["sample_rate"])
+        self.recorder = Recorder(self.cfg["sample_rate"],
+                                 pre_roll_s=self.cfg.get("pre_roll_s", 0.4))
         self.muter = OutputMuter()
         self.muter.ensure_unmuted()
         self.recording = False
@@ -553,10 +587,10 @@ class Flow:
             return
         self.active_mode = mode
         self.recording = True
+        self.recorder.start()  # first — capture must not wait on mute/icon
         self.set_icon("rec")
         if self.cfg.get("mute_output_while_recording"):
             self.muter.mute()
-        self.recorder.start()
         if (mode == "dictate" and self.cfg["streaming"]["enabled"]):
             # Live typing only where no style profile applies — styled text
             # must wait for the whole utterance.
