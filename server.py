@@ -87,6 +87,15 @@ def make_server(flow, host, port, token):
             device = self.headers.get("X-Device", "phone")
             if path == "/transcribe":
                 return self._transcribe(self._body(), "remote", device)
+            if path == "/command":
+                try:
+                    audio, sr = decode_any(self._body())
+                except Exception as e:
+                    return self._json(400, {"error": f"bad audio: {e}"})
+                text, _ = flow.transcribe_and_store(
+                    audio, sample_rate=sr, source="remote-command", window=device)
+                response = flow.router.handle(text) if text else ""
+                return self._json(200, {"text": text, "response": response})
             if path == "/v1/audio/transcriptions":
                 ctype = self.headers.get("Content-Type", "")
                 body = self._body()

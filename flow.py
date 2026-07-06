@@ -28,12 +28,14 @@ import sounddevice as sd
 from faster_whisper import WhisperModel
 
 from store import TranscriptStore, resample_linear, save_wav
+from commands import Router, speak
 
 APP_DIR = Path(__file__).parent
 CONFIG_PATH = APP_DIR / "config.json"
 
 DEFAULTS = {
-    "hotkey": "f8",                # hold to record, release to transcribe
+    "hotkey": "f8",                # hold to dictate (paste transcript at cursor)
+    "command_hotkey": "right shift",  # hold to issue a spoken COMMAND (acts + speaks back)
     "model": "large-v3",           # full v3 handles whispered/quiet speech better than turbo
     "device": "cuda",
     "compute_type": "float16",
@@ -249,8 +251,10 @@ class Flow:
         self.recorder = Recorder(self.cfg["sample_rate"])
         self.muter = OutputMuter()
         self.recording = False
+        self.active_mode = "dictate"
         self.busy = threading.Lock()
         self.model_lock = threading.Lock()  # serialize GPU across hotkey + server
+        self.router = Router(self.cfg)
         self.tray = None
         h = self.cfg["history"]
         self.store = TranscriptStore(
@@ -265,15 +269,17 @@ class Flow:
         # Warm up so the first real dictation isn't slow.
         self.model.transcribe(np.zeros(self.cfg["sample_rate"], dtype=np.float32))
         print(f"Model ready in {time.time() - t0:.1f}s. "
-              f"Hold [{self.cfg['hotkey']}] to dictate.")
+              f"Hold [{self.cfg['hotkey']}] to dictate, "
+              f"[{self.cfg.get('command_hotkey')}] for a command.")
 
     def set_icon(self, state):
         if self.tray:
             self.tray.icon = make_icon(state)
 
-    def on_press(self):
+    def on_press(self, mode="dictate"):
         if self.recording or self.busy.locked():
             return
+        self.active_mode = mode
         self.recording = True
         self.set_icon("rec")
         if self.cfg.get("mute_output_while_recording"):
@@ -286,7 +292,8 @@ class Flow:
         self.recording = False
         audio = self.recorder.stop()
         self.muter.restore()
-        threading.Thread(target=self.process, args=(audio,), daemon=True).start()
+        target = self.process_command if self.active_mode == "command" else self.process
+        threading.Thread(target=target, args=(audio,), daemon=True).start()
 
     def transcribe_and_store(self, audio, sample_rate=None, source="pc-hotkey",
                              window=None):
@@ -341,13 +348,35 @@ class Flow:
             finally:
                 self.set_icon("idle")
 
+    def process_command(self, audio):
+        with self.busy:
+            self.set_icon("work")
+            try:
+                dur = len(audio) / self.cfg["sample_rate"]
+                if dur < self.cfg["min_duration_s"]:
+                    return
+                text, _ = self.transcribe_and_store(
+                    audio, source="pc-command", window=foreground_window())
+                if not text:
+                    return
+                print(f"[command] heard: {text}")
+                response = self.router.handle(text)
+                print(f"[command] -> {response}")
+                speak(response)
+            finally:
+                self.set_icon("idle")
+
     def _on_key(self, event):
-        # Match the exact key NAME ("right ctrl"), not the scan code — left and
-        # right ctrl share scan code 29, so on_press_key fires for both.
-        if event.name != self.cfg["hotkey"]:
+        # Match the exact key NAME, not the scan code — left and right ctrl share
+        # scan code 29, so matching by name keeps the two hotkeys distinct.
+        if event.name == self.cfg["hotkey"]:
+            mode = "dictate"
+        elif event.name == self.cfg.get("command_hotkey"):
+            mode = "command"
+        else:
             return
         if event.event_type == keyboard.KEY_DOWN:
-            self.on_press()
+            self.on_press(mode)
         elif event.event_type == keyboard.KEY_UP:
             self.on_release()
 
