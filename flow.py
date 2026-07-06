@@ -18,6 +18,9 @@ if _nvidia.is_dir():
         os.add_dll_directory(str(_bin))
         os.environ["PATH"] = str(_bin) + os.pathsep + os.environ["PATH"]
 
+if sys.stdout:
+    sys.stdout.reconfigure(line_buffering=True)
+
 import keyboard
 import numpy as np
 import pyperclip
