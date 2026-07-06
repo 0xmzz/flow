@@ -139,6 +139,16 @@ def make_server(flow, host, port, token):
             path = self.path.split("?")[0].rstrip("/")
             if path in ("", "/health"):
                 return self._json(200, {"ok": True, "model": flow.cfg["model"]})
+            if path == "/apk/version":
+                from pathlib import Path
+                meta = (Path(__file__).parent / "android" / "app" / "build"
+                        / "outputs" / "apk" / "debug" / "output-metadata.json")
+                if not meta.exists():
+                    return self._json(404, {"error": "no build metadata"})
+                m = json.loads(meta.read_text(encoding="utf-8"))
+                el = (m.get("elements") or [{}])[0]
+                return self._json(200, {"versionCode": el.get("versionCode", 0),
+                                        "versionName": el.get("versionName", "?")})
             if path == "/apk":
                 from pathlib import Path
                 apk = (Path(__file__).parent / "android" / "app" / "build"

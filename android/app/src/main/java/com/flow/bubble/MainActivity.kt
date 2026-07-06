@@ -89,6 +89,7 @@ class MainActivity : Activity() {
             stopService(Intent(this, BubbleService::class.java))
             status.text = "Bubble stopped."
         }
+        button("Check for updates") { Updater.check(this, quiet = false) }
 
         status = TextView(this)
         status.setPadding(0, dp(16), 0, 0)
@@ -99,5 +100,7 @@ class MainActivity : Activity() {
         val scroll = ScrollView(this)
         scroll.addView(root)
         setContentView(scroll)
+
+        Updater.check(this, quiet = true)  // auto-offer new builds on open
     }
 }

@@ -11,8 +11,8 @@ android {
         applicationId = "com.flow.bubble"
         minSdk = 26
         targetSdk = 34
-        versionCode = 2
-        versionName = "0.2"
+        versionCode = 3
+        versionName = "0.3"
     }
 
     buildTypes {
@@ -27,4 +27,8 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+}
+
+dependencies {
+    implementation("androidx.core:core:1.13.1")  // FileProvider for self-update
 }
