@@ -85,6 +85,10 @@ DEFAULTS = {
     "no_speech_threshold": None,   # let VAD gate silence, not this (None disables the drop)
     "beam_size": 5,
     "normalize_gain": False,       # peak-normalize before ASR (low value; A/B only)
+    "streaming": {
+        "enabled": True,           # transcribe while the hotkey is held
+        "interval_s": 1.2,         # rolling-pass cadence
+    },
     "history": {
         "enabled": True,           # store every dictation locally
         "dir": "data",             # relative to this file
@@ -156,6 +160,13 @@ class Recorder:
         )
         self._stream.start()
 
+    def snapshot(self):
+        """Audio captured so far (recording continues)."""
+        chunks = list(self._chunks)
+        if not chunks:
+            return np.zeros(0, dtype=np.float32)
+        return np.concatenate(chunks).flatten()
+
     def stop(self):
         self._stream.stop()
         self._stream.close()
@@ -163,6 +174,83 @@ class Recorder:
         if not self._chunks:
             return np.zeros(0, dtype=np.float32)
         return np.concatenate(self._chunks).flatten()
+
+
+class StreamWorker:
+    """Transcribes rolling chunks WHILE the hotkey is held, committing text that
+    is stable across two consecutive passes (LocalAgreement). At release only
+    the uncommitted tail needs decoding, so release-to-paste stays ~constant no
+    matter how long the dictation ran."""
+
+    # Segments ending within this many seconds of the buffer edge are still
+    # "hot" (may change on the next pass) and are never committed.
+    UNSTABLE_TAIL_S = 1.0
+
+    def __init__(self, flow):
+        self.flow = flow
+        self.committed_text = ""
+        self.committed_samples = 0
+        self._prev = []          # segment texts from the previous pass
+        self._active = False
+        self._thread = None
+
+    def start(self):
+        self._active = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._active = False
+        if self._thread:
+            self._thread.join(2.0)
+        return self.committed_text, self.committed_samples
+
+    def _loop(self):
+        sr = self.flow.cfg["sample_rate"]
+        interval = self.flow.cfg["streaming"].get("interval_s", 1.2)
+        while self._active:
+            time.sleep(interval)
+            if not self._active:
+                return
+            snap = self.flow.recorder.snapshot()
+            tail = snap[self.committed_samples:]
+            if len(tail) < sr * 1.5:
+                continue
+            try:
+                segs = self.flow.decode(tail, beam_size=1, word_timestamps=True,
+                                        prompt=self.committed_text[-200:] or None)
+            except Exception as e:
+                print(f"[stream] pass failed: {e}")
+                continue
+            if not self._active:   # released mid-pass: let the final pass own it
+                return
+            tail_dur = len(tail) / sr
+            # Word-level commit: whisper often yields ONE growing segment, so
+            # segment-level stability never triggers on normal sentences.
+            words = [w for s in segs for w in (s.words or [])
+                     if w.end < tail_dur - self.UNSTABLE_TAIL_S]
+            texts = [w.word.strip() for w in words]
+            # Commit the longest prefix of words two consecutive passes agree on —
+            # but only cut at a natural pause (>=0.35s gap), so the audio seam
+            # lands on silence and phrase-level formatting ("10%", caps) survives.
+            agree = 0
+            for a, b in zip(texts, self._prev):
+                if a == b:
+                    agree += 1
+                else:
+                    break
+            cut = 0
+            for i in range(agree):
+                nxt = words[i + 1].start if i + 1 < len(words) else tail_dur
+                if nxt - words[i].end >= 0.35:
+                    cut = i + 1
+            if cut:
+                phrase = "".join(w.word for w in words[:cut]).strip()
+                self.committed_text = (self.committed_text + " " + phrase).strip()
+                self.committed_samples += int(words[cut - 1].end * sr)
+                self._prev = texts[cut:]
+            else:
+                self._prev = texts
 
 
 class OutputMuter:
@@ -262,6 +350,7 @@ class Flow:
         self.muter = OutputMuter()
         self.recording = False
         self.active_mode = "dictate"
+        self.streamer = None
         self.busy = threading.Lock()
         self.model_lock = threading.Lock()  # serialize GPU across hotkey + server
         self.router = Router(self.cfg)
@@ -313,19 +402,51 @@ class Flow:
         if self.cfg.get("mute_output_while_recording"):
             self.muter.mute()
         self.recorder.start()
+        if (mode == "dictate" and self.cfg["streaming"]["enabled"]):
+            self.streamer = StreamWorker(self)
+            self.streamer.start()
 
     def on_release(self):
         if not self.recording:
             return
         self.recording = False
+        committed = ("", 0)
+        if self.streamer:
+            committed = self.streamer.stop()
+            self.streamer = None
         audio = self.recorder.stop()
         self.muter.restore()
-        target = self.process_command if self.active_mode == "command" else self.process
-        threading.Thread(target=target, args=(audio,), daemon=True).start()
+        if self.active_mode == "command":
+            threading.Thread(target=self.process_command, args=(audio,),
+                             daemon=True).start()
+        else:
+            threading.Thread(target=self.process, args=(audio, committed),
+                             daemon=True).start()
+
+    def decode(self, audio, beam_size=None, prompt=None, word_timestamps=False):
+        """One locked whisper pass -> list of segments."""
+        vad_params = ({
+            "threshold": self.cfg["vad_threshold"],
+            "min_silence_duration_ms": self.cfg.get("vad_min_silence_ms", 400),
+            "speech_pad_ms": self.cfg.get("vad_speech_pad_ms", 600),
+        } if self.cfg.get("vad_filter") else None)
+        with self.model_lock:
+            segments, _ = self.model.transcribe(
+                audio, language=self.cfg["language"],
+                vad_filter=self.cfg.get("vad_filter", True),
+                vad_parameters=vad_params,
+                beam_size=beam_size or self.cfg.get("beam_size", 5),
+                condition_on_previous_text=self.cfg.get("condition_on_previous_text", False),
+                no_speech_threshold=self.cfg.get("no_speech_threshold"),
+                initial_prompt=prompt,
+                word_timestamps=word_timestamps,
+            )
+            return list(segments)
 
     def transcribe_and_store(self, audio, sample_rate=None, source="pc-hotkey",
-                             window=None):
-        """Shared pipeline: resample -> ASR -> cleanup -> store. Returns (text, meta)."""
+                             window=None, committed=("", 0)):
+        """Shared pipeline: resample -> ASR (tail only if streaming committed a
+        prefix) -> cleanup -> store. Returns (text, meta)."""
         target_sr = self.cfg["sample_rate"]
         if sample_rate and sample_rate != target_sr:
             audio = resample_linear(audio, sample_rate, target_sr)
@@ -333,22 +454,13 @@ class Flow:
         if self.cfg.get("normalize_gain"):
             peak = float(np.abs(audio).max()) or 1.0
             audio = (audio / peak * 0.95).astype(np.float32)
-        vad_params = ({
-            "threshold": self.cfg["vad_threshold"],
-            "min_silence_duration_ms": self.cfg.get("vad_min_silence_ms", 400),
-            "speech_pad_ms": self.cfg.get("vad_speech_pad_ms", 600),
-        } if self.cfg.get("vad_filter") else None)
+        committed_text, committed_samples = committed
         t0 = time.time()
-        with self.model_lock:
-            segments, _ = self.model.transcribe(
-                audio, language=self.cfg["language"],
-                vad_filter=self.cfg.get("vad_filter", True),
-                vad_parameters=vad_params,
-                beam_size=self.cfg.get("beam_size", 5),
-                condition_on_previous_text=self.cfg.get("condition_on_previous_text", False),
-                no_speech_threshold=self.cfg.get("no_speech_threshold"),
-            )
-            text = " ".join(s.text.strip() for s in segments).strip()
+        tail = audio[committed_samples:]
+        segs = self.decode(tail, prompt=committed_text[-200:] or None) \
+            if len(tail) > 0 else []
+        text = (committed_text + " "
+                + " ".join(s.text.strip() for s in segs)).strip()
         asr_t = time.time() - t0
         if text and self.cfg["cleanup"]["enabled"]:
             text = llm_cleanup(text, self.cfg, window=window)
@@ -360,7 +472,7 @@ class Flow:
         print(f"[{source}] [{dur:.1f}s audio -> {asr_t:.2f}s asr] {text}")
         return text, {"asr_s": round(asr_t, 2), "duration_s": round(dur, 2)}
 
-    def process(self, audio):
+    def process(self, audio, committed=("", 0)):
         with self.busy:
             self.set_icon("work")
             try:
@@ -370,7 +482,8 @@ class Flow:
                 if self.cfg.get("save_last_audio"):
                     save_wav(APP_DIR / "last.wav", audio, self.cfg["sample_rate"])
                 text, _ = self.transcribe_and_store(
-                    audio, source="pc-hotkey", window=foreground_window())
+                    audio, source="pc-hotkey", window=foreground_window(),
+                    committed=committed)
                 if text:
                     paste_text(text, self.cfg["paste_mode"])
             finally:
