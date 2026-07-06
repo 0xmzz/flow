@@ -58,6 +58,7 @@ DEFAULTS = {
         # for windows that match a profile (keeps raw speed elsewhere);
         # "all" = every dictation gets the neutral cleanup at minimum.
         "mode": "matched",
+        "min_words": 5,            # skip the LLM pass for shorter utterances
         "profiles": [
             {"match": ["whatsapp", "telegram", "discord"],
              "style": "Casual chat message: relaxed tone, contractions fine, "
@@ -200,6 +201,8 @@ def llm_cleanup(text, cfg, window=None):
     style = match_profile(cfg, window)
     if style is None and c.get("mode", "matched") == "matched":
         return text  # unmatched app -> raw fast path, no LLM call
+    if len(text.split()) < c.get("min_words", 5):
+        return text  # short snippets: delay is felt most, styling worth least
     system = CLEANUP_PROMPT
     if style:
         system += f"\nTarget style for this app ({window}): {style}"
@@ -235,7 +238,7 @@ def paste_text(text, mode):
     except Exception:
         pass
     pyperclip.copy(text)
-    time.sleep(0.15)
+    time.sleep(0.05)
     keyboard.press("ctrl")
     keyboard.press("v")
     time.sleep(0.03)
