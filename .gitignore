@@ -3,3 +3,5 @@ __pycache__/
 config.json
 *.log
 flow.err.log
+data/
+last.wav

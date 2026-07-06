@@ -40,12 +40,53 @@ Hold **F8**, speak, release. Text appears at your cursor.
 | `cleanup.api_key_env` | env var holding the API key (default `FLOW_API_KEY`) |
 | `paste_mode` | `clipboard` (fast) or `type` (simulated keystrokes) |
 
+## History / data collection
+
+Every dictation is appended to `data/history.jsonl` (id, timestamp, text, source,
+duration, model). Nothing leaves the machine.
+
+```powershell
+.venv\Scripts\python flow.py --history 30   # last 30 dictations
+.venv\Scripts\python flow.py --stats        # totals
+```
+
+Set `history.archive_audio: true` to also keep the paired audio under
+`data/dataset/<date>/<id>.wav` — a fine-tuning-ready corpus of your own voice.
+
+## Server mode (dictate from your phone)
+
+With `server.enabled: true`, Flow exposes an ASR endpoint on the local GPU.
+On first run it prints an auto-generated token (also saved to `config.json`).
+Reach it from any device on your Tailscale network:
+
+| route | purpose |
+|---|---|
+| `POST /transcribe` | wav body → `{"text": ...}` |
+| `POST /v1/audio/transcriptions` | OpenAI-Whisper-compatible (multipart `file`) — point any app that supports a custom Whisper endpoint here |
+| `GET /api/history` | recent dictations (JSON) |
+| `GET /` | browsable history page |
+| `GET /health` | liveness (no auth) |
+
+All routes except `/health` and `/` require `Authorization: Bearer <token>`.
+
+```bash
+# from the phone, over Tailscale (PC hostname "beast"):
+curl -X POST http://beast:8756/v1/audio/transcriptions \
+  -H "Authorization: Bearer <token>" -F file=@clip.wav
+```
+
+Windows Firewall: allow the port once (elevated PowerShell):
+
+```powershell
+New-NetFirewallRule -DisplayName "Flow ASR server" -Direction Inbound `
+  -Action Allow -Protocol TCP -LocalPort 8756 -Profile Any
+```
+
 ## Autostart
 
-Create a shortcut to `.venv\Scripts\pythonw.exe flow.py` in
-`shell:startup`.
+Create a shortcut to `.venv\Scripts\pythonw.exe flow.py` in `shell:startup`.
 
 ## Roadmap
 
-- Android port (whisper.cpp / futo-style keyboard integration)
+- Android client (approach chosen via design pass — see below)
 - Streaming partials, per-app tone profiles

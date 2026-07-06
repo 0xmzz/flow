@@ -27,6 +27,8 @@ import pyperclip
 import sounddevice as sd
 from faster_whisper import WhisperModel
 
+from store import TranscriptStore, resample_linear, save_wav
+
 APP_DIR = Path(__file__).parent
 CONFIG_PATH = APP_DIR / "config.json"
 
@@ -53,6 +55,17 @@ DEFAULTS = {
     "vad_threshold": 0.5,          # lower = keeps quieter speech (0.1-0.3 for whisper)
     "beam_size": 5,
     "normalize_gain": False,       # peak-normalize audio before ASR
+    "history": {
+        "enabled": True,           # store every dictation locally
+        "dir": "data",             # relative to this file
+        "archive_audio": False,    # also keep paired audio for a fine-tuning corpus
+    },
+    "server": {
+        "enabled": False,          # expose an ASR endpoint for phones over Tailscale
+        "host": "0.0.0.0",         # bind all interfaces (reach via tailnet IP)
+        "port": 8756,
+        "token": "",               # auto-generated on first run if empty
+    },
 }
 
 CLEANUP_PROMPT = (
@@ -75,6 +88,19 @@ def load_config():
     else:
         CONFIG_PATH.write_text(json.dumps(DEFAULTS, indent=2), encoding="utf-8")
     return cfg
+
+
+def _persist_config(patch):
+    """Merge a shallow patch into config.json on disk (one level deep)."""
+    data = {}
+    if CONFIG_PATH.exists():
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
+    for k, v in patch.items():
+        if isinstance(v, dict) and isinstance(data.get(k), dict):
+            data[k].update(v)
+        else:
+            data[k] = v
+    CONFIG_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
 class Recorder:
@@ -173,16 +199,6 @@ def llm_cleanup(text, cfg):
         return text
 
 
-def save_wav(path, audio, sample_rate):
-    import wave
-    pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype("<i2")
-    with wave.open(str(path), "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(sample_rate)
-        w.writeframes(pcm.tobytes())
-
-
 def foreground_window():
     try:
         import ctypes
@@ -229,7 +245,12 @@ class Flow:
         self.muter = OutputMuter()
         self.recording = False
         self.busy = threading.Lock()
+        self.model_lock = threading.Lock()  # serialize GPU across hotkey + server
         self.tray = None
+        h = self.cfg["history"]
+        self.store = TranscriptStore(
+            APP_DIR / h["dir"], archive_audio=h["archive_audio"]
+        ) if h["enabled"] else None
         print(f"Loading {self.cfg['model']} on {self.cfg['device']}...")
         t0 = time.time()
         self.model = WhisperModel(
@@ -262,6 +283,38 @@ class Flow:
         self.muter.restore()
         threading.Thread(target=self.process, args=(audio,), daemon=True).start()
 
+    def transcribe_and_store(self, audio, sample_rate=None, source="pc-hotkey",
+                             window=None):
+        """Shared pipeline: resample -> ASR -> cleanup -> store. Returns (text, meta)."""
+        target_sr = self.cfg["sample_rate"]
+        if sample_rate and sample_rate != target_sr:
+            audio = resample_linear(audio, sample_rate, target_sr)
+        dur = len(audio) / target_sr
+        if self.cfg.get("normalize_gain"):
+            peak = float(np.abs(audio).max()) or 1.0
+            audio = (audio / peak * 0.95).astype(np.float32)
+        vad_params = ({"threshold": self.cfg["vad_threshold"]}
+                      if self.cfg.get("vad_filter") else None)
+        t0 = time.time()
+        with self.model_lock:
+            segments, _ = self.model.transcribe(
+                audio, language=self.cfg["language"],
+                vad_filter=self.cfg.get("vad_filter", True),
+                vad_parameters=vad_params,
+                beam_size=self.cfg.get("beam_size", 5),
+            )
+            text = " ".join(s.text.strip() for s in segments).strip()
+        asr_t = time.time() - t0
+        if text and self.cfg["cleanup"]["enabled"]:
+            text = llm_cleanup(text, self.cfg)
+        if self.store and text:
+            self.store.add(text, source=source, window=window, duration_s=dur,
+                           asr_s=asr_t, model=self.cfg["model"],
+                           device=self.cfg["device"], audio=audio,
+                           sample_rate=target_sr)
+        print(f"[{source}] [{dur:.1f}s audio -> {asr_t:.2f}s asr] {text}")
+        return text, {"asr_s": round(asr_t, 2), "duration_s": round(dur, 2)}
+
     def process(self, audio):
         with self.busy:
             self.set_icon("work")
@@ -271,26 +324,10 @@ class Flow:
                     return
                 if self.cfg.get("save_last_audio"):
                     save_wav(APP_DIR / "last.wav", audio, self.cfg["sample_rate"])
-                if self.cfg.get("normalize_gain"):
-                    peak = float(np.abs(audio).max()) or 1.0
-                    audio = (audio / peak * 0.95).astype(np.float32)
-                t0 = time.time()
-                vad_params = ({"threshold": self.cfg["vad_threshold"]}
-                              if self.cfg.get("vad_filter") else None)
-                segments, _ = self.model.transcribe(
-                    audio, language=self.cfg["language"],
-                    vad_filter=self.cfg.get("vad_filter", True),
-                    vad_parameters=vad_params,
-                    beam_size=self.cfg.get("beam_size", 5),
-                )
-                text = " ".join(s.text.strip() for s in segments).strip()
-                asr_t = time.time() - t0
-                if not text:
-                    return
-                if self.cfg["cleanup"]["enabled"]:
-                    text = llm_cleanup(text, self.cfg)
-                paste_text(text, self.cfg["paste_mode"])
-                print(f"[{dur:.1f}s audio -> {asr_t:.2f}s asr] {text}")
+                text, _ = self.transcribe_and_store(
+                    audio, source="pc-hotkey", window=foreground_window())
+                if text:
+                    paste_text(text, self.cfg["paste_mode"])
             finally:
                 self.set_icon("idle")
 
@@ -304,7 +341,23 @@ class Flow:
         elif event.event_type == keyboard.KEY_UP:
             self.on_release()
 
+    def maybe_start_server(self):
+        s = self.cfg["server"]
+        if not s["enabled"]:
+            return
+        if not s["token"]:
+            import secrets
+            s["token"] = secrets.token_urlsafe(16)
+            _persist_config({"server": {"token": s["token"]}})
+            print(f"[server] generated token: {s['token']}")
+        from server import make_server
+        httpd = make_server(self, s["host"], s["port"], s["token"])
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        print(f"[server] listening on {s['host']}:{s['port']} "
+              f"(token required; history page at /)")
+
     def run(self):
+        self.maybe_start_server()
         # Raw hook (never suppresses) so we can distinguish left vs right ctrl
         # and never eat the key from other apps.
         keyboard.hook(self._on_key)
@@ -334,5 +387,24 @@ def make_icon(state):
     return img
 
 
+def cli_history(limit=30):
+    cfg = load_config()
+    store = TranscriptStore(APP_DIR / cfg["history"]["dir"])
+    entries = store.read(limit=limit)
+    if not entries:
+        print("No dictations recorded yet.")
+        return
+    for e in entries:
+        print(f"{e['ts']}  [{e.get('source','?'):9}] {e['text']}")
+    s = store.stats()
+    print(f"\n{s['dictations']} dictations · {s['words']} words · {s['by_source']}")
+
+
 if __name__ == "__main__":
-    Flow().run()
+    if len(sys.argv) > 1 and sys.argv[1] in ("--history", "-H"):
+        cli_history(int(sys.argv[2]) if len(sys.argv) > 2 else 30)
+    elif len(sys.argv) > 1 and sys.argv[1] in ("--stats", "-s"):
+        cfg = load_config()
+        print(TranscriptStore(APP_DIR / cfg["history"]["dir"]).stats())
+    else:
+        Flow().run()
