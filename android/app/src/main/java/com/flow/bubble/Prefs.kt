@@ -1,0 +1,23 @@
+package com.flow.bubble
+
+import android.content.Context
+
+class Prefs(ctx: Context) {
+    private val p = ctx.getSharedPreferences("flow", Context.MODE_PRIVATE)
+
+    var serverUrl: String
+        get() = p.getString("url", "http://100.64.112.82:8756")!!
+        set(v) = p.edit().putString("url", v).apply()
+
+    var token: String
+        get() = p.getString("token", "")!!
+        set(v) = p.edit().putString("token", v).apply()
+
+    var bubbleX: Int
+        get() = p.getInt("bx", 8)
+        set(v) = p.edit().putInt("bx", v).apply()
+
+    var bubbleY: Int
+        get() = p.getInt("by", 400)
+        set(v) = p.edit().putInt("by", v).apply()
+}

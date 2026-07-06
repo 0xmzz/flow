@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="accessibility_desc">Lets Flow insert dictated text into the focused text field. No data is read or sent anywhere except your own Flow server.</string>
+</resources>

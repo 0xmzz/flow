@@ -139,6 +139,22 @@ def make_server(flow, host, port, token):
             path = self.path.split("?")[0].rstrip("/")
             if path in ("", "/health"):
                 return self._json(200, {"ok": True, "model": flow.cfg["model"]})
+            if path == "/apk":
+                from pathlib import Path
+                apk = (Path(__file__).parent / "android" / "app" / "build"
+                       / "outputs" / "apk" / "debug" / "app-debug.apk")
+                if not apk.exists():
+                    return self._json(404, {"error": "apk not built"})
+                data = apk.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type",
+                                 "application/vnd.android.package-archive")
+                self.send_header("Content-Disposition",
+                                 'attachment; filename="flow.apk"')
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
             if not self._authed() and path.startswith("/api"):
                 return self._json(401, {"error": "unauthorized"})
             if path == "/api/history":
