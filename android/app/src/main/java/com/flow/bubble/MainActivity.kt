@@ -72,6 +72,9 @@ class MainActivity : Activity() {
                 Uri.parse("package:$packageName")))
         }
         button("3. Accessibility (auto-insert text)") {
+            Toast.makeText(this,
+                "Find 'Flow text inserter' (Samsung: under Installed apps) and turn it ON",
+                Toast.LENGTH_LONG).show()
             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
         }
 
@@ -102,5 +105,13 @@ class MainActivity : Activity() {
         setContentView(scroll)
 
         Updater.check(this, quiet = true)  // auto-offer new builds on open
+    }
+
+    override fun onResume() {
+        super.onResume()
+        val acc = if (FlowAccessibilityService.isEnabled()) "ON" else
+            "OFF - enable 'Flow text inserter' in Accessibility settings"
+        val bub = if (BubbleService.running) "running" else "stopped"
+        status.text = "Accessibility: $acc\nBubble: $bub"
     }
 }
