@@ -89,6 +89,9 @@ DEFAULTS = {
     "streaming": {
         "enabled": True,           # transcribe while the hotkey is held
         "interval_s": 1.2,         # rolling-pass cadence
+        "live_type": True,         # paste committed words WHILE you talk
+                                   # (only in windows with no style profile —
+                                   # styled text must wait for the full utterance)
     },
     "history": {
         "enabled": True,           # store every dictation locally
@@ -187,13 +190,21 @@ class StreamWorker:
     # "hot" (may change on the next pass) and are never committed.
     UNSTABLE_TAIL_S = 1.0
 
-    def __init__(self, flow):
+    def __init__(self, flow, live=False):
         self.flow = flow
         self.committed_text = ""
         self.committed_samples = 0
-        self._prev = []          # segment texts from the previous pass
+        self.live = live         # paste committed words while still recording
+        self.typed_len = 0       # chars of committed_text already pasted
+        self.saved_clip = None
+        self._prev = []          # word texts from the previous pass
         self._active = False
         self._thread = None
+        if live:
+            try:
+                self.saved_clip = pyperclip.paste()
+            except Exception:
+                pass
 
     def start(self):
         self._active = True
@@ -213,6 +224,8 @@ class StreamWorker:
             time.sleep(interval)
             if not self._active:
                 return
+            if self.flow.model_lock.locked():
+                continue  # don't queue behind other GPU work; try next cycle
             snap = self.flow.recorder.snapshot()
             tail = snap[self.committed_samples:]
             if len(tail) < sr * 1.5:
@@ -250,8 +263,33 @@ class StreamWorker:
                 self.committed_text = (self.committed_text + " " + phrase).strip()
                 self.committed_samples += int(words[cut - 1].end * sr)
                 self._prev = texts[cut:]
+                if self.live:
+                    self.type_chunk()
             else:
                 self._prev = texts
+
+    def type_chunk(self):
+        """Paste newly committed words at the cursor while still recording.
+        Uses clipboard+ctrl+v: the user is physically holding ctrl already, so
+        synthetic character typing would trigger app shortcuts — paste is safe."""
+        chunk = self.committed_text[self.typed_len:]
+        if not chunk:
+            return
+        try:
+            pyperclip.copy(chunk)
+            time.sleep(0.02)
+            keyboard.send("ctrl+v")
+            self.typed_len = len(self.committed_text)
+        except Exception as e:
+            print(f"[stream] live type failed: {e}")
+
+    def restore_clipboard(self):
+        if self.saved_clip is not None:
+            try:
+                pyperclip.copy(self.saved_clip)
+            except Exception:
+                pass
+            self.saved_clip = None
 
 
 class Overlay:
@@ -424,18 +462,19 @@ def foreground_window():
         return "?"
 
 
-def paste_text(text, mode):
+def paste_text(text, mode, restore=True):
     print(f"[paste] mode={mode} target window: {foreground_window()!r}")
     if mode == "type":
         keyboard.write(text)
         return
     old = None
-    try:
-        old = pyperclip.paste()
-    except Exception:
-        pass
+    if restore:
+        try:
+            old = pyperclip.paste()
+        except Exception:
+            pass
     pyperclip.copy(text)
-    time.sleep(0.05)
+    time.sleep(0.02)
     keyboard.press("ctrl")
     keyboard.press("v")
     time.sleep(0.03)
@@ -518,24 +557,29 @@ class Flow:
             self.muter.mute()
         self.recorder.start()
         if (mode == "dictate" and self.cfg["streaming"]["enabled"]):
-            self.streamer = StreamWorker(self)
+            # Live typing only where no style profile applies — styled text
+            # must wait for the whole utterance.
+            live = (self.cfg["streaming"].get("live_type", True)
+                    and not (self.cfg["cleanup"]["enabled"]
+                             and match_profile(self.cfg, foreground_window())))
+            self.streamer = StreamWorker(self, live=live)
             self.streamer.start()
 
     def on_release(self):
         if not self.recording:
             return
         self.recording = False
-        committed = ("", 0)
-        if self.streamer:
-            committed = self.streamer.stop()
-            self.streamer = None
+        streamer = self.streamer
+        self.streamer = None
+        if streamer:
+            streamer.stop()
         audio = self.recorder.stop()
         self.muter.restore()
         if self.active_mode == "command":
             threading.Thread(target=self.process_command, args=(audio,),
                              daemon=True).start()
         else:
-            threading.Thread(target=self.process, args=(audio, committed),
+            threading.Thread(target=self.process, args=(audio, streamer),
                              daemon=True).start()
 
     def decode(self, audio, beam_size=None, prompt=None, word_timestamps=False):
@@ -559,7 +603,7 @@ class Flow:
             return list(segments)
 
     def transcribe_and_store(self, audio, sample_rate=None, source="pc-hotkey",
-                             window=None, committed=("", 0)):
+                             window=None, committed=("", 0), skip_cleanup=False):
         """Shared pipeline: resample -> ASR (tail only if streaming committed a
         prefix) -> cleanup -> store. Returns (text, meta)."""
         target_sr = self.cfg["sample_rate"]
@@ -578,7 +622,7 @@ class Flow:
                + " ".join(s.text.strip() for s in segs)).strip()
         asr_t = time.time() - t0
         text = raw
-        if raw and self.cfg["cleanup"]["enabled"]:
+        if raw and self.cfg["cleanup"]["enabled"] and not skip_cleanup:
             text = llm_cleanup(raw, self.cfg, window=window)
         if self.store and raw:
             self.store.add(raw, source=source, window=window, duration_s=dur,
@@ -588,7 +632,7 @@ class Flow:
         print(f"[{source}] [{dur:.1f}s audio -> {asr_t:.2f}s asr] {text}")
         return text, {"asr_s": round(asr_t, 2), "duration_s": round(dur, 2)}
 
-    def process(self, audio, committed=("", 0)):
+    def process(self, audio, streamer=None):
         with self.busy:
             self.set_icon("work")
             try:
@@ -597,12 +641,23 @@ class Flow:
                     return
                 if self.cfg.get("save_last_audio"):
                     save_wav(APP_DIR / "last.wav", audio, self.cfg["sample_rate"])
+                committed = ((streamer.committed_text, streamer.committed_samples)
+                             if streamer else ("", 0))
+                live_typed = streamer.typed_len if streamer else 0
                 text, _ = self.transcribe_and_store(
                     audio, source="pc-hotkey", window=foreground_window(),
-                    committed=committed)
-                if text:
+                    committed=committed, skip_cleanup=live_typed > 0)
+                if text and live_typed:
+                    # Part of the text is already on screen — flush the rest.
+                    remainder = text[live_typed:]
+                    if remainder:
+                        paste_text(remainder, "clipboard", restore=False)
+                elif text:
                     paste_text(text, self.cfg["paste_mode"])
             finally:
+                if streamer:
+                    time.sleep(0.3)
+                    streamer.restore_clipboard()
                 self.set_icon("idle")
 
     def process_command(self, audio):
