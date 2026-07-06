@@ -98,6 +98,21 @@ def make_server(flow, host, port, token):
             device = self.headers.get("X-Device", "phone")
             if path == "/transcribe":
                 return self._transcribe(self._body(), "remote", device)
+            if path == "/llm":
+                # Local-only LLM for trusted tailnet callers (e.g. the Hermes
+                # sweep on multivac) — primary provider only, never the API
+                # fallback: the caller chose this route for privacy.
+                import llm as llmmod
+                try:
+                    req = json.loads(self._body().decode("utf-8"))
+                    p = {k: v for k, v in flow.cfg["cleanup"].items()
+                         if k != "fallback"}
+                    out = llmmod.call_provider(
+                        p, req.get("system", ""), req.get("text", ""),
+                        max_tokens=int(req.get("max_tokens", 1024)))
+                    return self._json(200, {"text": out})
+                except Exception as e:
+                    return self._json(502, {"error": str(e)})
             if path == "/command":
                 try:
                     audio, sr = decode_any(self._body())
