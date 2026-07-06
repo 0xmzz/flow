@@ -436,6 +436,8 @@ class Flow:
         self.busy = threading.Lock()
         self.model_lock = threading.Lock()  # serialize GPU across hotkey + server
         self.router = Router(self.cfg)
+        self.started_at = time.time()
+        self.last_pull = None  # last delta sync by multivac (server sets this)
         self.tray = None
         self.overlay = Overlay() if self.cfg.get("overlay", True) else None
         h = self.cfg["history"]
@@ -677,6 +679,16 @@ def cli_history(limit=30):
     print(f"\n{s['dictations']} dictations · {s['words']} words · {s['by_source']}")
 
 
+def acquire_single_instance():
+    import socket
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", 18756))
+        return s  # held for process lifetime
+    except OSError:
+        sys.exit("Flow is already running.")
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] in ("--history", "-H"):
         cli_history(int(sys.argv[2]) if len(sys.argv) > 2 else 30)
@@ -684,4 +696,5 @@ if __name__ == "__main__":
         cfg = load_config()
         print(TranscriptStore(APP_DIR / cfg["history"]["dir"]).stats())
     else:
+        _lock = acquire_single_instance()
         Flow().run()

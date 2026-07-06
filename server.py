@@ -189,9 +189,37 @@ def make_server(flow, host, port, token):
                 limit = int(m.group(1)) if m else 200
                 sm = re.search(r"since=([^&]+)", self.path)
                 since = urllib.parse.unquote(sm.group(1)) if sm else None
+                if since:
+                    import datetime
+                    flow.last_pull = datetime.datetime.now(
+                        datetime.timezone.utc).isoformat(timespec="seconds")
                 entries = flow.store.read(limit=limit, since=since)
                 cursor = entries[-1]["ts"] if entries else since
                 return self._json(200, {"entries": entries, "cursor": cursor})
+            if path == "/api/meta":
+                import time as _t
+                from pathlib import Path
+                base = Path(flow.store.base) if flow.store else None
+                hist_b = audio_b = 0
+                if base and (base / "history.jsonl").exists():
+                    hist_b = (base / "history.jsonl").stat().st_size
+                if base and (base / "dataset").exists():
+                    audio_b = sum(f.stat().st_size
+                                  for f in (base / "dataset").rglob("*.wav"))
+                c = flow.cfg
+                return self._json(200, {
+                    "model": c["model"], "device": c["device"],
+                    "streaming": c["streaming"]["enabled"],
+                    "cleanup": {"provider": c["cleanup"]["provider"],
+                                "model": c["cleanup"]["model"],
+                                "fallback": bool(c["cleanup"].get("fallback", {}).get("model"))},
+                    "hotkeys": {"dictate": c["hotkey"],
+                                "command": c.get("command_hotkey")},
+                    "uptime_s": int(_t.time() - flow.started_at),
+                    "last_pull": flow.last_pull,
+                    "storage": {"history_bytes": hist_b, "audio_bytes": audio_b,
+                                "dir": str(base) if base else None},
+                })
             if path == "/api/stats":
                 return self._json(200, flow.store.stats())
             return self._json(404, {"error": "not found"})
@@ -204,38 +232,101 @@ def make_server(flow, host, port, token):
 
 
 def _history_page():
-    # Self-contained page; fetches /api/history with a token entered once.
+    # Self-contained dashboard; all data via the token-gated API.
     return """<!doctype html><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>Flow history</title>
+<title>Flow</title>
 <style>
- body{font:15px/1.5 system-ui,sans-serif;margin:0;background:#0e0f13;color:#e6e6e6}
- header{padding:14px 16px;background:#16181d;position:sticky;top:0;display:flex;gap:10px;align-items:center}
- h1{font-size:16px;margin:0;font-weight:600}
- input{background:#0e0f13;border:1px solid #2a2d35;color:#e6e6e6;padding:6px 8px;border-radius:6px}
- .stat{color:#8a8f98;font-size:13px;margin-left:auto}
- .row{padding:12px 16px;border-bottom:1px solid #1c1e24}
- .meta{color:#6b7280;font-size:12px;margin-top:3px}
- .src{display:inline-block;padding:1px 6px;border-radius:4px;background:#23262e;font-size:11px}
+ :root{--bg:#0e0f13;--card:#16181d;--line:#22252c;--mut:#8a8f98;--fg:#e6e6e6;
+       --acc:#3d7edb;--red:#dc3c3c;--amb:#f0b428;--grn:#3ec97e}
+ body{font:15px/1.5 system-ui,sans-serif;margin:0;background:var(--bg);color:var(--fg)}
+ header{padding:16px 20px;display:flex;gap:12px;align-items:baseline;flex-wrap:wrap}
+ h1{font-size:22px;margin:0;font-weight:700;letter-spacing:.5px}
+ .tag{color:var(--mut);font-size:13px}
+ input{background:var(--card);border:1px solid var(--line);color:var(--fg);
+       padding:6px 8px;border-radius:6px;margin-left:auto}
+ .wrap{padding:0 20px 40px;max-width:1100px;margin:0 auto}
+ .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+ .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px}
+ .card b{display:block;font-size:24px;font-weight:700}
+ .card span{color:var(--mut);font-size:12px}
+ .card small{color:var(--mut);font-size:11px;display:block;margin-top:2px}
+ h2{font-size:13px;color:var(--mut);text-transform:uppercase;letter-spacing:1px;
+    margin:26px 0 10px;font-weight:600}
+ .bars{display:flex;gap:3px;align-items:flex-end;height:64px;background:var(--card);
+       border:1px solid var(--line);border-radius:10px;padding:10px}
+ .bars div{flex:1;background:var(--acc);border-radius:2px 2px 0 0;min-height:2px;opacity:.85}
+ .kv{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:6px 14px}
+ .kv div{display:flex;justify-content:space-between;padding:7px 0;
+         border-bottom:1px solid var(--line);font-size:13px}
+ .kv div:last-child{border-bottom:none}
+ .kv b{font-weight:500}
+ .kv span{color:var(--mut)}
+ .ok{color:var(--grn)}
+ .row{padding:11px 14px;border-bottom:1px solid var(--line)}
+ .row:last-child{border-bottom:none}
+ .rows{background:var(--card);border:1px solid var(--line);border-radius:10px}
+ .meta{color:var(--mut);font-size:12px;margin-top:2px}
+ .src{display:inline-block;padding:0 6px;border-radius:4px;background:#23262e;font-size:11px}
 </style>
-<header><h1>Flow — dictation history</h1>
- <input id=tok placeholder="token" size=14>
- <span class=stat id=stat></span></header>
-<div id=list></div>
+<header><h1>Flow</h1><span class=tag>your voice · your GPU · nothing leaves the box</span>
+<input id=tok placeholder="token" size=14></header>
+<div class=wrap>
+ <div class=cards id=cards></div>
+ <h2>Activity today (by hour)</h2><div class=bars id=bars></div>
+ <h2>Pipeline &amp; data</h2><div class=kv id=kv></div>
+ <h2>Recent dictations</h2><div class=rows id=list></div>
+</div>
 <script>
  const hm=location.hash.match(/tok=([^&]+)/);
  if(hm){localStorage.setItem('flow_tok',decodeURIComponent(hm[1]));history.replaceState(null,'',location.pathname)}
- const tok=localStorage.getItem('flow_tok')||'';document.getElementById('tok').value=tok;
- function esc(s){return (s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
+ const tokEl=document.getElementById('tok');tokEl.value=localStorage.getItem('flow_tok')||'';
+ const esc=s=>(s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+ const mb=b=>b>1048576?(b/1048576).toFixed(1)+' MB':Math.round(b/1024)+' KB';
+ const ago=s=>{if(s==null)return 'never';const m=Math.round(s/60);
+   return m<1?'just now':m<60?m+'m ago':Math.round(m/60)+'h ago'};
+ function card(v,l,s){return '<div class=card><b>'+v+'</b><span>'+l+'</span>'+(s?'<small>'+s+'</small>':'')+'</div>'}
  async function load(){
-  const t=document.getElementById('tok').value;localStorage.setItem('flow_tok',t);
+  const t=tokEl.value;localStorage.setItem('flow_tok',t);
   const h={Authorization:'Bearer '+t};
-  const s=await fetch('/api/stats',{headers:h}).then(r=>r.json()).catch(()=>({}));
-  document.getElementById('stat').textContent=(s.dictations||0)+' dictations · '+(s.words||0)+' words';
-  const d=await fetch('/api/history?limit=500',{headers:h}).then(r=>r.json()).catch(()=>({entries:[]}));
-  document.getElementById('list').innerHTML=(d.entries||[]).reverse().map(e=>
+  const [meta,d]=await Promise.all([
+    fetch('/api/meta',{headers:h}).then(r=>r.json()).catch(()=>({})),
+    fetch('/api/history?limit=2000',{headers:h}).then(r=>r.json()).catch(()=>({entries:[]}))]);
+  const es=d.entries||[];
+  const today=new Date().toLocaleDateString('sv');
+  const te=es.filter(e=>new Date(e.ts).toLocaleDateString('sv')===today);
+  const words=a=>a.reduce((n,e)=>n+(e.words||0),0);
+  const secs=a=>a.reduce((n,e)=>n+(e.duration_s||0),0);
+  const asr=te.filter(e=>e.asr_s!=null);
+  const avg=asr.length?(asr.reduce((n,e)=>n+e.asr_s,0)/asr.length).toFixed(2)+'s':'—';
+  const phone=te.filter(e=>(e.source||'').startsWith('remote')).length;
+  document.getElementById('cards').innerHTML=
+    card(te.length,'dictations today',words(te)+' words · '+Math.round(secs(te)/60)+' min spoken')+
+    card(avg,'avg transcribe time','release → text')+
+    card(phone,'from phone today',(te.length-phone)+' from PC')+
+    card(es.length,'in history',words(es)+' words total');
+  const hours=Array(24).fill(0);
+  te.forEach(e=>{hours[new Date(e.ts).getHours()]++});
+  const mx=Math.max(...hours,1);
+  document.getElementById('bars').innerHTML=hours.map(c=>
+    '<div style="height:'+Math.max(3,c/mx*100)+'%" title="'+c+'"></div>').join('');
+  const st=meta.storage||{};
+  document.getElementById('kv').innerHTML=
+    '<div><b>ASR</b><span>'+esc(meta.model||'?')+' on '+esc(meta.device||'?')+
+      (meta.streaming?' · streaming <span class=ok>on</span>':'')+'</span></div>'+
+    '<div><b>Cleanup</b><span>'+esc((meta.cleanup||{}).model||'off')+' ('+esc((meta.cleanup||{}).provider||'')+
+      ((meta.cleanup||{}).fallback?' + API fallback':'')+')</span></div>'+
+    '<div><b>Hotkeys</b><span>'+esc((meta.hotkeys||{}).dictate||'')+' dictate · '+
+      esc((meta.hotkeys||{}).command||'')+' command</span></div>'+
+    '<div><b>Stored at</b><span>'+esc(st.dir||'?')+' · text '+mb(st.history_bytes||0)+
+      ' · audio '+mb(st.audio_bytes||0)+'</span></div>'+
+    '<div><b>Hermes sync</b><span>last pull '+(meta.last_pull?ago((Date.now()-new Date(meta.last_pull))/1000):'never')+
+      ' · hourly from multivac</span></div>'+
+    '<div><b>Uptime</b><span>'+((meta.uptime_s||0)<3600?Math.round((meta.uptime_s||0)/60)+' min':((meta.uptime_s||0)/3600).toFixed(1)+' h')+'</span></div>';
+  document.getElementById('list').innerHTML=es.slice(-100).reverse().map(e=>
    '<div class=row><div>'+esc(e.text)+'</div><div class=meta><span class=src>'+
-   esc(e.source||'')+'</span> '+esc(e.ts||'')+' · '+(e.duration_s||'?')+'s</div></div>').join('');
+   esc(e.source||'')+'</span> '+esc((e.ts||'').replace('T',' ').slice(0,16))+
+   ' · '+(e.duration_s||'?')+'s'+(e.asr_s!=null?' · asr '+e.asr_s+'s':'')+'</div></div>').join('');
  }
- document.getElementById('tok').addEventListener('change',load);load();
+ tokEl.addEventListener('change',load);load();setInterval(load,30000);
 </script>"""
