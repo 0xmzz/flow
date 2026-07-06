@@ -101,12 +101,8 @@ class OutputMuter:
         self._was_muted = None
 
     def _endpoint(self):
-        from comtypes import CLSCTX_ALL
-        from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-        dev = AudioUtilities.GetSpeakers()
-        iface = dev.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-        import comtypes
-        return comtypes.cast(iface, comtypes.POINTER(IAudioEndpointVolume))
+        from pycaw.pycaw import AudioUtilities
+        return AudioUtilities.GetSpeakers().EndpointVolume
 
     def mute(self):
         try:
