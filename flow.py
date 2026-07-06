@@ -88,7 +88,9 @@ DEFAULTS = {
     "normalize_gain": False,       # peak-normalize before ASR (low value; A/B only)
     "streaming": {
         "enabled": True,           # transcribe while the hotkey is held
-        "interval_s": 1.2,         # rolling-pass cadence
+        "interval_s": 0.6,         # rolling-pass cadence (a pass costs ~0.25s on the 5090)
+        "unstable_tail_s": 0.6,    # words this close to the buffer edge may still change
+        "pause_gap_s": 0.25,       # only cut audio at a gap this long (format integrity)
         "live_type": True,         # paste committed words WHILE you talk
                                    # (only in windows with no style profile —
                                    # styled text must wait for the full utterance)
@@ -186,10 +188,6 @@ class StreamWorker:
     the uncommitted tail needs decoding, so release-to-paste stays ~constant no
     matter how long the dictation ran."""
 
-    # Segments ending within this many seconds of the buffer edge are still
-    # "hot" (may change on the next pass) and are never committed.
-    UNSTABLE_TAIL_S = 1.0
-
     def __init__(self, flow, live=False):
         self.flow = flow
         self.committed_text = ""
@@ -219,7 +217,10 @@ class StreamWorker:
 
     def _loop(self):
         sr = self.flow.cfg["sample_rate"]
-        interval = self.flow.cfg["streaming"].get("interval_s", 1.2)
+        scfg = self.flow.cfg["streaming"]
+        interval = scfg.get("interval_s", 0.6)
+        unstable = scfg.get("unstable_tail_s", 0.6)
+        pause_gap = scfg.get("pause_gap_s", 0.25)
         while self._active:
             time.sleep(interval)
             if not self._active:
@@ -242,7 +243,7 @@ class StreamWorker:
             # Word-level commit: whisper often yields ONE growing segment, so
             # segment-level stability never triggers on normal sentences.
             words = [w for s in segs for w in (s.words or [])
-                     if w.end < tail_dur - self.UNSTABLE_TAIL_S]
+                     if w.end < tail_dur - unstable]
             texts = [w.word.strip() for w in words]
             # Commit the longest prefix of words two consecutive passes agree on —
             # but only cut at a natural pause (>=0.35s gap), so the audio seam
@@ -256,7 +257,7 @@ class StreamWorker:
             cut = 0
             for i in range(agree):
                 nxt = words[i + 1].start if i + 1 < len(words) else tail_dur
-                if nxt - words[i].end >= 0.35:
+                if nxt - words[i].end >= pause_gap:
                     cut = i + 1
             if cut:
                 phrase = "".join(w.word for w in words[:cut]).strip()
