@@ -74,6 +74,7 @@ DEFAULTS = {
     "paste_mode": "clipboard",     # "clipboard" (fast, restores clipboard) or "type"
     "mute_output_while_recording": True,  # silence speakers during dictation
     "min_duration_s": 0.3,
+    "overlay": True,               # on-screen listening/transcribing pill
     "save_last_audio": False,      # debug: write each recording to last.wav for tuning
     # ASR tuning — the VAD gate is what drops quiet/whispered audio; keep it on
     # but permissive so whispers reach the decoder. (Verified via research pass.)
@@ -253,6 +254,69 @@ class StreamWorker:
                 self._prev = texts
 
 
+class Overlay:
+    """Small always-on-top pill showing recording state (red = listening,
+    amber = transcribing), bottom-center of the screen. Tk lives in its own
+    thread; state changes arrive via a queue."""
+
+    def __init__(self):
+        import queue
+        self._q = queue.Queue()
+        self._empty = queue.Empty
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def set(self, state):
+        self._q.put(state)
+
+    def _run(self):
+        try:
+            import tkinter as tk
+        except Exception as e:
+            print(f"[overlay] unavailable: {e}")
+            return
+        bg = "#15171c"
+        root = tk.Tk()
+        root.withdraw()
+        root.overrideredirect(True)
+        root.attributes("-topmost", True)
+        try:
+            root.attributes("-alpha", 0.93)
+        except Exception:
+            pass
+        root.configure(bg=bg)
+        canvas = tk.Canvas(root, width=14, height=14, bg=bg, highlightthickness=0)
+        dot = canvas.create_oval(2, 2, 12, 12, fill="#dc3c3c", outline="")
+        canvas.pack(side="left", padx=(12, 6), pady=9)
+        label = tk.Label(root, text="Listening", fg="#e6e6e6", bg=bg,
+                         font=("Segoe UI", 10))
+        label.pack(side="left", padx=(0, 14))
+        root.update_idletasks()
+        x = (root.winfo_screenwidth() - root.winfo_reqwidth()) // 2
+        y = root.winfo_screenheight() - 110
+        root.geometry(f"+{x}+{y}")
+
+        def poll():
+            try:
+                while True:
+                    state = self._q.get_nowait()
+                    if state == "rec":
+                        canvas.itemconfig(dot, fill="#dc3c3c")
+                        label.config(text="Listening")
+                        root.deiconify()
+                    elif state == "work":
+                        canvas.itemconfig(dot, fill="#f0b428")
+                        label.config(text="Transcribing…")
+                        root.deiconify()
+                    else:
+                        root.withdraw()
+            except self._empty:
+                pass
+            root.after(80, poll)
+
+        poll()
+        root.mainloop()
+
+
 class OutputMuter:
     """Mutes the default speaker endpoint during recording, restoring prior state."""
 
@@ -355,6 +419,7 @@ class Flow:
         self.model_lock = threading.Lock()  # serialize GPU across hotkey + server
         self.router = Router(self.cfg)
         self.tray = None
+        self.overlay = Overlay() if self.cfg.get("overlay", True) else None
         h = self.cfg["history"]
         self.store = TranscriptStore(
             APP_DIR / h["dir"], archive_audio=h["archive_audio"]
@@ -392,6 +457,8 @@ class Flow:
     def set_icon(self, state):
         if self.tray:
             self.tray.icon = make_icon(state)
+        if self.overlay:
+            self.overlay.set(state)
 
     def on_press(self, mode="dictate"):
         if self.recording or self.busy.locked():
@@ -543,11 +610,20 @@ class Flow:
         # and never eat the key from other apps.
         keyboard.hook(self._on_key)
         try:
+            import webbrowser
+
             import pystray
             from pystray import MenuItem
+            port = self.cfg["server"]["port"]
             self.tray = pystray.Icon(
                 "flow", make_icon("idle"), "Flow — hold %s to dictate" % self.cfg["hotkey"],
                 menu=pystray.Menu(
+                    MenuItem("Open history page",
+                             lambda: webbrowser.open(f"http://127.0.0.1:{port}/")),
+                    MenuItem("Edit config (restart to apply)",
+                             lambda: os.startfile(str(CONFIG_PATH))),
+                    MenuItem("Open data folder",
+                             lambda: os.startfile(str(APP_DIR / "data"))),
                     MenuItem("Quit", lambda: self.tray.stop()),
                 ),
             )
