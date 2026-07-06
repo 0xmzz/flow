@@ -47,6 +47,24 @@ DEFAULTS = {
         "model": "claude-haiku-4-5-20251001",
         "base_url": None,          # for openai-compatible endpoints
         "api_key_env": "FLOW_API_KEY",
+        "api_key": "",             # inline key (config.json is gitignored); wins over env
+        "extra_body": {},          # merged into the API request (e.g. z.ai thinking off)
+        # App-aware styling: match against the foreground window title
+        # (case-insensitive substring). mode "matched" = only run the LLM pass
+        # for windows that match a profile (keeps raw speed elsewhere);
+        # "all" = every dictation gets the neutral cleanup at minimum.
+        "mode": "matched",
+        "profiles": [
+            {"match": ["whatsapp", "telegram", "discord"],
+             "style": "Casual chat message: relaxed tone, contractions fine, "
+                      "minimal punctuation, no capital-letter stiffness."},
+            {"match": ["claude", "code", "terminal", "powershell", "cursor"],
+             "style": "Technical instruction for an AI coding agent: precise, "
+                      "unambiguous, keep exact file names/paths/symbols verbatim."},
+            {"match": ["gmail", "outlook", "mail"],
+             "style": "Professional email prose: complete sentences, courteous, "
+                      "properly punctuated."},
+        ],
     },
     "paste_mode": "clipboard",     # "clipboard" (fast, restores clipboard) or "type"
     "mute_output_while_recording": True,  # silence speakers during dictation
@@ -78,9 +96,18 @@ DEFAULTS = {
 CLEANUP_PROMPT = (
     "You clean up raw speech-to-text dictation. Remove filler words (um, uh, like, "
     "you know), fix punctuation and capitalization, and correct obvious transcription "
-    "errors from context. Do NOT rephrase, summarize, or add anything. Preserve the "
+    "errors from context. If the speaker is clearly dictating a list or steps, format "
+    "them as list lines. Do NOT rephrase, summarize, or add anything. Preserve the "
     "speaker's wording and meaning exactly. Reply with only the cleaned text."
 )
+
+
+def match_profile(cfg, window):
+    w = (window or "").lower()
+    for p in cfg["cleanup"].get("profiles", []):
+        if any(m in w for m in p.get("match", [])):
+            return p.get("style")
+    return None
 
 
 def load_config():
@@ -164,43 +191,55 @@ class OutputMuter:
         self._was_muted = None
 
 
-def llm_cleanup(text, cfg):
+def llm_cleanup(text, cfg, window=None):
     import requests
 
     c = cfg["cleanup"]
-    key = os.environ.get(c["api_key_env"], "")
+    style = match_profile(cfg, window)
+    if style is None and c.get("mode", "matched") == "matched":
+        return text  # unmatched app -> raw fast path, no API call
+    key = c.get("api_key") or os.environ.get(c["api_key_env"], "")
     if not key:
         return text
+    system = CLEANUP_PROMPT
+    if style:
+        system += f"\nTarget style for this app ({window}): {style}"
+    t0 = time.time()
     try:
         if c["provider"] == "anthropic":
+            body = {
+                "model": c["model"],
+                "max_tokens": 2048,
+                "system": system,
+                "messages": [{"role": "user", "content": text}],
+                **c.get("extra_body", {}),
+            }
             r = requests.post(
                 (c["base_url"] or "https://api.anthropic.com") + "/v1/messages",
                 headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
-                json={
-                    "model": c["model"],
-                    "max_tokens": 2048,
-                    "system": CLEANUP_PROMPT,
-                    "messages": [{"role": "user", "content": text}],
-                },
-                timeout=15,
+                json=body, timeout=15,
             )
             r.raise_for_status()
-            return r.json()["content"][0]["text"].strip()
+            out = r.json()["content"][0]["text"].strip()
         else:  # openai-compatible
+            body = {
+                "model": c["model"],
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": text},
+                ],
+                **c.get("extra_body", {}),
+            }
             r = requests.post(
                 (c["base_url"] or "https://api.openai.com/v1") + "/chat/completions",
                 headers={"Authorization": f"Bearer {key}"},
-                json={
-                    "model": c["model"],
-                    "messages": [
-                        {"role": "system", "content": CLEANUP_PROMPT},
-                        {"role": "user", "content": text},
-                    ],
-                },
-                timeout=15,
+                json=body, timeout=15,
             )
             r.raise_for_status()
-            return r.json()["choices"][0]["message"]["content"].strip()
+            out = r.json()["choices"][0]["message"]["content"].strip()
+        print(f"[cleanup] {'styled:' + window if style else 'neutral'} "
+              f"in {time.time() - t0:.2f}s")
+        return out or text
     except Exception as e:
         print(f"[cleanup] failed, using raw transcript: {e}")
         return text
@@ -323,7 +362,7 @@ class Flow:
             text = " ".join(s.text.strip() for s in segments).strip()
         asr_t = time.time() - t0
         if text and self.cfg["cleanup"]["enabled"]:
-            text = llm_cleanup(text, self.cfg)
+            text = llm_cleanup(text, self.cfg, window=window)
         if self.store and text:
             self.store.add(text, source=source, window=window, duration_s=dur,
                            asr_s=asr_t, model=self.cfg["model"],
