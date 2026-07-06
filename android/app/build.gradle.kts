@@ -11,8 +11,8 @@ android {
         applicationId = "com.flow.bubble"
         minSdk = 26
         targetSdk = 34
-        versionCode = 4
-        versionName = "0.4"
+        versionCode = 5
+        versionName = "0.5"
     }
 
     buildTypes {

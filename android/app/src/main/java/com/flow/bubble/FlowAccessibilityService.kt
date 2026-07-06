@@ -29,7 +29,12 @@ class FlowAccessibilityService : AccessibilityService() {
                 ?: return "Accessibility service is OFF - enable Flow in Settings > Accessibility"
             val node = svc.findEditTarget()
                 ?: return "No text field focused - tap into a field first (text copied)"
-            val existing = node.text?.toString().orEmpty()
+            // An empty field reports its HINT ("Message"...) as text — ignore it.
+            val existing = when {
+                node.isShowingHintText -> ""
+                node.text?.toString() == node.hintText?.toString() -> ""
+                else -> node.text?.toString().orEmpty()
+            }
             val merged = when {
                 existing.isBlank() -> text
                 existing.endsWith(" ") || existing.endsWith("\n") -> existing + text
