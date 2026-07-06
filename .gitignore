@@ -5,3 +5,6 @@ config.json
 flow.err.log
 data/
 last.wav
+finetune/dataset/
+finetune/out/
+models/
