@@ -43,6 +43,20 @@ def decode_wav(raw):
     return a.astype(np.float32), sr
 
 
+def decode_any(raw):
+    """Decode arbitrary audio bytes (wav/m4a/ogg/mp3/webm) -> (float32 mono @16k, 16000).
+
+    Uses faster-whisper's PyAV-backed decoder (handles the compressed formats
+    Android IMEs upload), falling back to the raw-WAV parser.
+    """
+    try:
+        from faster_whisper.audio import decode_audio
+        audio = decode_audio(io.BytesIO(raw), sampling_rate=16000)
+        return np.asarray(audio, dtype=np.float32), 16000
+    except Exception:
+        return decode_wav(raw)
+
+
 def resample_linear(audio, sr_in, sr_out):
     if sr_in == sr_out:
         return audio.astype(np.float32)

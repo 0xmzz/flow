@@ -34,7 +34,7 @@ CONFIG_PATH = APP_DIR / "config.json"
 
 DEFAULTS = {
     "hotkey": "f8",                # hold to record, release to transcribe
-    "model": "large-v3-turbo",     # any faster-whisper model id
+    "model": "large-v3",           # full v3 handles whispered/quiet speech better than turbo
     "device": "cuda",
     "compute_type": "float16",
     "language": None,              # None = auto-detect
@@ -50,11 +50,16 @@ DEFAULTS = {
     "mute_output_while_recording": True,  # silence speakers during dictation
     "min_duration_s": 0.3,
     "save_last_audio": False,      # debug: write each recording to last.wav for tuning
-    # ASR tuning — lower vad thresholds and gain help quiet/whispered speech.
+    # ASR tuning — the VAD gate is what drops quiet/whispered audio; keep it on
+    # but permissive so whispers reach the decoder. (Verified via research pass.)
     "vad_filter": True,
-    "vad_threshold": 0.5,          # lower = keeps quieter speech (0.1-0.3 for whisper)
+    "vad_threshold": 0.3,          # was 0.5; admits whispered onsets (sweep 0.2-0.3)
+    "vad_min_silence_ms": 400,     # push-to-talk clips rarely have 2s internal gaps
+    "vad_speech_pad_ms": 600,      # recover faint on/offset syllables
+    "condition_on_previous_text": False,  # avoid hallucination loops on short dictation
+    "no_speech_threshold": None,   # let VAD gate silence, not this (None disables the drop)
     "beam_size": 5,
-    "normalize_gain": False,       # peak-normalize audio before ASR
+    "normalize_gain": False,       # peak-normalize before ASR (low value; A/B only)
     "history": {
         "enabled": True,           # store every dictation locally
         "dir": "data",             # relative to this file
@@ -293,8 +298,11 @@ class Flow:
         if self.cfg.get("normalize_gain"):
             peak = float(np.abs(audio).max()) or 1.0
             audio = (audio / peak * 0.95).astype(np.float32)
-        vad_params = ({"threshold": self.cfg["vad_threshold"]}
-                      if self.cfg.get("vad_filter") else None)
+        vad_params = ({
+            "threshold": self.cfg["vad_threshold"],
+            "min_silence_duration_ms": self.cfg.get("vad_min_silence_ms", 400),
+            "speech_pad_ms": self.cfg.get("vad_speech_pad_ms", 600),
+        } if self.cfg.get("vad_filter") else None)
         t0 = time.time()
         with self.model_lock:
             segments, _ = self.model.transcribe(
@@ -302,6 +310,8 @@ class Flow:
                 vad_filter=self.cfg.get("vad_filter", True),
                 vad_parameters=vad_params,
                 beam_size=self.cfg.get("beam_size", 5),
+                condition_on_previous_text=self.cfg.get("condition_on_previous_text", False),
+                no_speech_threshold=self.cfg.get("no_speech_threshold"),
             )
             text = " ".join(s.text.strip() for s in segments).strip()
         asr_t = time.time() - t0

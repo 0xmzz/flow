@@ -17,7 +17,7 @@ import json
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from store import decode_wav
+from store import decode_any
 
 
 def _parse_multipart_file(body, content_type):
@@ -66,7 +66,7 @@ def make_server(flow, host, port, token):
 
         def _transcribe(self, audio_bytes, source, window):
             try:
-                audio, sr = decode_wav(audio_bytes)
+                audio, sr = decode_any(audio_bytes)
             except Exception as e:
                 return self._json(400, {"error": f"bad audio: {e}"})
             text, meta = flow.transcribe_and_store(
