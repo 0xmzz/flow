@@ -85,8 +85,11 @@ DEFAULTS = {
     "vad_speech_pad_ms": 600,      # recover faint on/offset syllables
     "condition_on_previous_text": False,  # avoid hallucination loops on short dictation
     "no_speech_threshold": None,   # let VAD gate silence, not this (None disables the drop)
-    "beam_size": 5,
+    "beam_size": 3,                # final decode; streaming passes stay greedy
     "normalize_gain": False,       # peak-normalize before ASR (low value; A/B only)
+    # Personal vocabulary — biases recognition toward YOUR words, so mumbled
+    # domain terms and names resolve correctly (the Wispr trick).
+    "vocab": [],
     "streaming": {
         "enabled": True,           # transcribe while the hotkey is held
         "interval_s": 0.6,         # rolling-pass cadence (a pass costs ~0.25s on the 5090)
@@ -266,7 +269,7 @@ class StreamWorker:
                 continue
             try:
                 segs = self.flow.decode(tail, beam_size=1, word_timestamps=True,
-                                        prompt=self.committed_text[-200:] or None)
+                                        prompt=self.flow.bias_prompt(self.committed_text))
             except Exception as e:
                 print(f"[stream] pass failed: {e}")
                 continue
@@ -617,6 +620,16 @@ class Flow:
             threading.Thread(target=self.process, args=(audio, streamer),
                              daemon=True).start()
 
+    def bias_prompt(self, committed=""):
+        """initial_prompt = personal vocabulary + committed text so far."""
+        vocab = self.cfg.get("vocab") or []
+        parts = []
+        if vocab:
+            parts.append(", ".join(vocab) + ".")
+        if committed:
+            parts.append(committed[-200:])
+        return " ".join(parts) or None
+
     def decode(self, audio, beam_size=None, prompt=None, word_timestamps=False):
         """One locked whisper pass -> list of segments."""
         vad_params = ({
@@ -651,7 +664,7 @@ class Flow:
         committed_text, committed_samples = committed
         t0 = time.time()
         tail = audio[committed_samples:]
-        segs = self.decode(tail, prompt=committed_text[-200:] or None) \
+        segs = self.decode(tail, prompt=self.bias_prompt(committed_text)) \
             if len(tail) > 0 else []
         raw = (committed_text + " "
                + " ".join(s.text.strip() for s in segs)).strip()
