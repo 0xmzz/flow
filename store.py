@@ -78,11 +78,15 @@ class TranscriptStore:
         self._lock = threading.Lock()
 
     def add(self, text, *, source, window=None, duration_s=None, asr_s=None,
-            model=None, device=None, audio=None, sample_rate=16000):
+            model=None, device=None, audio=None, sample_rate=16000,
+            cleaned=None):
         entry = {
             "id": uuid.uuid4().hex[:12],
             "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            # `text` is always the RAW transcript — fillers and hesitations are
+            # signal about the speaker, not noise. `cleaned` is what was pasted.
             "text": text,
+            "cleaned": cleaned if cleaned != text else None,
             "source": source,
             "window": window,
             "duration_s": round(duration_s, 2) if duration_s else None,

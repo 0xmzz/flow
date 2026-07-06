@@ -459,16 +459,17 @@ class Flow:
         tail = audio[committed_samples:]
         segs = self.decode(tail, prompt=committed_text[-200:] or None) \
             if len(tail) > 0 else []
-        text = (committed_text + " "
-                + " ".join(s.text.strip() for s in segs)).strip()
+        raw = (committed_text + " "
+               + " ".join(s.text.strip() for s in segs)).strip()
         asr_t = time.time() - t0
-        if text and self.cfg["cleanup"]["enabled"]:
-            text = llm_cleanup(text, self.cfg, window=window)
-        if self.store and text:
-            self.store.add(text, source=source, window=window, duration_s=dur,
+        text = raw
+        if raw and self.cfg["cleanup"]["enabled"]:
+            text = llm_cleanup(raw, self.cfg, window=window)
+        if self.store and raw:
+            self.store.add(raw, source=source, window=window, duration_s=dur,
                            asr_s=asr_t, model=self.cfg["model"],
                            device=self.cfg["device"], audio=audio,
-                           sample_rate=target_sr)
+                           sample_rate=target_sr, cleaned=text)
         print(f"[{source}] [{dur:.1f}s audio -> {asr_t:.2f}s asr] {text}")
         return text, {"asr_s": round(asr_t, 2), "duration_s": round(dur, 2)}
 
