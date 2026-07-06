@@ -12,6 +12,11 @@ import threading
 import time
 from pathlib import Path
 
+# The Intel Fortran runtime bundled in numpy/ctranslate2 registers a console
+# control handler that ABORTS the process on a console CLOSE/LOGOFF event —
+# fatal for a background app. Disable it before those libs load.
+os.environ.setdefault("FOR_DISABLE_CONSOLE_CTRL_HANDLER", "1")
+
 # Expose pip-installed NVIDIA cuBLAS/cuDNN DLLs to ctranslate2 before import.
 _nvidia = Path(sys.prefix) / "Lib" / "site-packages" / "nvidia"
 if _nvidia.is_dir():
@@ -21,6 +26,14 @@ if _nvidia.is_dir():
 
 if sys.stdout:
     sys.stdout.reconfigure(line_buffering=True)
+else:
+    # pythonw.exe has no console — keep diagnostics by logging to file.
+    try:
+        _logf = open(Path(__file__).parent / "flow.log", "a",
+                     buffering=1, encoding="utf-8")
+        sys.stdout = sys.stderr = _logf
+    except Exception:
+        pass
 
 import keyboard
 import numpy as np
