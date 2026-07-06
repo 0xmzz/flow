@@ -6,6 +6,7 @@ ASR runs fully local on GPU (faster-whisper). Optional LLM cleanup pass.
 
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -90,6 +91,8 @@ DEFAULTS = {
     # Personal vocabulary — biases recognition toward YOUR words, so mumbled
     # domain terms and names resolve correctly (the Wispr trick).
     "vocab": [],
+    "replacements": {},            # whole-word text replacements (btw -> by the way)
+    "snippets": {},                # phrase -> expansion (imported from Wispr; not yet wired)
     "streaming": {
         "enabled": True,           # transcribe while the hotkey is held
         "interval_s": 0.6,         # rolling-pass cadence (a pass costs ~0.25s on the 5090)
@@ -119,6 +122,14 @@ CLEANUP_PROMPT = (
     "them as list lines. Do NOT rephrase, summarize, or add anything. Preserve the "
     "speaker's wording and meaning exactly. Reply with only the cleaned text."
 )
+
+
+def apply_replacements(text, cfg):
+    """Whole-word, case-insensitive replacements (e.g. btw -> by the way)."""
+    reps = cfg.get("replacements") or {}
+    for k, v in reps.items():
+        text = re.sub(rf"\b{re.escape(k)}\b", lambda _m: v, text, flags=re.IGNORECASE)
+    return text
 
 
 def match_profile(cfg, window):
@@ -313,7 +324,7 @@ class StreamWorker:
         if not chunk:
             return
         try:
-            pyperclip.copy(chunk)
+            pyperclip.copy(apply_replacements(chunk, self.flow.cfg))
             time.sleep(0.02)
             keyboard.send("ctrl+v")
             self.typed_len = len(self.committed_text)
@@ -697,11 +708,12 @@ class Flow:
                     committed=committed, skip_cleanup=live_typed > 0)
                 if text and live_typed:
                     # Part of the text is already on screen — flush the rest.
-                    remainder = text[live_typed:]
+                    remainder = apply_replacements(text[live_typed:], self.cfg)
                     if remainder:
                         paste_text(remainder, "clipboard", restore=False)
                 elif text:
-                    paste_text(text, self.cfg["paste_mode"])
+                    paste_text(apply_replacements(text, self.cfg),
+                               self.cfg["paste_mode"])
             finally:
                 if streamer:
                     time.sleep(0.3)
