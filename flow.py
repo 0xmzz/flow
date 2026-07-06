@@ -45,6 +45,7 @@ DEFAULTS = {
         "api_key_env": "FLOW_API_KEY",
     },
     "paste_mode": "clipboard",     # "clipboard" (fast, restores clipboard) or "type"
+    "mute_output_while_recording": True,  # silence speakers during dictation
     "min_duration_s": 0.3,
 }
 
@@ -59,7 +60,7 @@ CLEANUP_PROMPT = (
 def load_config():
     cfg = json.loads(json.dumps(DEFAULTS))  # deep copy
     if CONFIG_PATH.exists():
-        user = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        user = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
         for k, v in user.items():
             if isinstance(v, dict) and isinstance(cfg.get(k), dict):
                 cfg[k].update(v)
@@ -91,6 +92,41 @@ class Recorder:
         if not self._chunks:
             return np.zeros(0, dtype=np.float32)
         return np.concatenate(self._chunks).flatten()
+
+
+class OutputMuter:
+    """Mutes the default speaker endpoint during recording, restoring prior state."""
+
+    def __init__(self):
+        self._was_muted = None
+
+    def _endpoint(self):
+        from comtypes import CLSCTX_ALL
+        from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+        dev = AudioUtilities.GetSpeakers()
+        iface = dev.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        import comtypes
+        return comtypes.cast(iface, comtypes.POINTER(IAudioEndpointVolume))
+
+    def mute(self):
+        try:
+            import comtypes
+            comtypes.CoInitialize()
+            vol = self._endpoint()
+            self._was_muted = bool(vol.GetMute())
+            vol.SetMute(1, None)
+        except Exception as e:
+            print(f"[mute] failed: {e}")
+            self._was_muted = None
+
+    def restore(self):
+        if self._was_muted is None:
+            return
+        try:
+            self._endpoint().SetMute(1 if self._was_muted else 0, None)
+        except Exception as e:
+            print(f"[mute] restore failed: {e}")
+        self._was_muted = None
 
 
 def llm_cleanup(text, cfg):
@@ -135,7 +171,19 @@ def llm_cleanup(text, cfg):
         return text
 
 
+def foreground_window():
+    try:
+        import ctypes
+        h = ctypes.windll.user32.GetForegroundWindow()
+        buf = ctypes.create_unicode_buffer(256)
+        ctypes.windll.user32.GetWindowTextW(h, buf, 256)
+        return buf.value
+    except Exception:
+        return "?"
+
+
 def paste_text(text, mode):
+    print(f"[paste] mode={mode} target window: {foreground_window()!r}")
     if mode == "type":
         keyboard.write(text)
         return
@@ -145,8 +193,13 @@ def paste_text(text, mode):
     except Exception:
         pass
     pyperclip.copy(text)
-    time.sleep(0.05)
-    keyboard.send("ctrl+v")
+    time.sleep(0.15)
+    keyboard.press("ctrl")
+    keyboard.press("v")
+    time.sleep(0.03)
+    keyboard.release("v")
+    keyboard.release("ctrl")
+    print("[paste] ctrl+v sent")
     if old is not None:
         def restore():
             time.sleep(0.6)
@@ -161,6 +214,7 @@ class Flow:
     def __init__(self):
         self.cfg = load_config()
         self.recorder = Recorder(self.cfg["sample_rate"])
+        self.muter = OutputMuter()
         self.recording = False
         self.busy = threading.Lock()
         self.tray = None
@@ -184,6 +238,8 @@ class Flow:
             return
         self.recording = True
         self.set_icon("rec")
+        if self.cfg.get("mute_output_while_recording"):
+            self.muter.mute()
         self.recorder.start()
 
     def on_release(self):
@@ -191,6 +247,7 @@ class Flow:
             return
         self.recording = False
         audio = self.recorder.stop()
+        self.muter.restore()
         threading.Thread(target=self.process, args=(audio,), daemon=True).start()
 
     def process(self, audio):
