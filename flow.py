@@ -288,8 +288,9 @@ class Overlay:
         dot = canvas.create_oval(2, 2, 12, 12, fill="#dc3c3c", outline="")
         canvas.pack(side="left", padx=(12, 6), pady=9)
         label = tk.Label(root, text="Listening", fg="#e6e6e6", bg=bg,
-                         font=("Segoe UI", 10))
+                         font=("Segoe UI", 10), wraplength=420, justify="left")
         label.pack(side="left", padx=(0, 14))
+        hide_at = [None]
         root.update_idletasks()
 
         def place():
@@ -316,19 +317,33 @@ class Overlay:
             try:
                 while True:
                     state = self._q.get_nowait()
-                    if state == "rec":
+                    if isinstance(state, tuple) and state[0] == "say":
+                        # Command response: show the text so command mode never
+                        # depends on audio alone.
+                        canvas.itemconfig(dot, fill="#3ec97e")
+                        label.config(text=state[1][:300])
+                        place()
+                        root.deiconify()
+                        hide_at[0] = time.time() + max(4, min(12, len(state[1]) / 18))
+                    elif state == "rec":
                         canvas.itemconfig(dot, fill="#dc3c3c")
                         label.config(text="Listening")
+                        hide_at[0] = None
                         place()
                         root.deiconify()
                     elif state == "work":
                         canvas.itemconfig(dot, fill="#f0b428")
                         label.config(text="Transcribing…")
+                        hide_at[0] = None
                         root.deiconify()
                     else:
-                        root.withdraw()
+                        if hide_at[0] is None:
+                            root.withdraw()
             except self._empty:
                 pass
+            if hide_at[0] is not None and time.time() > hide_at[0]:
+                hide_at[0] = None
+                root.withdraw()
             root.after(80, poll)
 
         poll()
@@ -364,6 +379,18 @@ class OutputMuter:
         except Exception as e:
             print(f"[mute] restore failed: {e}")
         self._was_muted = None
+
+    def ensure_unmuted(self):
+        """Startup recovery: a crash mid-recording leaves speakers muted."""
+        try:
+            import comtypes
+            comtypes.CoInitialize()
+            vol = self._endpoint()
+            if vol.GetMute():
+                vol.SetMute(0, None)
+                print("[mute] speakers were left muted (crashed session?) — unmuted")
+        except Exception:
+            pass
 
 
 def llm_cleanup(text, cfg, window=None):
@@ -430,6 +457,7 @@ class Flow:
         self.cfg = load_config()
         self.recorder = Recorder(self.cfg["sample_rate"])
         self.muter = OutputMuter()
+        self.muter.ensure_unmuted()
         self.recording = False
         self.active_mode = "dictate"
         self.streamer = None
@@ -591,6 +619,8 @@ class Flow:
                 print(f"[command] heard: {text}")
                 response = self.router.handle(text)
                 print(f"[command] -> {response}")
+                if self.overlay and response:
+                    self.overlay.set(("say", response))
                 speak(response)
             finally:
                 self.set_icon("idle")
