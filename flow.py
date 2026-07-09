@@ -597,9 +597,14 @@ class Flow:
         self.recording = False
         self.active_mode = "dictate"
         self.streamer = None
+        self._key_down = False
+        import queue as _queue
+        self._ctrl_q = _queue.Queue()
         self.busy = threading.Lock()
         self.model_lock = threading.Lock()  # serialize GPU across hotkey + server
         self.router = Router(self.cfg)
+        threading.Thread(target=self._ctrl_loop, daemon=True,
+                         name="hotkey-ctrl").start()
         self.started_at = time.time()
         self.last_pull = None  # last delta sync by multivac (server sets this)
         self.tray = None
@@ -789,8 +794,10 @@ class Flow:
                 self.set_icon("idle")
 
     def _on_key(self, event):
-        # Match the exact key NAME, not the scan code — left and right ctrl share
-        # scan code 29, so matching by name keeps the two hotkeys distinct.
+        # This runs inside the keyboard listener thread — it MUST be trivial and
+        # never throw, or the listener dies and every hotkey stops working until
+        # restart. So: match, drop auto-repeat, enqueue. All real work (mute,
+        # audio start, transcription) happens in _ctrl_loop.
         if event.name == self.cfg["hotkey"]:
             mode = "dictate"
         elif event.name == self.cfg.get("command_hotkey"):
@@ -798,9 +805,28 @@ class Flow:
         else:
             return
         if event.event_type == keyboard.KEY_DOWN:
-            self.on_press(mode)
+            if self._key_down:
+                return  # ignore held-key auto-repeat
+            self._key_down = True
+            self._ctrl_q.put(("down", mode))
         elif event.event_type == keyboard.KEY_UP:
-            self.on_release()
+            if not self._key_down:
+                return
+            self._key_down = False
+            self._ctrl_q.put(("up", mode))
+
+    def _ctrl_loop(self):
+        while True:
+            action, mode = self._ctrl_q.get()
+            try:
+                if action == "down":
+                    self.on_press(mode)
+                else:
+                    self.on_release()
+            except Exception as e:
+                # Never let a press/release error propagate — recover the state.
+                print(f"[hotkey] {action} handler error: {e}")
+                self.recording = False
 
     def maybe_start_server(self):
         s = self.cfg["server"]

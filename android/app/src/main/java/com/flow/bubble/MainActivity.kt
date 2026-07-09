@@ -92,6 +92,17 @@ class MainActivity : Activity() {
             stopService(Intent(this, BubbleService::class.java))
             status.text = "Bubble stopped."
         }
+        button("Keep permissions (stop Android auto-revoke)") {
+            // Android auto-revokes permissions for apps unused for a while —
+            // the likely cause of "worked the first day, then stopped".
+            try {
+                startActivity(Intent(Intent.ACTION_AUTO_REVOKE_PERMISSIONS,
+                    Uri.parse("package:$packageName")))
+            } catch (e: Exception) {
+                startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.parse("package:$packageName")))
+            }
+        }
         button("Check for updates") { Updater.check(this, quiet = false) }
 
         status = TextView(this)
@@ -109,10 +120,29 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
-        val acc = if (FlowAccessibilityService.isEnabled()) "ON" else
-            "OFF - enable 'Flow text inserter' in Accessibility settings"
-        val bub = if (BubbleService.running) "running" else "stopped"
+        render("checking…")
+        thread {
+            val srv = runCatching {
+                val c = URL(Prefs(this).serverUrl.trimEnd('/') + "/health")
+                    .openConnection() as HttpURLConnection
+                c.connectTimeout = 4000; c.readTimeout = 4000
+                "reachable (" + JSONObject(
+                    c.inputStream.bufferedReader().readText()).optString("model") + ")"
+            }.getOrElse { "UNREACHABLE - check Tailscale + URL" }
+            runOnUiThread { render(srv) }
+        }
+    }
+
+    private fun render(server: String) {
         val v = packageManager.getPackageInfo(packageName, 0).longVersionCode
-        status.text = "Flow v$v\nAccessibility: $acc\nBubble: $bub"
+        val g = android.content.pm.PackageManager.PERMISSION_GRANTED
+        val mic = if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == g)
+            "granted" else "DENIED — tap button 1 (likely your problem)"
+        val ovl = if (Settings.canDrawOverlays(this)) "granted" else "DENIED — tap button 2"
+        val acc = if (FlowAccessibilityService.isEnabled()) "ON" else "OFF — tap button 3"
+        val bub = if (BubbleService.running) "running" else "stopped"
+        status.text = "Flow v$v — diagnostics\n" +
+            "Mic: $mic\nOverlay: $ovl\nAccessibility: $acc\n" +
+            "Bubble: $bub\nServer: $server"
     }
 }
