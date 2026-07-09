@@ -93,6 +93,24 @@ def make_server(flow, host, port, token):
 
         def do_POST(self):
             path = self.path.split("?")[0].rstrip("/")
+            if path == "/clientlog":
+                # Unauthed on purpose: capture client crashes even when the
+                # token/config is the very thing that's broken. Tailnet-only.
+                import datetime
+                from pathlib import Path
+                try:
+                    body = json.loads(self._body().decode("utf-8"))
+                except Exception:
+                    body = {"raw": "unparseable"}
+                dev = self.headers.get("X-Device", "?")
+                line = (f"{datetime.datetime.now().isoformat(timespec='seconds')} "
+                        f"[{dev}] {body.get('tag', '')}: {body.get('message', body)}")
+                if flow.store:
+                    with (Path(flow.store.base) / "client.log").open(
+                            "a", encoding="utf-8") as f:
+                        f.write(line + "\n")
+                print("[clientlog] " + line[:500])
+                return self._json(200, {"ok": True})
             if not self._authed():
                 return self._json(401, {"error": "unauthorized"})
             device = self.headers.get("X-Device", "phone")

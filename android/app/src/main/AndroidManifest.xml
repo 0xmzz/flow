@@ -10,6 +10,7 @@
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <application
+        android:name=".FlowApp"
         android:label="Flow"
         android:allowBackup="true"
         android:icon="@android:drawable/ic_btn_speak_now"

@@ -48,6 +48,32 @@ from commands import Router, speak
 APP_DIR = Path(__file__).parent
 CONFIG_PATH = APP_DIR / "config.json"
 
+
+def _install_crash_logging():
+    """Persist every uncaught exception (main + threads) to data/flow-crash.log,
+    which survives restarts — flow.log is truncated on each launch."""
+    import datetime
+    import traceback
+    crash = APP_DIR / "data" / "flow-crash.log"
+    crash.parent.mkdir(parents=True, exist_ok=True)
+
+    def record(kind, exc_type, exc, tb):
+        try:
+            with crash.open("a", encoding="utf-8") as f:
+                f.write(f"\n===== {datetime.datetime.now().isoformat()} "
+                        f"({kind}) =====\n")
+                traceback.print_exception(exc_type, exc, tb, file=f)
+        except Exception:
+            pass
+        traceback.print_exception(exc_type, exc, tb)
+
+    sys.excepthook = lambda et, e, tb: record("main", et, e, tb)
+    threading.excepthook = lambda a: record(
+        f"thread:{a.thread.name}", a.exc_type, a.exc_value, a.exc_traceback)
+
+
+_install_crash_logging()
+
 DEFAULTS = {
     "hotkey": "f8",                # hold to dictate (paste transcript at cursor)
     "command_hotkey": "right shift",  # hold to issue a spoken COMMAND (acts + speaks back)
@@ -369,6 +395,13 @@ class Overlay:
 
     def _run(self):
         try:
+            self._build_and_loop()
+        except Exception as e:
+            # An overlay failure must NEVER take down dictation — just disable it.
+            print(f"[overlay] disabled after error: {e}")
+
+    def _build_and_loop(self):
+        try:
             import tkinter as tk
         except Exception as e:
             print(f"[overlay] unavailable: {e}")
@@ -440,10 +473,12 @@ class Overlay:
                             root.withdraw()
             except self._empty:
                 pass
+            except Exception as e:
+                print(f"[overlay] poll error (continuing): {e}")
             if hide_at[0] is not None and time.time() > hide_at[0]:
                 hide_at[0] = None
                 root.withdraw()
-            root.after(80, poll)
+            root.after(80, poll)  # always reschedule — never let the loop die
 
         poll()
         root.mainloop()
@@ -844,7 +879,8 @@ def acquire_single_instance():
         s.bind(("127.0.0.1", 18756))
         return s  # held for process lifetime
     except OSError:
-        sys.exit("Flow is already running.")
+        print("Flow is already running — exiting.")
+        sys.exit(0)  # clean, so the supervisor doesn't treat it as a crash
 
 
 if __name__ == "__main__":

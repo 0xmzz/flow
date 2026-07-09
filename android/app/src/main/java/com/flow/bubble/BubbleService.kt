@@ -68,14 +68,30 @@ class BubbleService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Don't let Android silently recreate this in the background — a mic
+        // foreground service started from the background crashes on Android 14.
+        return START_NOT_STICKY
+    }
+
+    private fun hasMic(): Boolean =
+        checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+
     override fun onCreate() {
         super.onCreate()
         running = true
         self = this
-        startInForeground()
-        wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        addBubble()
-        refreshVisibility()
+        try {
+            startInForeground()
+            wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            addBubble()
+            refreshVisibility()
+        } catch (e: Throwable) {
+            Toast.makeText(this, "Flow bubble failed to start: ${e.message}",
+                Toast.LENGTH_LONG).show()
+            stopSelf()  // fail gracefully instead of crashing the process
+        }
     }
 
     override fun onDestroy() {
@@ -95,10 +111,15 @@ class BubbleService : Service() {
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setContentTitle("Flow — hold the bubble to dictate")
             .build()
-        if (Build.VERSION.SDK_INT >= 30) {
+        // Claim the mic FGS type only if we actually hold the permission —
+        // otherwise Android 14 throws and crashes the service.
+        if (Build.VERSION.SDK_INT >= 30 && hasMic()) {
             startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
         } else {
             startForeground(1, n)
+            if (!hasMic()) Toast.makeText(this,
+                "Flow: grant Microphone in the app, then restart the bubble",
+                Toast.LENGTH_LONG).show()
         }
     }
 
