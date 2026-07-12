@@ -5,9 +5,19 @@ crash loop. Runs hidden via pythonw from the Startup shortcut.
 
 import datetime
 import shutil
+import socket
 import subprocess
+import sys
 import time
 from pathlib import Path
+
+# Refuse to run a second supervisor — two of them spawning flow.py was half of
+# the "tangled instances" mess. Held for the supervisor's lifetime.
+_guard = socket.socket()
+try:
+    _guard.bind(("127.0.0.1", 18757))
+except OSError:
+    sys.exit("A Flow supervisor is already running.")
 
 APP = Path(__file__).parent
 PYW = str(APP / ".venv" / "Scripts" / "pythonw.exe")

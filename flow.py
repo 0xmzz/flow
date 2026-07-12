@@ -25,12 +25,22 @@ if _nvidia.is_dir():
         os.environ["PATH"] = str(_bin) + os.pathsep + os.environ["PATH"]
 
 if sys.stdout:
-    sys.stdout.reconfigure(line_buffering=True)
+    # Force UTF-8: Windows default is cp1252, so any print containing a smart
+    # dash, arrow, or emoji (common in cleaned transcripts and window titles)
+    # would raise UnicodeEncodeError and kill that dictation. errors="replace"
+    # makes logging unconditionally safe.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace",
+                               line_buffering=True)
+        if sys.stderr:
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 else:
     # pythonw.exe has no console — keep diagnostics by logging to file.
     try:
         _logf = open(Path(__file__).parent / "flow.log", "a",
-                     buffering=1, encoding="utf-8")
+                     buffering=1, encoding="utf-8", errors="replace")
         sys.stdout = sys.stderr = _logf
     except Exception:
         pass
@@ -509,6 +519,8 @@ class OutputMuter:
         if self._was_muted is None:
             return
         try:
+            import comtypes
+            comtypes.CoInitialize()  # mute/restore may run on different threads
             self._endpoint().SetMute(1 if self._was_muted else 0, None)
         except Exception as e:
             print(f"[mute] restore failed: {e}")
@@ -602,6 +614,10 @@ class Flow:
         self._ctrl_q = _queue.Queue()
         self.busy = threading.Lock()
         self.model_lock = threading.Lock()  # serialize GPU across hotkey + server
+        self._remote_gen = 0  # remote session counter (stale-timer guard)
+        # Session transitions happen on two threads (hotkey ctrl-loop and HTTP
+        # request threads); this lock makes each check-then-mutate atomic.
+        self._session_lock = threading.Lock()
         self.router = Router(self.cfg)
         threading.Thread(target=self._ctrl_loop, daemon=True,
                          name="hotkey-ctrl").start()
@@ -650,34 +666,39 @@ class Flow:
             self.overlay.set(state)
 
     def on_press(self, mode="dictate"):
-        if self.recording or self.busy.locked():
-            return
-        self.active_mode = mode
-        self.recording = True
-        self.recorder.start()  # first — capture must not wait on mute/icon
-        self.set_icon("rec")
-        if self.cfg.get("mute_output_while_recording"):
-            self.muter.mute()
-        if (mode == "dictate" and self.cfg["streaming"]["enabled"]):
-            # Live typing only where no style profile applies — styled text
-            # must wait for the whole utterance.
-            live = (self.cfg["streaming"].get("live_type", True)
-                    and not (self.cfg["cleanup"]["enabled"]
-                             and match_profile(self.cfg, foreground_window())))
-            self.streamer = StreamWorker(self, live=live)
-            self.streamer.start()
+        with self._session_lock:
+            if self.recording or self.busy.locked():
+                return
+            self.active_mode = mode
+            self.recording = True
+            self.recorder.start()  # first — capture must not wait on mute/icon
+            self.set_icon("rec")
+            if self.cfg.get("mute_output_while_recording"):
+                self.muter.mute()
+            if (mode == "dictate" and self.cfg["streaming"]["enabled"]):
+                # Live typing only where no style profile applies — styled text
+                # must wait for the whole utterance.
+                live = (self.cfg["streaming"].get("live_type", True)
+                        and not (self.cfg["cleanup"]["enabled"]
+                                 and match_profile(self.cfg, foreground_window())))
+                self.streamer = StreamWorker(self, live=live)
+                self.streamer.start()
 
     def on_release(self):
-        if not self.recording:
-            return
-        self.recording = False
-        streamer = self.streamer
-        self.streamer = None
-        if streamer:
-            streamer.stop()
-        audio = self.recorder.stop()
-        self.muter.restore()
-        if self.active_mode == "command":
+        with self._session_lock:
+            if not self.recording:
+                return
+            if self.active_mode == "remote":
+                return  # remote session owns the recorder; the hotkey must not hijack it
+            self.recording = False
+            streamer = self.streamer
+            self.streamer = None
+            if streamer:
+                streamer.stop()
+            audio = self.recorder.stop()
+            self.muter.restore()
+            mode = self.active_mode
+        if mode == "command":
             threading.Thread(target=self.process_command, args=(audio,),
                              daemon=True).start()
         else:
@@ -792,6 +813,58 @@ class Flow:
                 speak(response)
             finally:
                 self.set_icon("idle")
+
+    def remote_start(self):
+        """Bridge mode (e.g. the work VM): a remote client starts a host-mic
+        recording; the transcript is returned to the caller, never pasted here."""
+        with self._session_lock:
+            if self.recording or self.busy.locked():
+                return False
+            self.active_mode = "remote"
+            self.recording = True
+            self._remote_gen += 1
+            gen = self._remote_gen
+            self.recorder.start()
+            self.set_icon("rec")
+            if self.cfg.get("mute_output_while_recording"):
+                self.muter.mute()
+            # Orphan guard: if the client dies mid-recording, don't record forever.
+            t = threading.Timer(600, lambda: self.remote_cancel(gen))
+            t.daemon = True
+            t.start()
+            return True
+
+    def remote_stop(self, window=None):
+        """Returns the transcript, '' if too short/empty, None if no session."""
+        with self._session_lock:
+            if not (self.recording and self.active_mode == "remote"):
+                return None
+            self.recording = False
+            audio = self.recorder.stop()
+            self.muter.restore()
+        with self.busy:
+            self.set_icon("work")
+            try:
+                if len(audio) / self.cfg["sample_rate"] < self.cfg["min_duration_s"]:
+                    return ""
+                text, _ = self.transcribe_and_store(
+                    audio, source="vm-bridge", window=window)
+                return apply_replacements(text, self.cfg) if text else ""
+            finally:
+                self.set_icon("idle")
+
+    def remote_cancel(self, gen=None):
+        with self._session_lock:
+            if not (self.recording and self.active_mode == "remote"):
+                return False
+            if gen is not None and gen != self._remote_gen:
+                return False  # a newer session owns the recorder now
+            self.recording = False
+            self.recorder.stop()
+            self.muter.restore()
+            self.set_icon("idle")
+            print("[remote] recording cancelled")
+            return True
 
     def _on_key(self, event):
         # This runs inside the keyboard listener thread — it MUST be trivial and
