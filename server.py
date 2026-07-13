@@ -191,6 +191,37 @@ def make_server(flow, host, port, token):
                 return self._html(200, _history_page())
             if path == "/health":
                 return self._json(200, {"ok": True, "model": flow.cfg["model"]})
+            if path == "/client/setup.ps1":
+                from pathlib import Path
+                f = Path(__file__).parent / "client" / "setup.ps1"
+                if not f.exists():
+                    return self._json(404, {"error": "not found"})
+                base = f"http://{self.headers.get('Host', '').split(':')[0]}:{flow.cfg['server']['port']}"
+                body = (f.read_text(encoding="utf-8")
+                        .replace("{{URL}}", base)
+                        .replace("{{TOKEN}}", token or ""))
+                data = body.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            if path.startswith("/client/file/"):
+                from pathlib import Path
+                name = path.split("/")[-1]
+                allowed = {"flow.py", "store.py", "llm.py", "commands.py",
+                           "supervisor.py", "flow.ico"}
+                if name not in allowed:
+                    return self._json(404, {"error": "not found"})
+                f = Path(__file__).parent / name
+                data = f.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
             if path in ("/vm/setup.sh", "/vm/daemon.py"):
                 from pathlib import Path
                 f = Path(__file__).parent / "vm" / path.split("/")[-1]

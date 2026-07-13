@@ -25,6 +25,19 @@ def save_wav(path, audio, sample_rate):
         w.writeframes(pcm.tobytes())
 
 
+def wav_bytes(audio, sample_rate):
+    """Encode float32 mono audio -> WAV bytes (for thin-client upload)."""
+    import io as _io
+    buf = _io.BytesIO()
+    pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype("<i2")
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sample_rate)
+        w.writeframes(pcm.tobytes())
+    return buf.getvalue()
+
+
 def decode_wav(raw):
     """Decode WAV bytes -> (float32 mono in [-1,1], sample_rate)."""
     with wave.open(io.BytesIO(raw), "rb") as w:
@@ -79,7 +92,7 @@ class TranscriptStore:
 
     def add(self, text, *, source, window=None, duration_s=None, asr_s=None,
             model=None, device=None, audio=None, sample_rate=16000,
-            cleaned=None):
+            cleaned=None, private=False):
         entry = {
             "id": uuid.uuid4().hex[:12],
             "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -87,6 +100,7 @@ class TranscriptStore:
             # signal about the speaker, not noise. `cleaned` is what was pasted.
             "text": text,
             "cleaned": cleaned if cleaned != text else None,
+            "private": private or None,
             "source": source,
             "window": window,
             "duration_s": round(duration_s, 2) if duration_s else None,

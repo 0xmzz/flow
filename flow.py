@@ -49,7 +49,8 @@ import keyboard
 import numpy as np
 import pyperclip
 import sounddevice as sd
-from faster_whisper import WhisperModel
+# faster_whisper is imported lazily in Flow._load_model — thin clients don't
+# have (or need) the CUDA stack installed.
 
 import llm
 from store import TranscriptStore, resample_linear, save_wav
@@ -85,6 +86,12 @@ def _install_crash_logging():
 _install_crash_logging()
 
 DEFAULTS = {
+    "mode": "full",                # "full" = local GPU; "client" = thin client
+    "server_url": "",              # client mode: the full Flow server, e.g. http://100.64.112.82:8756
+    "client_name": "",             # client mode: device tag (defaults to hostname)
+    # Devices whose dictations join YOUR corpus/Hermes context. Anything else
+    # is stored private: no audio archive, excluded from the Hermes sweep.
+    "trusted_devices": ["android-bubble", "phone", "work-vm"],
     "hotkey": "f8",                # hold to dictate (paste transcript at cursor)
     "command_hotkey": "right shift",  # hold to issue a spoken COMMAND (acts + speaks back)
     "model": "large-v3",           # full v3 handles whispered/quiet speech better than turbo
@@ -626,12 +633,23 @@ class Flow:
         self.last_pull = None  # last delta sync by multivac (server sets this)
         self.tray = None
         self.overlay = Overlay() if self.cfg.get("overlay", True) else None
+        self.model = None
+        if self.cfg["mode"] == "client":
+            # Thin client: no model, no store (the full server stores), no GPU.
+            self.store = None
+            if not self.cfg["server_url"]:
+                sys.exit("client mode needs server_url in config.json")
+            print(f"Client mode -> {self.cfg['server_url']}. "
+                  f"Hold [{self.cfg['hotkey']}] to dictate, "
+                  f"[{self.cfg.get('command_hotkey')}] for a command.")
+            return
         h = self.cfg["history"]
         self.store = TranscriptStore(
             APP_DIR / h["dir"], archive_audio=h["archive_audio"]
         ) if h["enabled"] else None
         print(f"Loading {self.cfg['model']} on {self.cfg['device']}...")
         t0 = time.time()
+        from faster_whisper import WhisperModel
         self.model = WhisperModel(
             self.cfg["model"], device=self.cfg["device"],
             compute_type=self.cfg["compute_type"],
@@ -676,7 +694,8 @@ class Flow:
             self.set_icon("rec")
             if self.cfg.get("mute_output_while_recording"):
                 self.muter.mute()
-            if (mode == "dictate" and self.cfg["streaming"]["enabled"]):
+            if (mode == "dictate" and self.cfg["streaming"]["enabled"]
+                    and self.cfg["mode"] != "client"):
                 # Live typing only where no style profile applies — styled text
                 # must wait for the whole utterance.
                 live = (self.cfg["streaming"].get("live_type", True)
@@ -759,10 +778,17 @@ class Flow:
         if raw and self.cfg["cleanup"]["enabled"] and not skip_cleanup:
             text = llm_cleanup(raw, self.cfg, window=window)
         if self.store and raw:
+            # Unknown remote devices (e.g. a family member's thin client) are
+            # PRIVATE by default: transcript stored for their history page, but
+            # no audio archive and the Hermes sweep skips it.
+            dev = (window or "").split("|")[0].lower()
+            private = (source == "remote" and
+                       not any(t in dev for t in self.cfg["trusted_devices"]))
             self.store.add(raw, source=source, window=window, duration_s=dur,
                            asr_s=asr_t, model=self.cfg["model"],
-                           device=self.cfg["device"], audio=audio,
-                           sample_rate=target_sr, cleaned=text)
+                           device=self.cfg["device"],
+                           audio=None if private else audio,
+                           sample_rate=target_sr, cleaned=text, private=private)
         print(f"[{source}] [{dur:.1f}s audio -> {asr_t:.2f}s asr] {text}")
         return text, {"asr_s": round(asr_t, 2), "duration_s": round(dur, 2)}
 
@@ -772,6 +798,11 @@ class Flow:
             try:
                 dur = len(audio) / self.cfg["sample_rate"]
                 if dur < self.cfg["min_duration_s"]:
+                    return
+                if self.cfg["mode"] == "client":
+                    text = self.client_transcribe(audio, "/transcribe")
+                    if text:
+                        paste_text(text, self.cfg["paste_mode"])
                     return
                 if self.cfg.get("save_last_audio"):
                     save_wav(APP_DIR / "last.wav", audio, self.cfg["sample_rate"])
@@ -802,18 +833,49 @@ class Flow:
                 dur = len(audio) / self.cfg["sample_rate"]
                 if dur < self.cfg["min_duration_s"]:
                     return
-                text, _ = self.transcribe_and_store(
-                    audio, source="pc-command", window=foreground_window())
-                if not text:
-                    return
-                print(f"[command] heard: {text}")
-                response = self.router.handle(text)
+                if self.cfg["mode"] == "client":
+                    response = self.client_transcribe(audio, "/command",
+                                                      field="response")
+                else:
+                    text, _ = self.transcribe_and_store(
+                        audio, source="pc-command", window=foreground_window())
+                    if not text:
+                        return
+                    print(f"[command] heard: {text}")
+                    response = self.router.handle(text)
                 print(f"[command] -> {response}")
                 if self.overlay and response:
                     self.overlay.set(("say", response))
                 speak(response)
             finally:
                 self.set_icon("idle")
+
+    def client_transcribe(self, audio, route, field="text"):
+        """Thin client: ship the audio to the full Flow server, return the text."""
+        import requests
+
+        from store import wav_bytes
+        name = self.cfg.get("client_name") or os.environ.get("COMPUTERNAME", "client")
+        try:
+            r = requests.post(
+                self.cfg["server_url"].rstrip("/") + route,
+                data=wav_bytes(audio, self.cfg["sample_rate"]),
+                headers={
+                    "Authorization": "Bearer " + self.cfg["server"]["token"],
+                    "Content-Type": "audio/wav",
+                    "X-Device": f"{name}|{foreground_window()}"[:200],
+                },
+                timeout=60,
+            )
+            r.raise_for_status()
+            out = r.json().get(field, "")
+            print(f"[client] {route} -> {out[:80]!r}")
+            return out
+        except Exception as e:
+            print(f"[client] {route} failed: {e}")
+            if self.overlay:
+                self.overlay.set(("say", f"Flow server unreachable: {e}"))
+            return ""
 
     def remote_start(self):
         """Bridge mode (e.g. the work VM): a remote client starts a host-mic
@@ -904,7 +966,7 @@ class Flow:
 
     def maybe_start_server(self):
         s = self.cfg["server"]
-        if not s["enabled"]:
+        if not s["enabled"] or self.cfg["mode"] == "client":
             return
         if not s["token"]:
             import secrets
