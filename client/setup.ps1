@@ -37,25 +37,37 @@ if (-not (Test-Path "$DIR\.venv")) { python -m venv "$DIR\.venv" }
     overlay = $true; mute_output_while_recording = $true
 } | ConvertTo-Json -Depth 5 | Set-Content "$DIR\config.json" -Encoding utf8
 
-# 5) Shortcuts (Desktop + Start Menu) + autostart
+# 5) Shortcuts + autostart — best-effort; a shortcut failure must NOT stop the
+# install (Desktop is often redirected to OneDrive, etc.).
 $ws = New-Object -ComObject WScript.Shell
-foreach ($dest in @("$env:USERPROFILE\Desktop\Flow.lnk",
-                    "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Flow.lnk")) {
-    $lnk = $ws.CreateShortcut($dest)
-    $lnk.TargetPath = "$DIR\.venv\Scripts\pythonw.exe"
-    $lnk.Arguments = "`"$DIR\supervisor.py`""
-    $lnk.WorkingDirectory = $DIR
-    $lnk.IconLocation = "$DIR\flow.ico"
-    $lnk.Description = "Flow - voice dictation (hold right ctrl)"
-    $lnk.Save()
+# GetFolderPath resolves the REAL locations (handles OneDrive redirection).
+$desktop = [Environment]::GetFolderPath("Desktop")
+$programs = [Environment]::GetFolderPath("Programs")
+$startup = [Environment]::GetFolderPath("Startup")
+foreach ($d in @($desktop, $programs)) {
+    try {
+        if ($d -and (Test-Path $d)) {
+            $lnk = $ws.CreateShortcut((Join-Path $d "Flow.lnk"))
+            $lnk.TargetPath = "$DIR\.venv\Scripts\pythonw.exe"
+            $lnk.Arguments = "`"$DIR\supervisor.py`""
+            $lnk.WorkingDirectory = $DIR
+            $lnk.IconLocation = "$DIR\flow.ico"
+            $lnk.Description = "Flow - voice dictation (hold right ctrl)"
+            $lnk.Save()
+        }
+    } catch { Write-Host "  (skipped shortcut in $d)" -ForegroundColor DarkGray }
 }
-@"
+try {
+    if ($startup -and (Test-Path $startup)) {
+        @"
 Set sh = CreateObject("WScript.Shell")
 sh.CurrentDirectory = "$DIR"
 sh.Run """$DIR\.venv\Scripts\pythonw.exe"" ""$DIR\supervisor.py""", 0, False
-"@ | Set-Content "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\flow.vbs" -Encoding ascii
+"@ | Set-Content (Join-Path $startup "flow.vbs") -Encoding ascii
+    }
+} catch { Write-Host "  (skipped autostart entry)" -ForegroundColor DarkGray }
 
-# 6) Launch now
+# 6) Launch now (the part that actually matters)
 Start-Process "$DIR\.venv\Scripts\pythonw.exe" -ArgumentList "`"$DIR\supervisor.py`"" -WorkingDirectory $DIR
 Write-Host ""
 Write-Host "Done. Hold RIGHT CTRL and speak - text appears where your cursor is." -ForegroundColor Green
