@@ -6,6 +6,9 @@ processed on the local GPU. Nothing leaves your network.
 Routes:
   POST /transcribe                     wav body -> {"text": ...}
   POST /v1/audio/transcriptions        OpenAI-Whisper-compatible (multipart 'file')
+  POST /record/start                   begin a host-mic recording (VM bridge)
+  POST /record/stop                    end it -> {"text": ...} (typed by caller)
+  POST /record/cancel                  abandon it (no transcription)
   GET  /api/history?limit=N            recent dictations as JSON
   GET  /api/stats                      totals
   GET  /                               browsable history page
@@ -114,6 +117,20 @@ def make_server(flow, host, port, token):
             if not self._authed():
                 return self._json(401, {"error": "unauthorized"})
             device = self.headers.get("X-Device", "phone")
+            if path == "/record/start":
+                if flow.remote_start():
+                    return self._json(200, {"ok": True})
+                return self._json(409, {"error": "busy (hotkey session in progress?)"})
+            if path == "/record/stop":
+                try:
+                    text = flow.remote_stop(window=device)
+                except Exception as e:
+                    return self._json(500, {"error": f"transcription failed: {e}"})
+                if text is None:
+                    return self._json(409, {"error": "no remote recording in progress"})
+                return self._json(200, {"text": text})
+            if path == "/record/cancel":
+                return self._json(200, {"ok": bool(flow.remote_cancel())})
             if path == "/transcribe":
                 return self._transcribe(self._body(), "remote", device)
             if path == "/llm":
@@ -174,6 +191,18 @@ def make_server(flow, host, port, token):
                 return self._html(200, _history_page())
             if path == "/health":
                 return self._json(200, {"ok": True, "model": flow.cfg["model"]})
+            if path in ("/vm/setup.sh", "/vm/daemon.py"):
+                from pathlib import Path
+                f = Path(__file__).parent / "vm" / path.split("/")[-1]
+                if not f.exists():
+                    return self._json(404, {"error": "not found"})
+                data = f.read_text(encoding="utf-8").replace("\r\n", "\n").encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
             if path == "/apk/version":
                 from pathlib import Path
                 meta = (Path(__file__).parent / "android" / "app" / "build"

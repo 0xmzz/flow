@@ -612,6 +612,7 @@ class Flow:
         self._key_down = False
         import queue as _queue
         self._ctrl_q = _queue.Queue()
+        self._vm_q = _queue.Queue()  # hands VM-triggered transcripts to the server
         self.busy = threading.Lock()
         self.model_lock = threading.Lock()  # serialize GPU across hotkey + server
         self._remote_gen = 0  # remote session counter (stale-timer guard)
