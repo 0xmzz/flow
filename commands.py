@@ -124,5 +124,6 @@ class Router:
             self.cfg["cleanup"],
             "You are a terse voice assistant. Answer in one or two spoken "
             "sentences, no markdown.",
-            text, max_tokens=200)
+            text, max_tokens=200,
+            local_only=self.cfg.get("local_only", True))
         return out or "I couldn't reach the assistant."
