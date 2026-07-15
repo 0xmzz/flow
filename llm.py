@@ -57,15 +57,25 @@ def call_provider(p, system, text, max_tokens=2048):
     return out
 
 
-def chain(cleanup_cfg, system, text, max_tokens=2048):
-    """Try primary then fallback. Returns (text, lane) or (None, None)."""
+def chain(cleanup_cfg, system, text, max_tokens=2048, cloud_system=None):
+    """Try primary (local) then fallback. Returns (text, lane) or (None, None).
+
+    cloud_system: if given, the NON-local fallback lane uses this system prompt
+    instead of `system`. Callers pass a sanitized prompt here so app/window/
+    screen context injected for the local model never leaves the box on the
+    cloud fallback path. (The local lane always gets the full `system`.)
+    """
+    local_is_cloud = cleanup_cfg.get("provider") != "ollama"
     lanes = [("local", cleanup_cfg)]
     fb = cleanup_cfg.get("fallback")
     if fb and fb.get("model"):
         lanes.append(("fallback", fb))
     for name, p in lanes:
+        leaves_box = name != "local" or local_is_cloud
+        sys_prompt = (cloud_system if (leaves_box and cloud_system is not None)
+                      else system)
         try:
-            return call_provider(p, system, text, max_tokens), \
+            return call_provider(p, sys_prompt, text, max_tokens), \
                 f"{name}:{p.get('model')}"
         except Exception as e:
             print(f"[llm] {name} ({p.get('model')}) failed: {e}")

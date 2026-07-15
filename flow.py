@@ -557,7 +557,9 @@ def llm_cleanup(text, cfg, window=None):
     if style:
         system += f"\nTarget style for this app ({window}): {style}"
     t0 = time.time()
-    out, lane = llm.chain(c, system, text)
+    # The cloud fallback never sees the window title / app context — only the
+    # generic filler-strip prompt. Local Ollama gets the full styled prompt.
+    out, lane = llm.chain(c, system, text, cloud_system=CLEANUP_PROMPT)
     if out is None:
         print("[cleanup] all providers failed, using raw transcript")
         return text
