@@ -8,3 +8,5 @@ last.wav
 finetune/dataset/
 finetune/out/
 models/
+experiments/run/
+experiments/*/report.json
