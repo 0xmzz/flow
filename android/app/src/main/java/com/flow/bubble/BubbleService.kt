@@ -8,9 +8,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.graphics.Color
 import android.graphics.PixelFormat
-import android.graphics.drawable.GradientDrawable
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
@@ -23,7 +21,6 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.WindowManager
-import android.widget.ImageView
 import android.widget.Toast
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
@@ -53,18 +50,15 @@ class BubbleService : Service() {
     }
 
     private lateinit var wm: WindowManager
-    private var bubble: ImageView? = null
+    private var bubble: WaveBubbleView? = null
     private lateinit var lp: WindowManager.LayoutParams
     private val main = Handler(Looper.getMainLooper())
+    private val density get() = resources.displayMetrics.density
 
     private var recorder: AudioRecord? = null
     @Volatile private var recording = false
     private var recThread: Thread? = null
     private val pcm = ByteArrayOutputStream()
-
-    private val idle = Color.parseColor("#3D7EDB")
-    private val rec = Color.parseColor("#DC3C3C")
-    private val work = Color.parseColor("#F0B428")
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -123,19 +117,22 @@ class BubbleService : Service() {
         }
     }
 
+    private val idlePx get() = (60 * density).roundToInt()
+    private val pillW get() = (176 * density).roundToInt()
+    private val pillH get() = (52 * density).roundToInt()
+
+    private fun setBubbleSize(pill: Boolean) {
+        lp.width = if (pill) pillW else idlePx
+        lp.height = if (pill) pillH else idlePx
+        bubble?.let { runCatching { wm.updateViewLayout(it, lp) } }
+    }
+
     @SuppressLint("ClickableViewAccessibility")
     private fun addBubble() {
-        val density = resources.displayMetrics.density
-        val size = (60 * density).roundToInt()
-        val v = ImageView(this)
-        v.setImageResource(android.R.drawable.ic_btn_speak_now)
-        v.setColorFilter(Color.WHITE)
-        val pad = (14 * density).roundToInt()
-        v.setPadding(pad, pad, pad, pad)
-        setTint(v, idle)
+        val v = WaveBubbleView(this)
 
         lp = WindowManager.LayoutParams(
-            size, size,
+            idlePx, idlePx,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
@@ -151,14 +148,14 @@ class BubbleService : Service() {
         var dragging = false
         var pressT = 0L
 
-        v.setOnTouchListener { view, e ->
+        v.setOnTouchListener { _, e ->
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     downRawX = e.rawX; downRawY = e.rawY
                     startX = lp.x; startY = lp.y
                     dragging = false
                     pressT = System.currentTimeMillis()
-                    startRecording(view as ImageView)
+                    startRecording()
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
@@ -167,12 +164,13 @@ class BubbleService : Service() {
                     if (!dragging && (abs(dx) > slop || abs(dy) > slop)) {
                         dragging = true
                         stopRecording(discard = true)
-                        setTint(view as ImageView, idle)
+                        v.state = WaveBubbleView.State.IDLE
+                        setBubbleSize(false)
                     }
                     if (dragging) {
                         lp.x = startX + dx.roundToInt()
                         lp.y = startY + dy.roundToInt()
-                        wm.updateViewLayout(view, lp)
+                        wm.updateViewLayout(v, lp)
                     }
                     true
                 }
@@ -181,8 +179,7 @@ class BubbleService : Service() {
                         val p = Prefs(this)
                         p.bubbleX = lp.x; p.bubbleY = lp.y
                     } else {
-                        val held = System.currentTimeMillis() - pressT
-                        finishRecording(view as ImageView, held)
+                        finishRecording(System.currentTimeMillis() - pressT)
                     }
                     true
                 }
@@ -193,15 +190,8 @@ class BubbleService : Service() {
         bubble = v
     }
 
-    private fun setTint(v: ImageView, color: Int) {
-        val bg = GradientDrawable()
-        bg.shape = GradientDrawable.OVAL
-        bg.setColor(color)
-        v.background = bg
-    }
-
     @SuppressLint("MissingPermission")
-    private fun startRecording(v: ImageView) {
+    private fun startRecording() {
         if (recording) return
         val minBuf = AudioRecord.getMinBufferSize(
             SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
@@ -216,13 +206,27 @@ class BubbleService : Service() {
         recorder = r
         recording = true
         r.startRecording()
-        setTint(v, rec)
-        v.animate().scaleX(1.15f).scaleY(1.15f).setDuration(100).start()
+        buzz(18)
+        bubble?.state = WaveBubbleView.State.REC
+        setBubbleSize(true)
         recThread = thread(name = "flow-rec") {
             val buf = ByteArray(minBuf)
             while (recording) {
                 val n = r.read(buf, 0, buf.size)
-                if (n > 0) pcm.write(buf, 0, n)
+                if (n > 0) {
+                    pcm.write(buf, 0, n)
+                    // peak of this chunk (16-bit LE) -> live waveform level
+                    var peak = 0
+                    var i = 0
+                    while (i < n - 1) {
+                        val s = (buf[i].toInt() and 0xff) or (buf[i + 1].toInt() shl 8)
+                        val a = abs(s.toShort().toInt())
+                        if (a > peak) peak = a
+                        i += 2
+                    }
+                    val lvl = peak / 32768f
+                    main.post { bubble?.pushLevel(lvl) }
+                }
             }
         }
     }
@@ -236,28 +240,39 @@ class BubbleService : Service() {
         if (discard) pcm.reset()
     }
 
-    private fun finishRecording(v: ImageView, heldMs: Long) {
+    private fun finishRecording(heldMs: Long) {
         stopRecording(discard = false)
-        v.animate().scaleX(1f).scaleY(1f).setDuration(100).start()
         val audio = pcm.toByteArray()
         pcm.reset()
         if (heldMs < 300 || audio.size < SAMPLE_RATE / 2) { // <0.25s of audio
-            setTint(v, idle)
+            bubble?.state = WaveBubbleView.State.IDLE
+            setBubbleSize(false)
             return
         }
-        setTint(v, work)
+        bubble?.state = WaveBubbleView.State.WORK
         thread(name = "flow-post") {
             val text = transcribe(audio)
             main.post {
-                setTint(v, idle)
+                bubble?.state = WaveBubbleView.State.IDLE
+                setBubbleSize(false)
                 if (text.isNullOrBlank()) {
                     toast("Flow: transcription failed")
                 } else {
-                    val fail = FlowAccessibilityService.insertText(this, text)
-                    if (fail != null) toast("Flow: $fail")
+                    // Trailing space so consecutive dictations don't run together.
+                    val fail = FlowAccessibilityService.insertText(this, text.trimEnd() + " ")
+                    if (fail != null) toast("Flow: $fail") else buzz(12)
                 }
             }
         }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun buzz(ms: Long) {
+        try {
+            val vib = getSystemService(VIBRATOR_SERVICE) as android.os.Vibrator
+            vib.vibrate(android.os.VibrationEffect.createOneShot(
+                ms, android.os.VibrationEffect.DEFAULT_AMPLITUDE))
+        } catch (_: Throwable) {}
     }
 
     private fun transcribe(pcmBytes: ByteArray): String? {
