@@ -241,6 +241,7 @@ class Recorder:
         self._ring_samples = 0
         self._recording = False
         self._stream = None
+        self.level = 0.0  # live RMS for the overlay waveform
         self._open()
 
     def _open(self):
@@ -256,6 +257,10 @@ class Recorder:
 
     def _on_audio(self, indata, *_):
         chunk = indata.copy()
+        try:
+            self.level = float(np.sqrt(np.mean(np.square(indata))))
+        except Exception:
+            pass
         if self._recording:
             self._chunks.append(chunk)
         else:
@@ -396,15 +401,34 @@ class StreamWorker:
             self.saved_clip = None
 
 
-class Overlay:
-    """Small always-on-top pill showing recording state (red = listening,
-    amber = transcribing), bottom-center of the screen. Tk lives in its own
-    thread; state changes arrive via a queue."""
+def describe_target(window):
+    """Human 'where the text is going' line from a window title. DISPLAY ONLY —
+    reflects what's already on the user's screen; never stored or sent."""
+    w = (window or "").strip()
+    if not w:
+        return ""
+    parts = re.split(r"\s+[—\-–|]\s+", w)
+    if len(parts) >= 2:
+        app = parts[-1].strip()
+        rest = " · ".join(p.strip() for p in parts[:-1]).strip()
+        return f"→ {app} · {rest}"[:60] if rest else f"→ {app}"[:60]
+    return f"→ {w}"[:60]
 
-    def __init__(self):
+
+class Overlay:
+    """Always-on-top listening pill: a live mic waveform + a status line +
+    a 'where the text is going' context line, at the bottom of the active
+    window. Tk runs in its own thread; state arrives via a queue. Reads the
+    live mic level through level_fn so the wave moves with your voice."""
+
+    N_BARS = 22
+    COLORS = {"rec": "#e0524d", "work": "#f0b428", "say": "#3ec97e"}
+
+    def __init__(self, level_fn=None):
         import queue
         self._q = queue.Queue()
         self._empty = queue.Empty
+        self._level_fn = level_fn or (lambda: 0.0)
         threading.Thread(target=self._run, daemon=True).start()
 
     def set(self, state):
@@ -423,79 +447,113 @@ class Overlay:
         except Exception as e:
             print(f"[overlay] unavailable: {e}")
             return
-        bg = "#15171c"
+        from collections import deque
+        bg, fg, sub = "#15171c", "#ececf0", "#8a8f98"
         root = tk.Tk()
         root.withdraw()
         root.overrideredirect(True)
         root.attributes("-topmost", True)
         try:
-            root.attributes("-alpha", 0.93)
+            root.attributes("-alpha", 0.96)
         except Exception:
             pass
         root.configure(bg=bg)
-        canvas = tk.Canvas(root, width=14, height=14, bg=bg, highlightthickness=0)
-        dot = canvas.create_oval(2, 2, 12, 12, fill="#dc3c3c", outline="")
-        canvas.pack(side="left", padx=(12, 6), pady=9)
-        label = tk.Label(root, text="Listening", fg="#e6e6e6", bg=bg,
-                         font=("Segoe UI", 10), wraplength=420, justify="left")
-        label.pack(side="left", padx=(0, 14))
+
+        BW, GAP, WH = 3, 2, 22
+        wave_w = self.N_BARS * (BW + GAP)
+        top = tk.Frame(root, bg=bg)
+        top.pack(fill="x", padx=13, pady=(9, 3))
+        canvas = tk.Canvas(top, width=14 + wave_w, height=WH, bg=bg,
+                           highlightthickness=0)
+        canvas.pack(side="left")
+        dot = canvas.create_oval(1, WH // 2 - 5, 11, WH // 2 + 5,
+                                 fill=self.COLORS["rec"], outline="")
+        bars = [canvas.create_rectangle(0, 0, 0, 0, fill=self.COLORS["rec"],
+                                        outline="") for _ in range(self.N_BARS)]
+        status = tk.Label(top, text="Listening", fg=fg, bg=bg,
+                          font=("Segoe UI", 10))
+        status.pack(side="left", padx=(9, 16))
+        context = tk.Label(root, text="", fg=sub, bg=bg, font=("Segoe UI", 8),
+                           anchor="w", justify="left")
+        context.pack(fill="x", padx=15, pady=(0, 8))
+
+        levels = deque([0.0] * self.N_BARS, maxlen=self.N_BARS)
+        st = {"mode": "idle"}
         hide_at = [None]
-        root.update_idletasks()
 
         def place():
-            # Bottom-center of the ACTIVE window — follows whichever monitor
-            # and app you're dictating into.
-            w = root.winfo_reqwidth()
+            root.update_idletasks()
+            w, h = root.winfo_reqwidth(), root.winfo_reqheight()
             try:
                 import ctypes
                 from ctypes import wintypes
-                h = ctypes.windll.user32.GetForegroundWindow()
+                hw = ctypes.windll.user32.GetForegroundWindow()
                 r = wintypes.RECT()
-                if h and ctypes.windll.user32.GetWindowRect(h, ctypes.byref(r)) \
+                if hw and ctypes.windll.user32.GetWindowRect(hw, ctypes.byref(r)) \
                         and r.right - r.left > 200 and r.bottom - r.top > 150:
-                    x = (r.left + r.right) // 2 - w // 2
-                    y = r.bottom - 90
-                    root.geometry(f"+{x}+{y}")
+                    root.geometry(f"+{(r.left + r.right) // 2 - w // 2}"
+                                  f"+{r.bottom - h - 26}")
                     return
             except Exception:
                 pass
-            x = (root.winfo_screenwidth() - w) // 2
-            root.geometry(f"+{x}+{root.winfo_screenheight() - 110}")
+            root.geometry(f"+{(root.winfo_screenwidth() - w) // 2}"
+                          f"+{root.winfo_screenheight() - 120}")
+
+        def draw_wave():
+            color = self.COLORS.get(st["mode"], "#e0524d")
+            live = st["mode"] == "rec"
+            lvl = min(1.0, self._level_fn() * 7.0) if live else 0.0
+            levels.append(lvl)
+            for i, rect in enumerate(bars):
+                h = max(2, levels[i] * WH)
+                cx = 15 + i * (BW + GAP)
+                canvas.coords(rect, cx, WH / 2 - h / 2, cx + BW, WH / 2 + h / 2)
+                canvas.itemconfig(rect, fill=color)
+
+        def show(mode):
+            st["mode"] = mode
+            canvas.itemconfig(dot, fill=self.COLORS.get(mode, "#e0524d"))
+            root.deiconify()
 
         def poll():
             try:
                 while True:
-                    state = self._q.get_nowait()
-                    if isinstance(state, tuple) and state[0] == "say":
-                        # Command response: show the text so command mode never
-                        # depends on audio alone.
-                        canvas.itemconfig(dot, fill="#3ec97e")
-                        label.config(text=state[1][:300])
-                        place()
-                        root.deiconify()
-                        hide_at[0] = time.time() + max(4, min(12, len(state[1]) / 18))
-                    elif state == "rec":
-                        canvas.itemconfig(dot, fill="#dc3c3c")
-                        label.config(text="Listening")
+                    s = self._q.get_nowait()
+                    kind = s[0] if isinstance(s, tuple) else s
+                    if kind == "rec":
+                        status.config(text="Listening")
+                        context.config(
+                            text=describe_target(s[1] if isinstance(s, tuple)
+                                                 and len(s) > 1 else ""))
                         hide_at[0] = None
+                        show("rec")
                         place()
-                        root.deiconify()
-                    elif state == "work":
-                        canvas.itemconfig(dot, fill="#f0b428")
-                        label.config(text="Transcribing…")
+                    elif kind == "work":
+                        status.config(text="Transcribing…")
+                        context.config(text="")
                         hide_at[0] = None
-                        root.deiconify()
-                    else:
+                        show("work")
+                    elif kind == "say":
+                        status.config(text=s[1][:200])
+                        context.config(text="")
+                        show("say")
+                        place()
+                        hide_at[0] = time.time() + max(4, min(12, len(s[1]) / 18))
+                    else:  # idle
                         if hide_at[0] is None:
+                            st["mode"] = "idle"
                             root.withdraw()
             except self._empty:
                 pass
             except Exception as e:
                 print(f"[overlay] poll error (continuing): {e}")
+            if st["mode"] in ("rec", "work"):
+                draw_wave()
             if hide_at[0] is not None and time.time() > hide_at[0]:
                 hide_at[0] = None
+                st["mode"] = "idle"
                 root.withdraw()
-            root.after(80, poll)  # always reschedule — never let the loop die
+            root.after(45, poll)  # ~22fps waveform; always reschedule
 
         poll()
         root.mainloop()
@@ -635,7 +693,8 @@ class Flow:
         self.started_at = time.time()
         self.last_pull = None  # last delta sync by multivac (server sets this)
         self.tray = None
-        self.overlay = Overlay() if self.cfg.get("overlay", True) else None
+        self.overlay = (Overlay(level_fn=lambda: self.recorder.level)
+                        if self.cfg.get("overlay", True) else None)
         self.model = None
         if self.cfg["mode"] == "client":
             # Thin client: no model, no store (the full server stores), no GPU.
@@ -681,11 +740,16 @@ class Flow:
         except Exception as e:
             print(f"[cleanup] warmup failed ({e}) — is Ollama running?")
 
-    def set_icon(self, state):
+    def set_icon(self, state, context=None):
         if self.tray:
             self.tray.icon = make_icon(state)
         if self.overlay:
-            self.overlay.set(state)
+            # Enrich the listening state with the target window so the pill can
+            # show "→ where the text is going" (display-only, never sent).
+            if state == "rec":
+                self.overlay.set(("rec", context or foreground_window()))
+            else:
+                self.overlay.set(state)
 
     def on_press(self, mode="dictate"):
         with self._session_lock:
