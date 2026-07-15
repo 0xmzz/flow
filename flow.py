@@ -258,7 +258,9 @@ class Recorder:
     def _on_audio(self, indata, *_):
         chunk = indata.copy()
         try:
-            self.level = float(np.sqrt(np.mean(np.square(indata))))
+            # Peak (not RMS) — shows the transient peaks of the voice, which is
+            # what reads as a waveform. RMS averages them out to a flat nub.
+            self.level = float(np.abs(indata).max())
         except Exception:
             pass
         if self._recording:
@@ -479,6 +481,7 @@ class Overlay:
 
         levels = deque([0.0] * self.N_BARS, maxlen=self.N_BARS)
         st = {"mode": "idle"}
+        agc = {"ref": 0.08}  # decaying reference peak for auto-gain
         hide_at = [None]
 
         def place():
@@ -502,8 +505,13 @@ class Overlay:
         def draw_wave():
             color = self.COLORS.get(st["mode"], "#e0524d")
             live = st["mode"] == "rec"
-            lvl = min(1.0, self._level_fn() * 7.0) if live else 0.0
-            levels.append(lvl)
+            raw = self._level_fn() if live else 0.0
+            # Auto-gain: normalize against a decaying recent peak so the wave
+            # fills the pill whatever the mic gain is; noise gate keeps silence
+            # flat; **0.6 curve lifts quiet speech into visible range.
+            agc["ref"] = max(raw, agc["ref"] * 0.93, 0.03)
+            norm = 0.0 if raw < 0.015 else min(1.0, (raw / agc["ref"]) ** 0.6)
+            levels.append(norm)
             for i, rect in enumerate(bars):
                 h = max(2, levels[i] * WH)
                 cx = 15 + i * (BW + GAP)
