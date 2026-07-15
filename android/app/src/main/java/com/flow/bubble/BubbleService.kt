@@ -118,8 +118,8 @@ class BubbleService : Service() {
     }
 
     private val idlePx get() = (60 * density).roundToInt()
-    private val pillW get() = (176 * density).roundToInt()
-    private val pillH get() = (52 * density).roundToInt()
+    private val pillW get() = (188 * density).roundToInt()
+    private val pillH get() = (60 * density).roundToInt()
 
     private fun setBubbleSize(pill: Boolean) {
         lp.width = if (pill) pillW else idlePx
@@ -207,6 +207,7 @@ class BubbleService : Service() {
         recording = true
         r.startRecording()
         buzz(18)
+        bubble?.label = FlowAccessibilityService.currentTarget(this)  // where it'll go
         bubble?.state = WaveBubbleView.State.REC
         setBubbleSize(true)
         recThread = thread(name = "flow-rec") {

@@ -20,6 +20,24 @@ class FlowAccessibilityService : AccessibilityService() {
             instance?.windows?.any { it.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD }
                 ?: false
 
+        /** Human 'where the text is going' — app name (+ field hint) of the
+         *  focused editable, for the bubble's context line. "" if unknown. */
+        fun currentTarget(ctx: Context): String {
+            val svc = instance ?: return ""
+            val node = svc.findEditTarget()
+            val pkg = node?.packageName?.toString()
+                ?: svc.rootInActiveWindow?.packageName?.toString()
+                ?: return ""
+            val app = try {
+                val pm = ctx.packageManager
+                pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString()
+            } catch (_: Exception) {
+                pkg.substringAfterLast('.')
+            }
+            val hint = node?.hintText?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+            return if (hint != null) "$app · $hint" else app
+        }
+
         /** Insert text into the focused editable field. Returns a human reason
          *  on failure (text is left on the clipboard either way), null on success. */
         fun insertText(ctx: Context, text: String): String? {

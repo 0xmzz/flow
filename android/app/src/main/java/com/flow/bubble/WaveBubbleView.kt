@@ -25,6 +25,9 @@ class WaveBubbleView(ctx: Context) : View(ctx) {
             postInvalidateOnAnimation()
         }
 
+    /** "where the text is going" — shown above the waveform while recording. */
+    var label: String = ""
+
     private val d = resources.displayMetrics.density
     private val nBars = 18
     private val levels = FloatArray(nBars)
@@ -74,16 +77,32 @@ class WaveBubbleView(ctx: Context) : View(ctx) {
     private fun drawWave(c: Canvas, w: Float, h: Float) {
         p.style = Paint.Style.FILL
         p.color = cPill
-        c.drawRoundRect(RectF(0f, 0f, w, h), h / 2, h / 2, p)
+        c.drawRoundRect(RectF(0f, 0f, w, h), 16 * d, 16 * d, p)
+        // "→ where it's going" caption at the top (if the accessibility service
+        // could name it), waveform centred in the space below.
+        val hasLabel = label.isNotEmpty()
+        var topPad = 0f
+        if (hasLabel) {
+            p.color = Color.parseColor("#9AA0AA")
+            p.textSize = 10 * d
+            p.textAlign = Paint.Align.CENTER
+            var t = "→ $label"
+            while (p.measureText(t) > w - 20 * d && t.length > 4) t = t.dropLast(1)
+            c.drawText(t, w / 2, 15 * d, p)
+            p.textAlign = Paint.Align.LEFT
+            topPad = 14 * d
+        }
+        val cy = topPad + (h - topPad) / 2
         p.color = cRec
         val pad = 16 * d
         val bw = 3 * d
         val gap = (w - 2 * pad - bw) / (nBars - 1) - bw
+        val span = (h - topPad) * 0.66f
         for (i in 0 until nBars) {
             val lvl = levels[(head + i) % nBars]
-            val bh = max(3 * d, lvl * (h * 0.62f))
+            val bh = max(3 * d, lvl * span)
             val x = pad + i * (bw + gap)
-            c.drawRoundRect(RectF(x, h / 2 - bh / 2, x + bw, h / 2 + bh / 2), bw / 2, bw / 2, p)
+            c.drawRoundRect(RectF(x, cy - bh / 2, x + bw, cy + bh / 2), bw / 2, bw / 2, p)
         }
     }
 
