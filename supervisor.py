@@ -27,8 +27,47 @@ CRASH = APP / "data" / "flow-crash.log"
 CRASH.parent.mkdir(parents=True, exist_ok=True)
 CREATE_NO_WINDOW = 0x08000000
 
+
+def client_self_update():
+    """Thin clients pull the latest app files from the Flow server before each
+    launch, so improvements to flow.py propagate automatically (like the phone
+    APK does). No-op on the host (mode != client)."""
+    import json
+    import urllib.request
+    cfg_path = APP / "config.json"
+    if not cfg_path.exists():
+        return
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return
+    if cfg.get("mode") != "client":
+        return
+    url = (cfg.get("server_url") or "").rstrip("/")
+    if not url:
+        return
+    try:
+        ver = json.loads(urllib.request.urlopen(
+            url + "/client/version", timeout=6).read())["version"]
+    except Exception:
+        return  # server down / offline — keep running the current files
+    vfile = APP / ".client_version"
+    if vfile.exists() and vfile.read_text().strip() == ver:
+        return
+    for f in ("flow.py", "store.py", "llm.py", "commands.py", "supervisor.py",
+              "flow.ico"):
+        try:
+            data = urllib.request.urlopen(url + "/client/file/" + f, timeout=20).read()
+            (APP / f).write_bytes(data)
+        except Exception:
+            return  # partial fetch — don't record the version, retry next launch
+    vfile.write_text(ver)
+    print(f"[update] client updated to {ver}")
+
+
 fails = []
 while True:
+    client_self_update()
     with LOG.open("w", encoding="utf-8") as out:
         code = subprocess.call([PYW, FLOW], cwd=str(APP), stdout=out,
                                stderr=subprocess.STDOUT,

@@ -207,6 +207,17 @@ def make_server(flow, host, port, token):
                 self.end_headers()
                 self.wfile.write(data)
                 return
+            if path == "/client/version":
+                import hashlib
+                from pathlib import Path
+                d = Path(__file__).parent
+                h = hashlib.sha1()
+                for f in ("flow.py", "store.py", "llm.py", "commands.py",
+                          "supervisor.py", "flow.ico"):
+                    p = d / f
+                    if p.exists():
+                        h.update(p.read_bytes())
+                return self._json(200, {"version": h.hexdigest()[:12]})
             if path.startswith("/client/file/"):
                 from pathlib import Path
                 name = path.split("/")[-1]
