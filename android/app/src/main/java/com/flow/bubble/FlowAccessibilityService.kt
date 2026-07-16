@@ -14,6 +14,9 @@ class FlowAccessibilityService : AccessibilityService() {
     companion object {
         private var instance: FlowAccessibilityService? = null
 
+        /** Package the last insert actually landed in (diagnostics). */
+        var lastTargetPkg: String = ""
+
         fun isEnabled() = instance != null
 
         fun imeVisible(): Boolean =
@@ -57,6 +60,7 @@ class FlowAccessibilityService : AccessibilityService() {
                 ?: return "Accessibility service is OFF - enable Flow in Settings > Accessibility"
             val node = svc.findEditTarget()
                 ?: return "No text field focused - tap into a field first (text copied)"
+            lastTargetPkg = node.packageName?.toString() ?: "?"
             val before = fieldText(node)
             val probe = text.trim().takeLast(12)
 
@@ -90,16 +94,21 @@ class FlowAccessibilityService : AccessibilityService() {
         }
     }
 
-    /** Focused input node, with a fallback sweep for editable+focused nodes. */
+    /** Focused editable in the ACTIVE app's window ONLY. A global sweep can
+     *  find an editable in a background/IME window — pasting there "succeeds"
+     *  invisibly, which is exactly the silent-failure users see. */
     private fun findEditTarget(): AccessibilityNodeInfo? {
-        findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+        val active = rootInActiveWindow
+        val activePkg = active?.packageName?.toString()
+        active?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
             ?.takeIf { it.isEditable }?.let { return it }
-        for (w in windows) {
-            val root = w.root ?: continue
-            root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
-                ?.takeIf { it.isEditable }?.let { return it }
-            findEditable(root, 0)?.let { return it }
-        }
+        // Global input focus is acceptable only if it belongs to the active app.
+        findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+            ?.takeIf { it.isEditable && (activePkg == null ||
+                it.packageName?.toString() == activePkg) }
+            ?.let { return it }
+        // Last resort: sweep the ACTIVE window's tree only.
+        active?.let { findEditable(it, 0) }?.let { return it }
         return null
     }
 

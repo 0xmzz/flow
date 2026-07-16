@@ -162,10 +162,7 @@ class BubbleService : Service() {
                     val dx = e.rawX - downRawX
                     val dy = e.rawY - downRawY
                     if (!dragging && (abs(dx) > slop || abs(dy) > slop)) {
-                        dragging = true
-                        stopRecording(discard = true)
-                        v.state = WaveBubbleView.State.IDLE
-                        setBubbleSize(false)
+                        dragging = true  // recording CONTINUES while moving (Wispr parity)
                     }
                     if (dragging) {
                         lp.x = startX + dx.roundToInt()
@@ -178,9 +175,10 @@ class BubbleService : Service() {
                     if (dragging) {
                         val p = Prefs(this)
                         p.bubbleX = lp.x; p.bubbleY = lp.y
-                    } else {
-                        finishRecording(System.currentTimeMillis() - pressT)
                     }
+                    // moved or not, releasing finishes the dictation (short
+                    // holds are discarded by the duration guard anyway)
+                    finishRecording(System.currentTimeMillis() - pressT)
                     true
                 }
                 else -> false
@@ -352,18 +350,19 @@ class BubbleService : Service() {
                 }
                 if (fail == null) {
                     main.post { buzz(12) }
+                    report("insert-ok", "pkg=" + FlowAccessibilityService.lastTargetPkg)
                 } else {
                     val f = fail
                     main.post { toast("Flow: $f") }
-                    reportInsertFail(f)
+                    report("insert-fail", f)
                 }
             }
         }
     }
 
-    /** Ship the insertion-failure reason to the server's client.log so the
-     *  clipboard-fallback cause is visible without phone-side debugging. */
-    private fun reportInsertFail(reason: String) {
+    /** Ship insert diagnostics to the server's client.log so behavior is
+     *  visible without phone-side debugging. */
+    private fun report(tag: String, msg: String) {
         thread {
             runCatching {
                 val c = URL(Prefs(this).serverUrl.trimEnd('/') + "/clientlog")
@@ -373,8 +372,8 @@ class BubbleService : Service() {
                 c.connectTimeout = 4000
                 c.setRequestProperty("Content-Type", "application/json")
                 c.setRequestProperty("X-Device", "android-bubble")
-                val body = JSONObject().put("tag", "insert-fail")
-                    .put("message", reason + " | target=" +
+                val body = JSONObject().put("tag", tag)
+                    .put("message", msg + " | app=" +
                         FlowAccessibilityService.currentTarget(this)).toString()
                 c.outputStream.use { it.write(body.toByteArray()) }
                 c.responseCode
