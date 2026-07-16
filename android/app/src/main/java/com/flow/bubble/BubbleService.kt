@@ -190,6 +190,11 @@ class BubbleService : Service() {
         bubble = v
     }
 
+    // --- streaming session state (text appears while you speak) ---
+    @Volatile private var streamSid: String? = null
+    private val streamBuf = ByteArrayOutputStream()
+    private var streamTarget = ""
+
     @SuppressLint("MissingPermission")
     private fun startRecording() {
         if (recording) return
@@ -207,15 +212,28 @@ class BubbleService : Service() {
         recording = true
         r.startRecording()
         buzz(18)
-        bubble?.label = FlowAccessibilityService.currentTarget(this)  // where it'll go
+        streamTarget = FlowAccessibilityService.currentTarget(this)
+        bubble?.label = streamTarget
         bubble?.state = WaveBubbleView.State.REC
         setBubbleSize(true)
+        // open a streaming session (best-effort; falls back to one-shot)
+        streamSid = null
+        synchronized(streamBuf) { streamBuf.reset() }
+        thread(name = "flow-stream-open") {
+            streamSid = runCatching {
+                val c = conn(Prefs(this).serverUrl, "/stream/start", 4000)
+                c.outputStream.use { it.write(ByteArray(0)) }
+                JSONObject(c.inputStream.bufferedReader().readText()).getString("sid")
+            }.getOrNull()
+            if (streamSid != null) streamLoop()
+        }
         recThread = thread(name = "flow-rec") {
             val buf = ByteArray(minBuf)
             while (recording) {
                 val n = r.read(buf, 0, buf.size)
                 if (n > 0) {
                     pcm.write(buf, 0, n)
+                    synchronized(streamBuf) { streamBuf.write(buf, 0, n) }
                     // peak of this chunk (16-bit LE) -> live waveform level
                     var peak = 0
                     var i = 0
@@ -232,6 +250,41 @@ class BubbleService : Service() {
         }
     }
 
+    /** Upload buffered audio every ~400ms; show the committed text on the pill. */
+    private fun streamLoop() {
+        val sid = streamSid ?: return
+        while (recording && streamSid == sid) {
+            Thread.sleep(400)
+            val chunk = synchronized(streamBuf) {
+                val b = streamBuf.toByteArray(); streamBuf.reset(); b
+            }
+            if (chunk.isEmpty()) continue
+            val committed = runCatching {
+                val c = conn(Prefs(this).serverUrl, "/stream/$sid/audio", 6000)
+                c.outputStream.use { it.write(chunk) }
+                JSONObject(c.inputStream.bufferedReader().readText())
+                    .optString("committed", "")
+            }.getOrNull() ?: continue
+            if (committed.isNotEmpty()) {
+                main.post {
+                    // live text preview replaces the target caption while talking
+                    bubble?.label = "…" + committed.takeLast(34)
+                }
+            }
+        }
+    }
+
+    private fun conn(base: String, path: String, timeoutMs: Int): HttpURLConnection {
+        val c = URL(base.trimEnd('/') + path).openConnection() as HttpURLConnection
+        c.requestMethod = "POST"
+        c.doOutput = true
+        c.connectTimeout = timeoutMs
+        c.readTimeout = 30000
+        c.setRequestProperty("Authorization", "Bearer " + Prefs(this).token)
+        c.setRequestProperty("X-Device", "android-bubble")
+        return c
+    }
+
     private fun stopRecording(discard: Boolean) {
         if (!recording) return
         recording = false
@@ -243,16 +296,44 @@ class BubbleService : Service() {
 
     private fun finishRecording(heldMs: Long) {
         stopRecording(discard = false)
+        val sid = streamSid
+        streamSid = null
         val audio = pcm.toByteArray()
         pcm.reset()
         if (heldMs < 300 || audio.size < SAMPLE_RATE / 2) { // <0.25s of audio
             bubble?.state = WaveBubbleView.State.IDLE
             setBubbleSize(false)
+            if (sid != null) thread {
+                runCatching {
+                    val c = conn(Prefs(this).serverUrl, "/stream/$sid/cancel", 4000)
+                    c.outputStream.use { it.write(ByteArray(0)) }
+                    c.inputStream.close()
+                }
+            }
             return
         }
         bubble?.state = WaveBubbleView.State.WORK
         thread(name = "flow-post") {
-            val text = transcribe(audio)
+            // Prefer the streaming finish (only the tail decodes — fast);
+            // fall back to the classic one-shot upload.
+            var text: String? = null
+            if (sid != null) {
+                text = runCatching {
+                    val tail = synchronized(streamBuf) {
+                        val b = streamBuf.toByteArray(); streamBuf.reset(); b
+                    }
+                    if (tail.isNotEmpty()) {
+                        val a = conn(Prefs(this).serverUrl, "/stream/$sid/audio", 6000)
+                        a.outputStream.use { it.write(tail) }
+                        a.inputStream.close()
+                    }
+                    val c = conn(Prefs(this).serverUrl, "/stream/$sid/finish", 6000)
+                    c.outputStream.use { it.write(ByteArray(0)) }
+                    JSONObject(c.inputStream.bufferedReader().readText())
+                        .getString("text")
+                }.getOrNull()
+            }
+            if (text == null) text = transcribe(audio)
             main.post {
                 bubble?.state = WaveBubbleView.State.IDLE
                 setBubbleSize(false)
@@ -278,20 +359,25 @@ class BubbleService : Service() {
 
     private fun transcribe(pcmBytes: ByteArray): String? {
         val p = Prefs(this)
-        return runCatching {
-            val url = URL(p.serverUrl.trimEnd('/') + "/transcribe")
-            val c = url.openConnection() as HttpURLConnection
-            c.requestMethod = "POST"
-            c.doOutput = true
-            c.connectTimeout = 5000
-            c.readTimeout = 30000
-            c.setRequestProperty("Authorization", "Bearer " + p.token)
-            c.setRequestProperty("Content-Type", "audio/wav")
-            c.setRequestProperty("X-Device", "android-bubble")
-            c.outputStream.use { it.write(wav(pcmBytes)) }
-            val body = c.inputStream.bufferedReader().readText()
-            JSONObject(body).getString("text")
-        }.getOrNull()
+        // beast 5090 first; the always-on multivac 4080 node when beast sleeps
+        for (base in listOf(p.serverUrl, p.fallbackUrl)) {
+            if (base.isBlank()) continue
+            val out = runCatching {
+                val c = URL(base.trimEnd('/') + "/transcribe")
+                    .openConnection() as HttpURLConnection
+                c.requestMethod = "POST"
+                c.doOutput = true
+                c.connectTimeout = 5000
+                c.readTimeout = 30000
+                c.setRequestProperty("Authorization", "Bearer " + p.token)
+                c.setRequestProperty("Content-Type", "audio/wav")
+                c.setRequestProperty("X-Device", "android-bubble")
+                c.outputStream.use { it.write(wav(pcmBytes)) }
+                JSONObject(c.inputStream.bufferedReader().readText()).getString("text")
+            }.getOrNull()
+            if (out != null) return out
+        }
+        return null
     }
 
     private fun wav(pcmBytes: ByteArray): ByteArray {

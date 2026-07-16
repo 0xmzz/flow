@@ -13,6 +13,10 @@ class Prefs(ctx: Context) {
         get() = p.getString("token", "")!!
         set(v) = p.edit().putString("token", v).apply()
 
+    var fallbackUrl: String
+        get() = p.getString("fallback_url", "http://100.108.50.120:8757")!!
+        set(v) = p.edit().putString("fallback_url", v).apply()
+
     var bubbleX: Int
         get() = p.getInt("bx", 8)
         set(v) = p.edit().putInt("bx", v).apply()

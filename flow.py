@@ -88,6 +88,7 @@ _install_crash_logging()
 DEFAULTS = {
     "mode": "full",                # "full" = local GPU; "client" = thin client
     "server_url": "",              # client mode: the full Flow server, e.g. http://100.64.112.82:8756
+    "fallback_server_url": "http://100.108.50.120:8757",  # multivac 4080 node (one-shot only)
     "client_name": "",             # client mode: device tag (defaults to hostname)
     # Devices whose dictations join YOUR corpus/Hermes context. Anything else
     # is stored private: no audio archive, excluded from the Hermes sweep.
@@ -155,6 +156,7 @@ DEFAULTS = {
         "unstable_tail_s": 0.6,    # words this close to the buffer edge may still change
         "pause_gap_s": 0.25,       # only cut audio at a gap this long (format integrity)
         "live_type": True,         # paste committed words WHILE you talk
+        "client": True,            # thin clients: stream chunks to the server + live-type
                                    # (only in windows with no style profile —
                                    # styled text must wait for the full utterance)
     },
@@ -298,8 +300,9 @@ class StreamWorker:
     the uncommitted tail needs decoding, so release-to-paste stays ~constant no
     matter how long the dictation ran."""
 
-    def __init__(self, flow, live=False):
+    def __init__(self, flow, live=False, source=None):
         self.flow = flow
+        self.source = source or flow.recorder  # anything with .snapshot()
         self.committed_text = ""
         self.committed_samples = 0
         self.live = live         # paste committed words while still recording
@@ -337,7 +340,7 @@ class StreamWorker:
                 return
             if self.flow.model_lock.locked():
                 continue  # don't queue behind other GPU work; try next cycle
-            snap = self.flow.recorder.snapshot()
+            snap = self.source.snapshot()
             tail = snap[self.committed_samples:]
             if len(tail) < sr * 1.5:
                 continue
@@ -401,6 +404,119 @@ class StreamWorker:
             except Exception:
                 pass
             self.saved_clip = None
+
+
+class ClientStreamer:
+    """Thin-client streaming: upload PCM16 chunks to the server while the key
+    is held, live-type the committed text the server returns (committed text
+    never retracts, so typing it early is safe)."""
+
+    def __init__(self, flow):
+        self.flow = flow
+        self.sid = None
+        self.committed = ""
+        self.typed = 0
+        self.sent = 0
+        self.saved_clip = None
+        self._active = False
+        self._thread = None
+
+    def _url(self, path):
+        return self.flow.cfg["server_url"].rstrip("/") + path
+
+    def _hdr(self):
+        name = (self.flow.cfg.get("client_name")
+                or os.environ.get("COMPUTERNAME", "client"))
+        return {"Authorization": "Bearer " + self.flow.cfg["server"]["token"],
+                "X-Device": f"{name}|{foreground_window()}"[:200]}
+
+    def start(self):
+        import requests
+        try:
+            r = requests.post(self._url("/stream/start"), headers=self._hdr(),
+                              timeout=4)
+            r.raise_for_status()
+            self.sid = r.json()["sid"]
+        except Exception as e:
+            print(f"[client-stream] unavailable ({e}); one-shot fallback")
+            return
+        try:
+            self.saved_clip = pyperclip.paste()
+        except Exception:
+            pass
+        self._active = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self):
+        import requests
+        sr = self.flow.cfg["sample_rate"]
+        while self._active:
+            time.sleep(0.35)
+            snap = self.flow.recorder.snapshot()
+            new = snap[self.sent:]
+            if len(new) < sr * 0.25:
+                continue
+            pcm = (np.clip(new, -1, 1) * 32767).astype("<i2").tobytes()
+            try:
+                r = requests.post(self._url(f"/stream/{self.sid}/audio"),
+                                  data=pcm, headers=self._hdr(), timeout=6)
+                r.raise_for_status()
+                self.sent = len(snap)
+                self.committed = r.json().get("committed", "")
+                self._type_delta()
+            except Exception as e:
+                print(f"[client-stream] chunk failed: {e}")
+
+    def _type_delta(self):
+        chunk = self.committed[self.typed:]
+        if not chunk:
+            return
+        try:
+            pyperclip.copy(chunk)
+            time.sleep(0.02)
+            keyboard.send("ctrl+v")  # user is already holding ctrl — paste is safe
+            self.typed = len(self.committed)
+        except Exception as e:
+            print(f"[client-stream] live type failed: {e}")
+
+    def stop(self):
+        """on_release calls this like a StreamWorker; the real work is finish()."""
+        self._active = False
+        if self._thread:
+            self._thread.join(2.0)
+        return self.committed, 0
+
+    def finish(self):
+        """Stop uploading; final decode on the server. Returns (text, typed)."""
+        import requests
+        self._active = False
+        if self._thread:
+            self._thread.join(2.0)
+        if not self.sid:
+            return None, 0  # streaming never started -> caller does one-shot
+        # ship any remaining audio, then finish
+        try:
+            snap = self.flow.recorder.snapshot()
+            new = snap[self.sent:]
+            if len(new):
+                pcm = (np.clip(new, -1, 1) * 32767).astype("<i2").tobytes()
+                requests.post(self._url(f"/stream/{self.sid}/audio"), data=pcm,
+                              headers=self._hdr(), timeout=6)
+            r = requests.post(self._url(f"/stream/{self.sid}/finish"),
+                              headers=self._hdr(), timeout=30)
+            r.raise_for_status()
+            return r.json().get("text", ""), self.typed
+        except Exception as e:
+            print(f"[client-stream] finish failed: {e}")
+            return None, self.typed
+
+    def restore_clipboard(self):
+        if self.saved_clip is not None:
+            try:
+                pyperclip.copy(self.saved_clip)
+            except Exception:
+                pass
 
 
 def describe_target(window):
@@ -769,8 +885,12 @@ class Flow:
             self.set_icon("rec")
             if self.cfg.get("mute_output_while_recording"):
                 self.muter.mute()
-            if (mode == "dictate" and self.cfg["streaming"]["enabled"]
-                    and self.cfg["mode"] != "client"):
+            if mode == "dictate" and self.cfg["streaming"]["enabled"]:
+                if self.cfg["mode"] == "client":
+                    if self.cfg["streaming"].get("client", True):
+                        self.streamer = ClientStreamer(self)
+                        self.streamer.start()
+                    return
                 # Live typing only where no style profile applies — styled text
                 # must wait for the whole utterance.
                 live = (self.cfg["streaming"].get("live_type", True)
@@ -875,9 +995,21 @@ class Flow:
                 if dur < self.cfg["min_duration_s"]:
                     return
                 if self.cfg["mode"] == "client":
-                    text = self.client_transcribe(audio, "/transcribe")
-                    if text:
-                        paste_text(text, self.cfg["paste_mode"])
+                    if isinstance(streamer, ClientStreamer) and streamer.sid:
+                        text, typed = streamer.finish()
+                        if text is None:  # server lost the session mid-flight
+                            text, typed = self.client_transcribe(audio, "/transcribe"), 0
+                        remainder = (text or "")[typed:]
+                        if remainder:
+                            paste_text(remainder, "clipboard",
+                                       restore=typed == 0)
+                        if typed:
+                            time.sleep(0.3)
+                            streamer.restore_clipboard()
+                    else:
+                        text = self.client_transcribe(audio, "/transcribe")
+                        if text:
+                            paste_text(text, self.cfg["paste_mode"])
                     return
                 if self.cfg.get("save_last_audio"):
                     save_wav(APP_DIR / "last.wav", audio, self.cfg["sample_rate"])
@@ -926,31 +1058,39 @@ class Flow:
                 self.set_icon("idle")
 
     def client_transcribe(self, audio, route, field="text"):
-        """Thin client: ship the audio to the full Flow server, return the text."""
+        """Thin client: ship audio to the main server; on failure fall back to
+        the always-on multivac node (plain transcription, /transcribe only)."""
         import requests
 
         from store import wav_bytes
         name = self.cfg.get("client_name") or os.environ.get("COMPUTERNAME", "client")
-        try:
-            r = requests.post(
-                self.cfg["server_url"].rstrip("/") + route,
-                data=wav_bytes(audio, self.cfg["sample_rate"]),
-                headers={
-                    "Authorization": "Bearer " + self.cfg["server"]["token"],
-                    "Content-Type": "audio/wav",
-                    "X-Device": f"{name}|{foreground_window()}"[:200],
-                },
-                timeout=60,
-            )
-            r.raise_for_status()
-            out = r.json().get(field, "")
-            print(f"[client] {route} -> {out[:80]!r}")
-            return out
-        except Exception as e:
-            print(f"[client] {route} failed: {e}")
-            if self.overlay:
-                self.overlay.set(("say", f"Flow server unreachable: {e}"))
-            return ""
+        lanes = [self.cfg["server_url"]]
+        if route == "/transcribe" and self.cfg.get("fallback_server_url"):
+            lanes.append(self.cfg["fallback_server_url"])
+        last_err = None
+        for i, base in enumerate(lanes):
+            try:
+                r = requests.post(
+                    base.rstrip("/") + route,
+                    data=wav_bytes(audio, self.cfg["sample_rate"]),
+                    headers={
+                        "Authorization": "Bearer " + self.cfg["server"]["token"],
+                        "Content-Type": "audio/wav",
+                        "X-Device": f"{name}|{foreground_window()}"[:200],
+                    },
+                    timeout=60,
+                )
+                r.raise_for_status()
+                out = r.json().get(field, "")
+                lane = "primary" if i == 0 else "fallback"
+                print(f"[client] {route} via {lane} -> {out[:80]!r}")
+                return out
+            except Exception as e:
+                last_err = e
+                print(f"[client] {route} lane {i} failed: {e}")
+        if self.overlay:
+            self.overlay.set(("say", f"Flow unreachable: {last_err}"))
+        return ""
 
     def remote_start(self):
         """Bridge mode (e.g. the work VM): a remote client starts a host-mic
@@ -966,6 +1106,12 @@ class Flow:
             self.set_icon("rec")
             if self.cfg.get("mute_output_while_recording"):
                 self.muter.mute()
+            if self.cfg["streaming"]["enabled"]:
+                # Host-side streaming for the VM bridge: commits accumulate
+                # while the key is held; the daemon polls /record/partial and
+                # types committed deltas live.
+                self.remote_streamer = StreamWorker(self, live=False)
+                self.remote_streamer.start()
             # Orphan guard: if the client dies mid-recording, don't record forever.
             t = threading.Timer(600, lambda: self.remote_cancel(gen))
             t.daemon = True
@@ -978,6 +1124,9 @@ class Flow:
             if not (self.recording and self.active_mode == "remote"):
                 return None
             self.recording = False
+            streamer = getattr(self, "remote_streamer", None)
+            self.remote_streamer = None
+            committed = streamer.stop() if streamer else ("", 0)
             audio = self.recorder.stop()
             self.muter.restore()
         with self.busy:
@@ -985,9 +1134,15 @@ class Flow:
             try:
                 if len(audio) / self.cfg["sample_rate"] < self.cfg["min_duration_s"]:
                     return ""
+                partial_served = bool(streamer and streamer.committed_text)
                 text, _ = self.transcribe_and_store(
-                    audio, source="vm-bridge", window=window)
-                return apply_replacements(text, self.cfg) if text else ""
+                    audio, source="vm-bridge", window=window,
+                    committed=committed, skip_cleanup=partial_served)
+                if not text:
+                    return ""
+                # Replacements would shift the already-typed prefix out of
+                # alignment — only apply them when nothing was typed live.
+                return text if partial_served else apply_replacements(text, self.cfg)
             finally:
                 self.set_icon("idle")
 
@@ -998,6 +1153,10 @@ class Flow:
             if gen is not None and gen != self._remote_gen:
                 return False  # a newer session owns the recorder now
             self.recording = False
+            streamer = getattr(self, "remote_streamer", None)
+            self.remote_streamer = None
+            if streamer:
+                streamer.stop()
             self.recorder.stop()
             self.muter.restore()
             self.set_icon("idle")

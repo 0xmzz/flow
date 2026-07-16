@@ -49,6 +49,9 @@ def _parse_multipart(body, content_type):
 
 
 def make_server(flow, host, port, token):
+    from streaming import SessionManager
+    streams = SessionManager(flow)
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "Flow/1.0"
 
@@ -117,6 +120,37 @@ def make_server(flow, host, port, token):
             if not self._authed():
                 return self._json(401, {"error": "unauthorized"})
             device = self.headers.get("X-Device", "phone")
+            if path.startswith("/stream/"):
+                parts = path.split("/")  # /stream/start | /stream/<sid>/<op>
+                if parts[2] == "start":
+                    s = streams.start(device)
+                    return self._json(200, {"sid": s.sid})
+                sid, op = parts[2], (parts[3] if len(parts) > 3 else "")
+                s = streams.get(sid)
+                if not s:
+                    return self._json(404, {"error": "no such stream"})
+                if op == "audio":
+                    committed = s.add_audio(self._body())
+                    if committed:
+                        s.partial_served = True
+                    return self._json(200, {"committed": committed})
+                if op == "finish":
+                    streams.drop(sid)
+                    try:
+                        text = s.finish()
+                        if not s.partial_served:
+                            # replacements shift the typed prefix — skip if the
+                            # client already live-typed committed text
+                            import flow as flowmod
+                            text = flowmod.apply_replacements(text, flow.cfg)
+                    except Exception as e:
+                        return self._json(500, {"error": f"finish failed: {e}"})
+                    return self._json(200, {"text": text})
+                if op == "cancel":
+                    streams.drop(sid)
+                    s.cancel()
+                    return self._json(200, {"ok": True})
+                return self._json(404, {"error": "unknown stream op"})
             if path == "/record/start":
                 if flow.remote_start():
                     return self._json(200, {"ok": True})
@@ -273,6 +307,14 @@ def make_server(flow, host, port, token):
                 return
             if not self._authed() and path.startswith("/api"):
                 return self._json(401, {"error": "unauthorized"})
+            if path == "/record/partial":
+                # VM bridge polls this while the key is held and types the
+                # committed delta live (committed text never retracts).
+                if not self._authed():
+                    return self._json(401, {"error": "unauthorized"})
+                st = getattr(flow, "remote_streamer", None)
+                return self._json(200, {"committed":
+                                        st.committed_text if st else ""})
             if path == "/api/history":
                 m = re.search(r"limit=(\d+)", self.path)
                 limit = int(m.group(1)) if m else 200
