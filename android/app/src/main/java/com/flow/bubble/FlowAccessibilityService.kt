@@ -38,8 +38,18 @@ class FlowAccessibilityService : AccessibilityService() {
             return if (hint != null) "$app · $hint" else app
         }
 
-        /** Insert text into the focused editable field. Returns a human reason
-         *  on failure (text is left on the clipboard either way), null on success. */
+        private fun fieldText(node: AccessibilityNodeInfo): String {
+            node.refresh()
+            return when {
+                node.isShowingHintText -> ""
+                node.text?.toString() == node.hintText?.toString() -> ""
+                else -> node.text?.toString().orEmpty()
+            }
+        }
+
+        /** Insert text into the focused editable field, VERIFYING the field
+         *  actually changed — performAction can return true while doing
+         *  nothing (the silent-failure mode). Returns a reason on failure. */
         fun insertText(ctx: Context, text: String): String? {
             val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             cm.setPrimaryClip(ClipData.newPlainText("flow", text))
@@ -47,29 +57,35 @@ class FlowAccessibilityService : AccessibilityService() {
                 ?: return "Accessibility service is OFF - enable Flow in Settings > Accessibility"
             val node = svc.findEditTarget()
                 ?: return "No text field focused - tap into a field first (text copied)"
-            // PASTE first: inserts at the cursor like a human paste — immune to
-            // the hint-text-as-content quirk (WhatsApp's "Message") and honors
-            // cursor position instead of clobbering the whole field.
-            node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
-            if (node.performAction(AccessibilityNodeInfo.ACTION_PASTE))
-                return null
-            // Fallback: replace-with-merge, guarding against hint text.
-            val existing = when {
-                node.isShowingHintText -> ""
-                node.text?.toString() == node.hintText?.toString() -> ""
-                node.textSelectionEnd <= 0 && !node.text.isNullOrEmpty() -> ""
-                else -> node.text?.toString().orEmpty()
+            val before = fieldText(node)
+            val probe = text.trim().takeLast(12)
+
+            fun landed(): Boolean {
+                val now = fieldText(node)
+                return now != before && (probe.isEmpty() || now.contains(probe))
             }
+
+            // 1) PASTE at the cursor (hint-immune, cursor-respecting)
+            node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+            if (node.performAction(AccessibilityNodeInfo.ACTION_PASTE)) {
+                Thread.sleep(120)
+                if (landed()) return null
+            }
+            // 2) SET_TEXT merge (paste claimed success but the field didn't change,
+            //    or paste was refused)
             val merged = when {
-                existing.isBlank() -> text
-                existing.endsWith(" ") || existing.endsWith("\n") -> existing + text
-                else -> "$existing $text"
+                before.isBlank() -> text
+                before.endsWith(" ") || before.endsWith("\n") -> before + text
+                else -> "$before $text"
             }
             val args = Bundle()
             args.putCharSequence(
                 AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, merged)
-            if (node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args))
-                return null
+            if (node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) {
+                Thread.sleep(120)
+                if (landed()) return null
+                return "insert silently ignored by this app (pkg=${node.packageName})"
+            }
             return "This app blocks text insertion (text copied - long-press to paste)"
         }
     }

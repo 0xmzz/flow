@@ -337,27 +337,25 @@ class BubbleService : Service() {
             main.post {
                 bubble?.state = WaveBubbleView.State.IDLE
                 setBubbleSize(false)
-                if (text.isNullOrBlank()) {
-                    toast("Flow: transcription failed")
+            }
+            if (text.isNullOrBlank()) {
+                main.post { toast("Flow: transcription failed") }
+            } else {
+                // Trailing space so consecutive dictations don't run together.
+                val payload = text.trimEnd() + " "
+                var fail = FlowAccessibilityService.insertText(this, payload)
+                if (fail != null) {
+                    // Focus can take a beat to return after touching the
+                    // bubble — retry once before falling back to clipboard.
+                    Thread.sleep(400)
+                    fail = FlowAccessibilityService.insertText(this, payload)
+                }
+                if (fail == null) {
+                    main.post { buzz(12) }
                 } else {
-                    // Trailing space so consecutive dictations don't run together.
-                    val payload = text!!.trimEnd() + " "
-                    val fail = FlowAccessibilityService.insertText(this, payload)
-                    if (fail == null) {
-                        buzz(12)
-                    } else {
-                        // Focus can take a beat to return after touching the
-                        // bubble — retry once before falling back to clipboard.
-                        main.postDelayed({
-                            val f2 = FlowAccessibilityService.insertText(this, payload)
-                            if (f2 == null) {
-                                buzz(12)
-                            } else {
-                                toast("Flow: $f2")
-                                reportInsertFail(f2)
-                            }
-                        }, 400)
-                    }
+                    val f = fail
+                    main.post { toast("Flow: $f") }
+                    reportInsertFail(f)
                 }
             }
         }
