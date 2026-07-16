@@ -341,9 +341,45 @@ class BubbleService : Service() {
                     toast("Flow: transcription failed")
                 } else {
                     // Trailing space so consecutive dictations don't run together.
-                    val fail = FlowAccessibilityService.insertText(this, text.trimEnd() + " ")
-                    if (fail != null) toast("Flow: $fail") else buzz(12)
+                    val payload = text!!.trimEnd() + " "
+                    val fail = FlowAccessibilityService.insertText(this, payload)
+                    if (fail == null) {
+                        buzz(12)
+                    } else {
+                        // Focus can take a beat to return after touching the
+                        // bubble — retry once before falling back to clipboard.
+                        main.postDelayed({
+                            val f2 = FlowAccessibilityService.insertText(this, payload)
+                            if (f2 == null) {
+                                buzz(12)
+                            } else {
+                                toast("Flow: $f2")
+                                reportInsertFail(f2)
+                            }
+                        }, 400)
+                    }
                 }
+            }
+        }
+    }
+
+    /** Ship the insertion-failure reason to the server's client.log so the
+     *  clipboard-fallback cause is visible without phone-side debugging. */
+    private fun reportInsertFail(reason: String) {
+        thread {
+            runCatching {
+                val c = URL(Prefs(this).serverUrl.trimEnd('/') + "/clientlog")
+                    .openConnection() as HttpURLConnection
+                c.requestMethod = "POST"
+                c.doOutput = true
+                c.connectTimeout = 4000
+                c.setRequestProperty("Content-Type", "application/json")
+                c.setRequestProperty("X-Device", "android-bubble")
+                val body = JSONObject().put("tag", "insert-fail")
+                    .put("message", reason + " | target=" +
+                        FlowAccessibilityService.currentTarget(this)).toString()
+                c.outputStream.use { it.write(body.toByteArray()) }
+                c.responseCode
             }
         }
     }
