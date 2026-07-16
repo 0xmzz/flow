@@ -109,6 +109,8 @@ class TranscriptStore:
             "model": model,
             "device": device,
         }
+        if private:
+            audio = None  # enforced HERE, not just at call sites: private entries never archive audio
         if self.archive_audio and audio is not None and len(audio):
             day = entry["ts"][:10]
             d = self.audio_dir / day
