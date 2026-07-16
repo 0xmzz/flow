@@ -152,6 +152,12 @@ class Router:
     def handle(self, text):
         """Return a short spoken response for a command."""
         t = text.strip().rstrip(".!?").lower()
+        # Spoken commands come wrapped in politeness — strip it so the verb
+        # patterns see "open whatsapp", not "can you open whatsapp for me".
+        t = re.sub(r"^(?:hey |ok |okay |so |um |uh )+", "", t)
+        t = re.sub(r"^(?:can|could|would|will) you (?:please )?", "", t)
+        t = re.sub(r"^please ", "", t)
+        t = re.sub(r"\s+(?:for me|please|now|real quick|quickly)$", "", t)
 
         # --- crypto price ---
         if any(k in t for k in ("price", "how much", "trading at", "worth")):
@@ -196,7 +202,24 @@ class Router:
         # --- fallback: ask the LLM ---
         return self._fallback(text)
 
+    FOLDERS = {
+        "downloads": "Downloads", "documents": "Documents", "desktop": "Desktop",
+        "pictures": "Pictures", "videos": "Videos", "music": "Music",
+    }
+
     def _open(self, name):
+        n = name.lower().strip()
+        # 0) drives and common folders ("open c drive", "open downloads")
+        m = re.match(r"^(?:the )?([a-z])(?: |-)?drive$", n)
+        if m:
+            os.startfile(f"{m.group(1).upper()}:\\")
+            return f"Opening {m.group(1).upper()} drive."
+        if n in self.FOLDERS:
+            os.startfile(os.path.join(os.path.expanduser("~"), self.FOLDERS[n]))
+            return f"Opening {n}."
+        if n in ("file explorer", "explorer", "my computer", "this pc"):
+            os.startfile("explorer")
+            return "Opening File Explorer."
         # 1) an already-open window? switch instead of spawning a second copy
         title = switch_to(name)
         if title:

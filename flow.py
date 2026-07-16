@@ -94,7 +94,7 @@ DEFAULTS = {
     # is stored private: no audio archive, excluded from the Hermes sweep.
     "trusted_devices": ["android-bubble", "phone", "work-vm"],
     "hotkey": "f8",                # hold to dictate (paste transcript at cursor)
-    "command_hotkey": "right shift",  # hold to issue a spoken COMMAND (acts + speaks back)
+    "command_hotkey": "right alt",    # hold to issue a spoken COMMAND (acts + speaks back)
     "model": "large-v3",           # full v3 handles whispered/quiet speech better than turbo
     "device": "cuda",
     "compute_type": "float16",
