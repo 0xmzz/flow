@@ -167,6 +167,21 @@ def make_server(flow, host, port, token):
                 return self._json(200, {"ok": bool(flow.remote_cancel())})
             if path == "/transcribe":
                 return self._transcribe(self._body(), "remote", device)
+            if path == "/brief":
+                # multivac's sweep posts the daily brief back so the dashboard
+                # can show it (beast otherwise never sees the distilled brief).
+                try:
+                    req = json.loads(self._body().decode("utf-8"))
+                    from pathlib import Path
+                    d = Path(flow.store.base) if flow.store else None
+                    if d:
+                        (d / "brief-latest.json").write_text(
+                            json.dumps({"day": req.get("day", ""),
+                                        "brief": req.get("brief", "")[:4000]}),
+                            encoding="utf-8")
+                    return self._json(200, {"ok": True})
+                except Exception as e:
+                    return self._json(400, {"error": str(e)})
             if path == "/llm":
                 # Local-only LLM for trusted tailnet callers (e.g. the Hermes
                 # sweep on multivac) — primary provider only, never the API
@@ -327,6 +342,14 @@ def make_server(flow, host, port, token):
                 entries = flow.store.read(limit=limit, since=since)
                 cursor = entries[-1]["ts"] if entries else since
                 return self._json(200, {"entries": entries, "cursor": cursor})
+            if path == "/api/brief":
+                if not self._authed():
+                    return self._json(401, {"error": "unauthorized"})
+                from pathlib import Path
+                f = (Path(flow.store.base) / "brief-latest.json") if flow.store else None
+                if not f or not f.exists():
+                    return self._json(200, {"day": "", "brief": ""})
+                return self._json(200, json.loads(f.read_text(encoding="utf-8")))
             if path == "/api/meta":
                 import time as _t
                 from pathlib import Path
@@ -337,8 +360,26 @@ def make_server(flow, host, port, token):
                 if base and (base / "dataset").exists():
                     audio_b = sum(f.stat().st_size
                                   for f in (base / "dataset").rglob("*.wav"))
+                # fallback-node health, cached 60s so the dashboard poll is free
+                import time as _tt
+                cache = getattr(flow, "_node_cache", None)
+                if not cache or _tt.time() - cache[0] > 60:
+                    up = False
+                    fb = flow.cfg.get("fallback_server_url", "")
+                    if fb:
+                        try:
+                            import urllib.request as _ur
+                            with _ur.urlopen(fb.rstrip("/") + "/health",
+                                             timeout=2) as r:
+                                up = b"ok" in r.read()
+                        except Exception:
+                            up = False
+                    cache = (_tt.time(), up)
+                    flow._node_cache = cache
                 c = flow.cfg
                 return self._json(200, {
+                    "fallback_node": {"url": c.get("fallback_server_url", ""),
+                                      "up": cache[1]},
                     "model": c["model"], "device": c["device"],
                     "streaming": c["streaming"]["enabled"],
                     "cleanup": {"provider": c["cleanup"]["provider"],
@@ -405,6 +446,8 @@ def _history_page():
 <div class=wrap>
  <div class=cards id=cards></div>
  <h2>Activity today (by hour)</h2><div class=bars id=bars></div>
+ <h2>Daily brief <span style="text-transform:none;letter-spacing:0;color:var(--mut)">(distilled from your voice, on your GPU)</span></h2>
+ <div class=kv id=brief style="white-space:pre-wrap;font-size:13px;padding:12px 14px">—</div>
  <h2>Pipeline &amp; data</h2><div class=kv id=kv></div>
  <h2>Recent dictations</h2><div class=rows id=list></div>
 </div>
@@ -420,9 +463,12 @@ def _history_page():
  async function load(){
   const t=tokEl.value;localStorage.setItem('flow_tok',t);
   const h={Authorization:'Bearer '+t};
-  const [meta,d]=await Promise.all([
+  const [meta,d,br]=await Promise.all([
     fetch('/api/meta',{headers:h}).then(r=>r.json()).catch(()=>({})),
-    fetch('/api/history?limit=2000',{headers:h}).then(r=>r.json()).catch(()=>({entries:[]}))]);
+    fetch('/api/history?limit=2000',{headers:h}).then(r=>r.json()).catch(()=>({entries:[]})),
+    fetch('/api/brief',{headers:h}).then(r=>r.json()).catch(()=>({}))]);
+  document.getElementById('brief').textContent=
+    br.brief?(br.day?br.day+'\n':'')+br.brief:'— no brief yet (hourly sweep populates this)';
   const es=d.entries||[];
   const today=new Date().toLocaleDateString('sv');
   const te=es.filter(e=>new Date(e.ts).toLocaleDateString('sv')===today);
@@ -453,6 +499,7 @@ def _history_page():
       ' · audio '+mb(st.audio_bytes||0)+'</span></div>'+
     '<div><b>Hermes sync</b><span>last pull '+(meta.last_pull?ago((Date.now()-new Date(meta.last_pull))/1000):'never')+
       ' · hourly from multivac</span></div>'+
+    '<div><b>Fallback node</b><span>'+((meta.fallback_node||{}).up?'<span class=ok>up</span> — dictation survives this PC sleeping':'DOWN — phone/client dictation needs this PC on')+'</span></div>'+
     '<div><b>Uptime</b><span>'+((meta.uptime_s||0)<3600?Math.round((meta.uptime_s||0)/60)+' min':((meta.uptime_s||0)/3600).toFixed(1)+' h')+'</span></div>';
   document.getElementById('list').innerHTML=es.slice(-100).reverse().map(e=>
    '<div class=row><div>'+esc(e.text)+'</div><div class=meta><span class=src>'+

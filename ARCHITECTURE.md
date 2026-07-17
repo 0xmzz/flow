@@ -1,33 +1,34 @@
 # Flow — architecture
 
-Self-hosted voice layer: push-to-talk dictation and voice commands on Windows,
-phone dictation over Tailscale, all inference on the local GPU. Nothing leaves
-your hardware except two explicit, documented exceptions (see [Privacy](#privacy-boundaries)).
+Self-hosted voice layer across four surfaces — PC push-to-talk, Android bubble,
+a Linux work-VM bridge, and thin-client PCs — all transcribed on hardware you
+own. **local_only is enforced in code**: the cleanup/command LLM refuses any
+non-loopback endpoint (see [Privacy](#privacy-boundaries)).
 
 ## System map
 
 ```mermaid
 flowchart LR
-  subgraph beast[beast — Windows PC, RTX 5090]
+  subgraph beast[beast — Windows PC, RTX 5090 — the brain]
     subgraph app[flow.py]
-      HK[keyboard hook<br/>right ctrl = dictate<br/>right shift = command] --> REC[Recorder<br/>16k mono f32]
-      REC --> SW[StreamWorker<br/>commit-while-held]
+      HK[keyboard hook<br/>right ctrl = dictate<br/>right shift = command] --> REC[Recorder<br/>always-open + pre-roll ring]
+      REC --> SW[StreamWorker<br/>commit-at-pauses while held]
       SW --> ASR[faster-whisper large-v3<br/>fp16 CUDA]
-      ASR --> CL[llm.py chain<br/>qwen3:8b via Ollama<br/>→ z.ai fallback]
-      CL --> PASTE[clipboard paste<br/>at cursor]
-      CL --> CMD[commands.py Router<br/>price / open / search / LLM]
-      CMD --> TTS[SAPI speak + overlay]
-      OV[Overlay pill<br/>listening / transcribing / answer]
-      TRAY[pystray menu]
+      ASR --> CL[llm.py chain<br/>qwen3:8b via Ollama<br/>local-only enforced]
+      CL --> PASTE[live-type + paste<br/>at cursor]
+      CMD[commands.py Router<br/>open app / switch window /<br/>price / search / local LLM]
+      OV[Overlay: waveform pill +<br/>'→ where the text goes']
     end
-    ASR --> ST[(store.py<br/>data/history.jsonl<br/>data/dataset/*.wav)]
-    SRV[server.py :8756<br/>token-gated HTTP] --> ASR
-    SRV --> ST
+    ASR --> ST[(store.py history.jsonl<br/>+ audio corpus · private flags)]
+    SRV[server.py :8756<br/>token-gated] --> ASR
+    SRV --> STREAMS[streaming.py sessions<br/>partials while clients talk]
   end
-  PHONE[Android: bubble app v0.x<br/>+ whisper-to-input IME] -->|WAV/m4a over Tailscale| SRV
-  MV[multivac ~/flow-context/sweep.py<br/>hourly cron :15] -->|/api/history?since=cursor| SRV
-  MV -->|/llm — summarize on beast GPU| SRV
-  MV --> HB[(Hermes MEMORY.md pointer<br/>+ imports/flow-context-DAY.md<br/>+ vault/memory canon)]
+  PHONE[Android bubble<br/>waveform + live preview] -->|chunks over Tailscale| STREAMS
+  WIFE[thin-client PCs<br/>self-updating] -->|chunks + live-type| STREAMS
+  VM[work-VM daemon<br/>ydotool live-typing] -->|/record + /record/partial| SRV
+  PHONE & WIFE -.->|when beast sleeps| NODE[multivac RTX 4080<br/>flow-asr :8757 always-on]
+  MV[multivac sweep · hourly] -->|delta pull + /llm summarize| SRV
+  MV --> HB[(Hermes memory pointer<br/>+ daily brief → dashboard)]
 ```
 
 ## Dictation pipeline (the latency story)
@@ -98,10 +99,32 @@ drops `think:false` and Qwen3 then burns ~7s on hidden reasoning.
 | `POST /v1/audio/transcriptions` | Bearer | OpenAI-Whisper-compatible (multipart, m4a/ogg/wav via PyAV); strict `{text}` response |
 | `POST /command` | Bearer | audio → transcript → command router → `{text, response}` |
 | `POST /llm` | Bearer | `{system,text}` → local model only (never fallback) — used by the multivac sweep |
+| `POST /stream/start` → `/stream/<sid>/audio|finish|cancel` | Bearer | streaming sessions: each audio chunk returns the committed-so-far text; finish decodes only the tail |
+| `POST /record/start|stop|cancel`, `GET /record/partial` | Bearer | VM bridge: host-mic session + live committed text for delta typing |
+| `POST /brief`, `GET /api/brief` | Bearer | sweep posts the daily brief back; dashboard shows it |
+| `POST /clientlog` | none (tailnet) | phone/client crash + insert diagnostics |
+| `GET /client/setup.ps1`, `/client/file/*`, `/client/version` | none (tailnet) | thin-client installer + self-update channel |
+| `GET /vm/setup.sh`, `/vm/daemon.py` | none (tailnet) | VM bridge installer + daemon self-update |
 | `GET /api/history?limit&since` | Bearer | entries + cursor; `since` marks a delta sync |
-| `GET /api/stats`, `GET /api/meta` | Bearer | totals; model/storage/uptime/last-pull |
+| `GET /api/stats`, `GET /api/meta` | Bearer | totals; model/storage/uptime/last-pull/fallback-node health |
 
 A `threading.Lock` serializes the GPU between hotkey and server calls.
+
+## Fallback ASR node (multivac RTX 4080)
+
+`multivac/asr_node.py` runs as systemd `flow-asr` on multivac (port 8757, same
+token): always-on, one-shot `/transcribe` only — no streaming, no cleanup,
+degraded on purpose. Phone and thin clients try beast first and fall back here,
+so dictation survives beast sleeping. The dashboard shows its health.
+
+## Invariant tests (`tests/`)
+
+`python -m pytest tests -q` — pins the promises that must never regress:
+local_only drops non-loopback LLM lanes; the cloud lane (when explicitly
+enabled) gets a sanitized prompt with no window/app context; private entries
+never archive audio (enforced inside `store.add`); the OpenAI route returns
+strictly `{text}`; history requires auth. Written before the streaming rework;
+caught a real defense-in-depth gap on first run.
 
 ## Data model
 
@@ -147,10 +170,16 @@ Zero-dependency Kotlin (one androidx artifact for FileProvider). Components:
 
 Leaves your hardware, ever:
 
-1. **z.ai fallback** — text (never audio) of one dictation, only while Ollama
-   is down. Delete `cleanup.fallback` in config for hard-local-only.
-2. **CoinGecko / opened sites** — the extracted query of a voice command
+1. **CoinGecko / opened sites** — the extracted query of a voice command
    ("bitcoin"), not your speech.
+
+That's the list. `local_only: true` (the default) makes `llm.chain` DROP any
+lane whose endpoint isn't provably loopback before calling it — a cloud
+fallback that sneaks into config is skipped, not sanitized. (The old z.ai
+cleanup fallback is deactivated; re-enabling it requires both configuring it
+AND flipping local_only off.) Unknown remote devices (e.g. a family member's
+thin client) are stored `private`: no audio archive, excluded from the Hermes
+sweep — enforced inside `store.add`, tested in `tests/`.
 
 Everything else — audio, transcripts, briefs, the corpus — stays on beast and
 multivac. Phone traffic rides Tailscale (WireGuard, E2E). Note: once Hermes

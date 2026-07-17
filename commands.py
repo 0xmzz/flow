@@ -177,6 +177,13 @@ class Router:
                 chg_s = f", {chg:+.1f} percent in the last day" if chg is not None else ""
                 return f"{name} is {_fmt_price(price)}{chg_s}."
 
+        # --- discoverability ---
+        if re.search(r"^(what can you do|help|commands|what do you do)$", t):
+            return ("I can open apps: say open WhatsApp. Switch windows: say "
+                    "switch to Chrome. Check crypto: say price of bitcoin. "
+                    "Search the web: say search for something. Anything else, "
+                    "I answer with the local model.")
+
         # --- switch to an open window ---
         m = re.search(r"^(?:switch to|go to|focus|bring up) (.+)", t)
         if m:
