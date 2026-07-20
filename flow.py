@@ -95,6 +95,9 @@ DEFAULTS = {
     "trusted_devices": ["android-bubble", "phone", "work-vm"],
     "hotkey": "f8",                # hold to dictate (paste transcript at cursor)
     "command_hotkey": "right alt",    # hold to issue a spoken COMMAND (acts + speaks back)
+    "live_hotkey": "f9",
+    "live": {"enabled": True, "wake_word": "flow", "silence_ms": 280,
+             "max_utterance_s": 12, "engine": "nemo-parakeet-tdt-0.6b-v3"},
     "model": "large-v3",           # full v3 handles whispered/quiet speech better than turbo
     "device": "cuda",
     "compute_type": "float16",
@@ -243,6 +246,7 @@ class Recorder:
         self._ring_samples = 0
         self._recording = False
         self._stream = None
+        self._subscribers = []
         self.level = 0.0  # live RMS for the overlay waveform
         self._open()
 
@@ -265,6 +269,15 @@ class Recorder:
             self.level = float(np.abs(indata).max())
         except Exception:
             pass
+        for q in tuple(self._subscribers):
+            try:
+                q.put_nowait(chunk)
+            except Exception:
+                try:
+                    q.get_nowait()
+                    q.put_nowait(None)  # discontinuity: subscriber must reset
+                except Exception:
+                    pass
         if self._recording:
             self._chunks.append(chunk)
         else:
@@ -292,6 +305,15 @@ class Recorder:
         if not self._chunks:
             return np.zeros(0, dtype=np.float32)
         return np.concatenate(self._chunks).flatten()
+
+    def subscribe(self, maxsize=96):
+        import queue
+        q = queue.Queue(maxsize=maxsize)
+        self._subscribers.append(q)
+        return q
+
+    def unsubscribe(self, target):
+        self._subscribers = [q for q in self._subscribers if q is not target]
 
 
 class StreamWorker:
@@ -540,7 +562,8 @@ class Overlay:
     live mic level through level_fn so the wave moves with your voice."""
 
     N_BARS = 22
-    COLORS = {"rec": "#e0524d", "work": "#f0b428", "say": "#3ec97e"}
+    COLORS = {"rec": "#e0524d", "work": "#f0b428", "say": "#3ec97e",
+              "live": "#4f8ee8"}
 
     def __init__(self, level_fn=None):
         import queue
@@ -652,6 +675,12 @@ class Overlay:
                         hide_at[0] = None
                         show("rec")
                         place()
+                    elif kind == "live":
+                        status.config(text="Live listening")
+                        context.config(text="Say the wake word, then a command")
+                        hide_at[0] = None
+                        show("live")
+                        place()
                     elif kind == "work":
                         status.config(text="Transcribing…")
                         context.config(text="")
@@ -671,7 +700,7 @@ class Overlay:
                 pass
             except Exception as e:
                 print(f"[overlay] poll error (continuing): {e}")
-            if st["mode"] in ("rec", "work"):
+            if st["mode"] in ("rec", "work", "live"):
                 draw_wave()
             if hide_at[0] is not None and time.time() > hide_at[0]:
                 hide_at[0] = None
@@ -801,7 +830,8 @@ class Flow:
         self.recording = False
         self.active_mode = "dictate"
         self.streamer = None
-        self._key_down = False
+        self._pressed_keys = set()
+        self._active_ptt_key = None
         import queue as _queue
         self._ctrl_q = _queue.Queue()
         self._vm_q = _queue.Queue()  # hands VM-triggered transcripts to the server
@@ -820,6 +850,7 @@ class Flow:
         self.overlay = (Overlay(level_fn=lambda: self.recorder.level)
                         if self.cfg.get("overlay", True) else None)
         self.model = None
+        self.live_worker = None
         if self.cfg["mode"] == "client":
             # Thin client: no model, no store (the full server stores), no GPU.
             self.store = None
@@ -842,11 +873,21 @@ class Flow:
         )
         # Warm up so the first real dictation isn't slow.
         self.model.transcribe(np.zeros(self.cfg["sample_rate"], dtype=np.float32))
+        if self.cfg.get("live", {}).get("enabled", True):
+            try:
+                from live import LiveWorker
+                self.live_worker = LiveWorker(
+                    self.recorder, self.router, self.store, self.cfg["live"],
+                    speak_fn=speak, response_fn=self._show_live_response,
+                    state_fn=self.restore_base_state)
+            except Exception as e:
+                print(f"[live] disabled: model/VAD startup failed ({e})")
         if self.cfg["cleanup"]["enabled"] and self.cfg["cleanup"]["provider"] == "ollama":
             threading.Thread(target=self._warm_ollama, daemon=True).start()
         print(f"Model ready in {time.time() - t0:.1f}s. "
               f"Hold [{self.cfg['hotkey']}] to dictate, "
-              f"[{self.cfg.get('command_hotkey')}] for a command.")
+              f"[{self.cfg.get('command_hotkey')}] for a command; "
+              f"[{self.cfg.get('live_hotkey')}] toggles live mode.")
 
     def _warm_ollama(self):
         import requests
@@ -875,12 +916,31 @@ class Flow:
             else:
                 self.overlay.set(state)
 
+    def restore_base_state(self):
+        if self.recording:
+            state = "rec"
+        elif self.live_worker and self.live_worker.listening:
+            state = "live"
+        else:
+            state = "idle"
+        self.set_icon(state)
+        if self.tray:
+            suffix = f"; live [{self.cfg.get('live_hotkey')}] ON" \
+                if self.live_worker and self.live_worker.enabled else ""
+            self.tray.title = f"Flow — hold {self.cfg['hotkey']} to dictate{suffix}"
+
+    def _show_live_response(self, response):
+        if self.overlay and response:
+            self.overlay.set(("say", response))
+
     def on_press(self, mode="dictate"):
         with self._session_lock:
             if self.recording or self.busy.locked():
                 return
             self.active_mode = mode
             self.recording = True
+            if self.live_worker:
+                self.live_worker.pause("recorder-owner")
             self.recorder.start()  # first — capture must not wait on mute/icon
             self.set_icon("rec")
             if self.cfg.get("mute_output_while_recording"):
@@ -913,6 +973,8 @@ class Flow:
             audio = self.recorder.stop()
             self.muter.restore()
             mode = self.active_mode
+            if self.live_worker and mode != "command":
+                self.live_worker.resume("recorder-owner")
         if mode == "command":
             threading.Thread(target=self.process_command, args=(audio,),
                              daemon=True).start()
@@ -1031,7 +1093,7 @@ class Flow:
                 if streamer:
                     time.sleep(0.3)
                     streamer.restore_clipboard()
-                self.set_icon("idle")
+                self.restore_base_state()
 
     def process_command(self, audio):
         with self.busy:
@@ -1055,7 +1117,9 @@ class Flow:
                     self.overlay.set(("say", response))
                 speak(response)
             finally:
-                self.set_icon("idle")
+                if self.live_worker:
+                    self.live_worker.resume("recorder-owner")
+                self.restore_base_state()
 
     def client_transcribe(self, audio, route, field="text"):
         """Thin client: ship audio to the main server; on failure fall back to
@@ -1100,6 +1164,8 @@ class Flow:
                 return False
             self.active_mode = "remote"
             self.recording = True
+            if self.live_worker:
+                self.live_worker.pause("recorder-owner")
             self._remote_gen += 1
             gen = self._remote_gen
             self.recorder.start()
@@ -1129,6 +1195,8 @@ class Flow:
             committed = streamer.stop() if streamer else ("", 0)
             audio = self.recorder.stop()
             self.muter.restore()
+            if self.live_worker:
+                self.live_worker.resume("recorder-owner")
         with self.busy:
             self.set_icon("work")
             try:
@@ -1144,7 +1212,7 @@ class Flow:
                 # alignment — only apply them when nothing was typed live.
                 return text if partial_served else apply_replacements(text, self.cfg)
             finally:
-                self.set_icon("idle")
+                self.restore_base_state()
 
     def remote_cancel(self, gen=None):
         with self._session_lock:
@@ -1159,7 +1227,9 @@ class Flow:
                 streamer.stop()
             self.recorder.stop()
             self.muter.restore()
-            self.set_icon("idle")
+            if self.live_worker:
+                self.live_worker.resume("recorder-owner")
+            self.restore_base_state()
             print("[remote] recording cancelled")
             return True
 
@@ -1168,28 +1238,47 @@ class Flow:
         # never throw, or the listener dies and every hotkey stops working until
         # restart. So: match, drop auto-repeat, enqueue. All real work (mute,
         # audio start, transcription) happens in _ctrl_loop.
-        if event.name == self.cfg["hotkey"]:
+        name = event.name
+        if name == self.cfg.get("live_hotkey"):
+            if event.event_type == keyboard.KEY_DOWN and name not in self._pressed_keys:
+                self._pressed_keys.add(name)
+                self._ctrl_q.put(("toggle", "live"))
+            elif event.event_type == keyboard.KEY_UP:
+                self._pressed_keys.discard(name)
+            return
+        if name == self.cfg["hotkey"]:
             mode = "dictate"
-        elif event.name == self.cfg.get("command_hotkey"):
+        elif name == self.cfg.get("command_hotkey"):
             mode = "command"
         else:
             return
         if event.event_type == keyboard.KEY_DOWN:
-            if self._key_down:
+            if name in self._pressed_keys:
                 return  # ignore held-key auto-repeat
-            self._key_down = True
-            self._ctrl_q.put(("down", mode))
+            self._pressed_keys.add(name)
+            if self._active_ptt_key is None:
+                self._active_ptt_key = name
+                self._ctrl_q.put(("down", mode))
         elif event.event_type == keyboard.KEY_UP:
-            if not self._key_down:
+            if name not in self._pressed_keys:
                 return
-            self._key_down = False
-            self._ctrl_q.put(("up", mode))
+            self._pressed_keys.discard(name)
+            if name == self._active_ptt_key:
+                self._active_ptt_key = None
+                self._ctrl_q.put(("up", mode))
 
     def _ctrl_loop(self):
         while True:
             action, mode = self._ctrl_q.get()
             try:
-                if action == "down":
+                if action == "toggle":
+                    if not self.live_worker:
+                        print("[live] unavailable")
+                    elif self.live_worker.enabled:
+                        self.live_worker.stop()
+                    else:
+                        self.live_worker.start()
+                elif action == "down":
                     self.on_press(mode)
                 else:
                     self.on_release()
@@ -1225,7 +1314,9 @@ class Flow:
             from pystray import MenuItem
             port = self.cfg["server"]["port"]
             self.tray = pystray.Icon(
-                "flow", make_icon("idle"), "Flow — hold %s to dictate" % self.cfg["hotkey"],
+                "flow", make_icon("idle"),
+                "Flow — hold %s to dictate; %s toggles live" %
+                (self.cfg["hotkey"], self.cfg.get("live_hotkey")),
                 menu=pystray.Menu(
                     MenuItem("Open history page",
                              lambda: webbrowser.open(
@@ -1246,7 +1337,8 @@ class Flow:
 
 def make_icon(state):
     from PIL import Image, ImageDraw
-    color = {"idle": (90, 90, 90), "rec": (220, 60, 60), "work": (240, 180, 40)}[state]
+    color = {"idle": (90, 90, 90), "rec": (220, 60, 60),
+             "work": (240, 180, 40), "live": (70, 130, 225)}[state]
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     d.ellipse([8, 8, 56, 56], fill=color)

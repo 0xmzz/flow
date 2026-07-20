@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT))
 
 import llm  # noqa: E402
 from store import TranscriptStore, decode_wav, wav_bytes  # noqa: E402
+from live import LiveWorker, wake_command  # noqa: E402
 
 
 # ---------- llm.chain: nothing leaves the box ----------
@@ -88,6 +89,50 @@ def test_wav_roundtrip():
     b, sr = decode_wav(wav_bytes(a, 16000))
     assert sr == 16000 and abs(len(b) - len(a)) < 4
     assert float(np.abs(b[:100] - a[:100]).max()) < 0.01
+
+
+@pytest.mark.parametrize(("heard", "expected"), [
+    ("flow open youtube", "open youtube"),
+    ("Flo, open youtube", "open youtube"),
+    ("floh open youtube", "open youtube"),
+    ("hello flow", None),
+    ("flow", None),
+])
+def test_live_wake_gate(heard, expected):
+    assert wake_command(heard, "flow") == expected
+
+
+def test_live_wake_gate_can_be_disabled():
+    assert wake_command("open youtube", None) == "open youtube"
+
+
+def test_ignored_live_utterance_never_stores():
+    class Recorder:
+        def subscribe(self, maxsize=96):
+            import queue
+            return queue.Queue()
+        def unsubscribe(self, _q): pass
+    class Engine:
+        provider = "CPU"
+        def decode(self, _audio): return "hello there", 0.01
+    class Vad:
+        def reset(self): pass
+        def probability(self, _frame): return 0.0
+    class Store:
+        def add(self, *_a, **_kw): raise AssertionError("ignored audio stored")
+    class Router:
+        def handle(self, _text): raise AssertionError("ignored audio routed")
+    worker = LiveWorker(Recorder(), Router(), Store(), {
+        "engine": "fake", "wake_word": "flow", "silence_ms": 280,
+        "max_utterance_s": 12}, engine=Engine(), vad=Vad())
+    worker.start()
+    worker._decode_and_act(__import__("numpy").zeros(512), worker._generation)
+    worker.close()
+
+
+def test_live_module_has_no_network_client_import():
+    source = (ROOT / "live.py").read_text(encoding="utf-8")
+    assert "import requests" not in source and "urllib" not in source
 
 
 # ---------- flow module helpers (no Flow() init: no GPU) ----------

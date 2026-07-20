@@ -77,6 +77,21 @@ regex skills first (crypto price via CoinGecko, `open <site/app>`, `search`),
 otherwise the local LLM answers. Responses are spoken (SAPI) **and** shown in
 the overlay pill. `POST /command` exposes the same router to remote devices.
 
+## Live mode (`live.py`) — always-listening commands
+
+F9 toggles a hands-free command mode (CNVS-inspired): the always-open Recorder
+feeds a subscriber queue → streaming Silero VAD segments utterances (280ms
+endpoint) → **Parakeet-TDT-0.6b-v3** (onnx-asr, CUDA) decodes in ~110ms →
+wake-word gate ("flow …", fuzzy first-token) → the same `commands.py` router.
+Measured end-of-speech→text ≈ 0.4s. Guards: PTT/remote sessions pause it
+atomically (generation counter kills in-flight decodes), segmentation pauses
+while SAPI speaks so it never hears itself, non-wake utterances are dropped
+unstored. Whisper stays the dictation engine — Parakeet exists for command
+latency only. GPU note: the pip `nvidia-*-cu12` DLLs must be preloaded by
+absolute path (`ParakeetEngine._preload_gpu_dlls`) or ORT silently falls back
+to CPU; `_cuda_actually_used` probes the real session provider because
+`get_available_providers()` lies about that.
+
 ## LLM chain (`llm.py`)
 
 ```

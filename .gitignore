@@ -10,3 +10,6 @@ finetune/out/
 models/
 experiments/run/
 experiments/*/report.json
+.pip-cache/
+.pip-tmp/
+.test-tmp/
