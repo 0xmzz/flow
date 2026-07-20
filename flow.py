@@ -93,6 +93,11 @@ DEFAULTS = {
     # Devices whose dictations join YOUR corpus/Hermes context. Anything else
     # is stored private: no audio archive, excluded from the Hermes sweep.
     "trusted_devices": ["android-bubble", "phone", "work-vm"],
+    # Mic selection. None = follow the Windows default input. A string matches
+    # a device NAME (case-insensitive substring) because indices churn.
+    "input_device": None,
+    "mic_silence_guard": True,     # speak up when the mic returns digital silence
+    "mic_autoswitch": True,        # ...and move to an input that actually carries signal
     "hotkey": "f8",                # hold to dictate (paste transcript at cursor)
     "command_hotkey": "right alt",    # hold to issue a spoken COMMAND (acts + speaks back)
     "live_hotkey": "f9",
@@ -228,6 +233,50 @@ def _persist_config(patch):
     CONFIG_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
+# A sleeping/absent mic (wireless headset off, privacy switch on) returns
+# DIGITAL silence — measured ~3e-5 peak, while a whisper still peaks above
+# 5e-3. Anything under this is a dead input, not quiet speech.
+SILENCE_PEAK = 0.002
+# Loopback/monitor inputs would "pass" a signal probe while capturing your
+# speakers instead of your voice.
+NOT_A_MIC = ("speaker", "loopback", "stereo mix", "what u hear",
+             "sound mapper", "primary sound capture", "output")
+
+
+def peak_level(audio):
+    return float(np.abs(audio).max()) if audio is not None and len(audio) else 0.0
+
+
+def probe_input(index, sample_rate=16000, seconds=0.4):
+    """Peak level of a short capture from one device (0.0 if it can't open)."""
+    try:
+        audio = sd.rec(int(seconds * sample_rate), samplerate=sample_rate,
+                       channels=1, dtype="float32", device=index)
+        sd.wait()
+        return peak_level(audio)
+    except Exception:
+        return 0.0
+
+
+def live_input_devices():
+    """Unique real microphones, in enumeration order."""
+    try:
+        devices = sd.query_devices()
+    except Exception:
+        return []
+    found, seen = [], set()
+    for i, d in enumerate(devices):
+        name = d["name"]
+        key = name.lower()
+        if d["max_input_channels"] < 1 or key in seen:
+            continue
+        if any(bad in key for bad in NOT_A_MIC):
+            continue
+        seen.add(key)
+        found.append((i, name))
+    return found
+
+
 class Recorder:
     """Always-open mic stream with a pre-roll ring buffer.
 
@@ -237,7 +286,7 @@ class Recorder:
     `pre_roll_s` seconds are prepended, so the recording begins in the past.
     """
 
-    def __init__(self, sample_rate, pre_roll_s=0.4):
+    def __init__(self, sample_rate, pre_roll_s=0.4, device=None):
         from collections import deque
         self.sample_rate = sample_rate
         self.pre_roll = int(pre_roll_s * sample_rate)
@@ -247,19 +296,72 @@ class Recorder:
         self._recording = False
         self._stream = None
         self._subscribers = []
+        self.device_spec = device
+        self.device_index = None
+        self.device_name = None
         self.level = 0.0  # live RMS for the overlay waveform
         self._open()
 
+    @staticmethod
+    def resolve_device(spec):
+        """Map an input_device config value to (index, name).
+
+        None/'' follows the Windows default. Strings match a device name
+        (case-insensitive substring) rather than an index, because indices
+        renumber whenever devices come and go."""
+        try:
+            devices = sd.query_devices()
+        except Exception as e:
+            print(f"[mic] device query failed: {e}")
+            return None, None
+        inputs = [(i, d) for i, d in enumerate(devices)
+                  if d["max_input_channels"] > 0]
+        if isinstance(spec, bool):
+            spec = None
+        if isinstance(spec, int):
+            match = next((d for i, d in inputs if i == spec), None)
+            if match:
+                return spec, match["name"]
+            print(f"[mic] input device {spec} not found; using the default")
+        elif isinstance(spec, str) and spec.strip():
+            needle = spec.strip().lower()
+            match = next(((i, d) for i, d in inputs
+                          if needle in d["name"].lower()), None)
+            if match:
+                return match[0], match[1]["name"]
+            print(f"[mic] no input matches {spec!r}; using the default")
+        try:
+            return None, sd.query_devices(kind="input")["name"]
+        except Exception:
+            return None, None
+
     def _open(self):
+        self.device_index, self.device_name = self.resolve_device(self.device_spec)
         try:
             self._stream = sd.InputStream(
                 samplerate=self.sample_rate, channels=1, dtype="float32",
-                callback=self._on_audio,
+                callback=self._on_audio, device=self.device_index,
             )
             self._stream.start()
+            print(f"[mic] listening on {self.device_name or 'default input'}")
         except Exception as e:
             self._stream = None
             print(f"[mic] open failed: {e}")
+
+    def retarget(self, spec):
+        """Move to another input device, discarding the stale pre-roll."""
+        try:
+            if self._stream is not None:
+                self._stream.stop()
+                self._stream.close()
+        except Exception:
+            pass
+        self._stream = None
+        self.device_spec = spec
+        self._ring.clear()
+        self._ring_samples = 0
+        self._open()
+        return self._stream is not None
 
     def _on_audio(self, indata, *_):
         chunk = indata.copy()
@@ -855,7 +957,9 @@ class Flow:
     def __init__(self):
         self.cfg = load_config()
         self.recorder = Recorder(self.cfg["sample_rate"],
-                                 pre_roll_s=self.cfg.get("pre_roll_s", 0.4))
+                                 pre_roll_s=self.cfg.get("pre_roll_s", 0.4),
+                                 device=self.cfg.get("input_device"))
+        self._last_mic_probe = 0.0
         self.muter = OutputMuter()
         self.muter.ensure_unmuted()
         self.recording = False
@@ -945,6 +1049,72 @@ class Flow:
             print(f"[cleanup] local model {c['model']} warm in {time.time()-t0:.1f}s")
         except Exception as e:
             print(f"[cleanup] warmup failed ({e}) — is Ollama running?")
+
+    def mic_is_deaf(self, audio):
+        """True when the captured audio is digital silence.
+
+        A sleeping wireless headset stays the Windows default input and yields
+        pure zeros, so every dictation returned an empty transcript and the app
+        looked like a dead hotkey for a whole session. Say it out loud instead,
+        and move to an input that actually carries signal."""
+        if not self.cfg.get("mic_silence_guard", True):
+            return False
+        if peak_level(audio) >= SILENCE_PEAK:
+            return False
+        name = self.recorder.device_name or "the microphone"
+        print(f"[mic] silent capture from {name}")
+        switched = (self.recover_mic() if self.cfg.get("mic_autoswitch", True)
+                    else None)
+        msg = (f"{name} was silent. Switched to {switched}." if switched else
+               f"{name} is silent. Check that it's on and unmuted.")
+        if self.overlay:
+            self.overlay.set(("say", msg))
+        speak(msg)
+        return True
+
+    def recover_mic(self, min_gap_s=20.0):
+        """Switch to the input device carrying the strongest signal."""
+        now = time.time()
+        if now - self._last_mic_probe < min_gap_s:
+            return None
+        self._last_mic_probe = now
+        current = (self.recorder.device_name or "").lower()
+        scored = []
+        for index, name in live_input_devices():
+            if name.lower() == current:
+                continue
+            level = probe_input(index, self.cfg["sample_rate"])
+            print(f"[mic] probe {name}: peak {level:.5f}")
+            if level >= SILENCE_PEAK:
+                scored.append((index, name, level))
+        if not scored:
+            print("[mic] no live input found")
+            return None
+        # One physical mic appears once per host API (MME, WASAPI, WDM-KS) with
+        # slightly different levels. Among comparable candidates take the
+        # LOWEST index: those are MME/DirectSound, the ones that reliably open
+        # at our sample rate. Picking the loudest can land on a KS endpoint
+        # that opens and then delivers nothing.
+        loudest = max(level for _, _, level in scored)
+        index, name, level = min(
+            (c for c in scored if c[2] >= loudest * 0.7), key=lambda c: c[0])
+        if not self.recorder.retarget(index):
+            return None
+        print(f"[mic] switched to {name} (peak {level:.5f})")
+        return name
+
+    def startup_mic_check(self):
+        """Log — and quietly fix — a dead default input before first use."""
+        if self.cfg["mode"] == "client" or not self.cfg.get("mic_silence_guard", True):
+            return
+        level = probe_input(self.recorder.device_index, self.cfg["sample_rate"], 0.3)
+        name = self.recorder.device_name or "default input"
+        if level >= SILENCE_PEAK / 4:  # room tone clears this; digital silence doesn't
+            print(f"[mic] {name} live at startup (peak {level:.5f})")
+            return
+        print(f"[mic] {name} is silent at startup (peak {level:.5f})")
+        if self.cfg.get("mic_autoswitch", True):
+            self.recover_mic(min_gap_s=0.0)
 
     def set_icon(self, state, context=None):
         if self.tray:
@@ -1138,6 +1308,8 @@ class Flow:
                 dur = len(audio) / self.cfg["sample_rate"]
                 if dur < self.cfg["min_duration_s"]:
                     return
+                if self.mic_is_deaf(audio):
+                    return
                 if self.cfg["mode"] == "client":
                     if isinstance(streamer, ClientStreamer) and streamer.sid:
                         text, typed = streamer.finish()
@@ -1183,6 +1355,8 @@ class Flow:
             try:
                 dur = len(audio) / self.cfg["sample_rate"]
                 if dur < self.cfg["min_duration_s"]:
+                    return
+                if self.mic_is_deaf(audio):
                     return
                 if self.cfg["mode"] == "client":
                     response = self.client_transcribe(audio, "/command",
@@ -1391,6 +1565,7 @@ class Flow:
 
     def run(self):
         self.maybe_start_server()
+        self.startup_mic_check()
         # Raw hook (never suppresses) so we can distinguish left vs right ctrl
         # and never eat the key from other apps.
         keyboard.hook(self._on_key)
@@ -1461,6 +1636,16 @@ def acquire_single_instance():
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] in ("--history", "-H"):
         cli_history(int(sys.argv[2]) if len(sys.argv) > 2 else 30)
+    elif len(sys.argv) > 1 and sys.argv[1] in ("--devices", "-d"):
+        cfg = load_config()
+        index, name = Recorder.resolve_device(cfg.get("input_device"))
+        print(f"in use: {name or 'unknown'}\n")
+        for i, dev in live_input_devices():
+            level = probe_input(i, cfg["sample_rate"], 0.4)
+            state = "SILENT" if level < SILENCE_PEAK else "live  "
+            print(f"  [{i:>3}] {state} peak {level:.5f}  {dev}")
+        print("\nSet \"input_device\" in config.json to a name substring "
+              "(e.g. \"Razer Seiren\") or null to follow the Windows default.")
     elif len(sys.argv) > 1 and sys.argv[1] in ("--stats", "-s"):
         cfg = load_config()
         print(TranscriptStore(APP_DIR / cfg["history"]["dir"]).stats())

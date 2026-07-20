@@ -614,3 +614,46 @@ def test_openai_route_strict_shape(srv):
         out = json.loads(r.read())
     assert set(out.keys()) == {"text"}, \
         "OpenAI route must return ONLY {text} - extra keys get pasted into chats"
+
+
+# ---------- microphone silence guard ----------
+
+def test_peak_level_distinguishes_dead_mic_from_whisper():
+    import numpy as np
+    from flow import SILENCE_PEAK, peak_level
+    dead = np.full(16000, 3e-5, dtype=np.float32)      # measured: sleeping headset
+    whisper = np.full(16000, 6e-3, dtype=np.float32)   # measured: quiet speech
+    assert peak_level(dead) < SILENCE_PEAK <= peak_level(whisper)
+    assert peak_level(np.zeros(0, dtype=np.float32)) == 0.0
+
+
+def test_live_input_devices_excludes_loopback_and_duplicates(monkeypatch):
+    import flow
+    devices = [
+        {"name": "Microphone (Razer)", "max_input_channels": 1},
+        {"name": "Stereo Mix (Realtek)", "max_input_channels": 2},
+        {"name": "PC Speaker (Realtek output)", "max_input_channels": 2},
+        {"name": "Microphone (Razer)", "max_input_channels": 1},   # duplicate
+        {"name": "Headphones", "max_input_channels": 0},           # output only
+    ]
+    monkeypatch.setattr(flow.sd, "query_devices", lambda *a, **k: devices)
+    assert flow.live_input_devices() == [(0, "Microphone (Razer)")]
+
+
+def test_resolve_device_matches_name_substring(monkeypatch):
+    import flow
+    devices = [
+        {"name": "Microphone (HyperX Cloud Alpha)", "max_input_channels": 1},
+        {"name": "Microphone (2- Razer Seiren V3 Mini)", "max_input_channels": 1},
+    ]
+
+    def query(*args, **kwargs):
+        if kwargs.get("kind") == "input":
+            return devices[0]
+        return devices
+
+    monkeypatch.setattr(flow.sd, "query_devices", query)
+    assert flow.Recorder.resolve_device("razer seiren")[0] == 1
+    # No match and None both fall back to the Windows default (index None).
+    assert flow.Recorder.resolve_device("nonexistent")[0] is None
+    assert flow.Recorder.resolve_device(None)[0] is None
