@@ -19,7 +19,8 @@ import webbrowser
 from collections import deque
 
 from agents import AgentError, AgentRunner, select_lane
-from workflows import Question, RecipeStore, WorkflowRunner, creation_dialog
+from workflows import (Question, RecipeStore, WorkflowRunner, creation_dialog,
+                       normalize as normalize_workflow)
 
 
 def speak(text):
@@ -150,7 +151,7 @@ KNOWN_SITES = {
 }
 
 ROUTER_VERBS = ("open", "reopen", "launch", "start", "close", "switch", "navigate", "search", "google",
-                "price", "type", "write", "help", "run")
+                "price", "type", "write", "help", "run", "put", "move", "place", "arrange")
 _TAIL_RE = re.compile(
     r"\s+(?:right\s+now|at\s+the\s+moment|real\s+quick|for\s+me|currently|"
     r"quickly|today|please|now)\s*$")
@@ -162,6 +163,82 @@ def _strip_tails(text):
         previous = text
         text = _TAIL_RE.sub("", text).strip()
     return text
+
+
+_NUMBER_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9,
+}
+
+
+def _monitor_number(value):
+    value = str(value).lower()
+    return _NUMBER_WORDS.get(value, int(value) if value.isdigit() else None)
+
+
+def _parse_place(text):
+    """Parse supported placement phrases into one canonical workflow step."""
+    heard = str(text or "").strip().lower().rstrip(".!?")
+    region_words = (r"top[ -]left|top[ -]right|bottom[ -]left|bottom[ -]right|"
+                    r"left|right|top|bottom|full")
+    number = r"\d+|one|two|three|four|five|six|seven|eight|nine"
+    patterns = (
+        rf"^(?:put|move|place)\s+(.+?)\s+(?:on|in|to)\s+(?:the\s+)?"
+        rf"(?:(?:({region_words})(?:\s+half|\s+quarter)?)(?:\s+of)?\s+)?"
+        rf"(?:monitor|screen)\s+({number})$",
+        rf"^(?:put|move|place)\s+(.+?)\s+(?:on|in|to)\s+(?:the\s+)?"
+        rf"(?:monitor|screen)\s+({number})(?:\s*,?\s*(?:on\s+)?(?:the\s+)?"
+        rf"({region_words})(?:\s+half|\s+quarter)?)?$",
+        rf"^(.+?)\s+({region_words})(?:\s+half|\s+quarter)?(?:\s+(?:on|of)\s+"
+        rf"(?:the\s+)?(?:monitor|screen)\s+({number}))?$",
+    )
+    for index, pattern in enumerate(patterns):
+        match = re.match(pattern, heard)
+        if not match:
+            continue
+        groups = match.groups()
+        if index == 0:
+            name, region, monitor = groups
+        elif index == 1:
+            name, monitor, region = groups
+        else:
+            name, region, monitor = groups
+        name = re.sub(r"^the\s+", "", name).strip()
+        if name and name not in {"monitor", "screen", "desktop"}:
+            return {"do": "place", "arg": name,
+                    "monitor": _monitor_number(monitor) if monitor else None,
+                    "region": (region or "full").replace(" ", "-")}
+    return None
+
+
+def _parse_desktop(text):
+    heard = str(text or "").strip().lower().rstrip(".!?")
+    match = re.match(r"^(next|previous)\s+(?:virtual\s+)?desktop$", heard)
+    if match:
+        return match.group(1), None
+    match = re.match(r"^(?:go to\s+)?(?:virtual\s+)?desktop\s+"
+                     r"(\d+|one|two|three|four|five|six|seven|eight|nine)$", heard)
+    return (None, _monitor_number(match.group(1))) if match else None
+
+
+def _action_shaped(text):
+    heard = normalize_workflow(text)
+    if not heard or heard.startswith(("can you ", "could you ", "what ", "why ",
+                                      "how ", "when ", "where ", "are you ")):
+        return False
+    verbs = {"open", "put", "move", "place", "set", "setup", "start",
+             "arrange", "launch", "close", "switch", "type", "write", "run"}
+    return heard.split()[0] in verbs or any(
+        re.search(rf"\b{verb}\b", heard) for verb in {"open", "put", "set up", "start", "arrange"})
+
+
+def _workflow_slug(text):
+    words = normalize_workflow(text).split()
+    fillers = {"please", "the", "a", "an", "my", "for", "me", "can", "you"}
+    useful = [word for word in words if word not in fillers][:4]
+    if len(useful) < 2:
+        useful = (useful + ["workflow"])[:2]
+    return " ".join(useful)
 
 
 class Router:
@@ -297,6 +374,18 @@ class Router:
             return creation_dialog(
                 m.group(1).strip(), self.workflows, self.parse_action)
 
+        desktop = _parse_desktop(t)
+        if desktop:
+            direction, requested = desktop
+            if requested is not None:
+                return (f"Windows only exposes next and previous desktop by key; "
+                        f"I can't reliably jump to desktop {requested}.")
+            return self._desktop(direction)
+
+        placement = _parse_place(t)
+        if placement:
+            return self._place_step(placement)
+
         recipe = self.workflows.match(t)
         if recipe:
             if self.workflow_runner.running:
@@ -379,6 +468,19 @@ class Router:
             return self.intent_parser(text)
         raw = str(text or "").strip()
         normalized = raw.rstrip(".!?")
+        placement = _parse_place(normalized)
+        if placement:
+            return placement
+        desktop = _parse_desktop(normalized)
+        if desktop and desktop[0]:
+            return {"do": "desktop", "arg": desktop[0]}
+        wait = re.match(r"^wait\s+(\d+(?:\.\d+)?|one|two|three|four|five|six|"
+                        r"seven|eight|nine)\s*(?:seconds?|secs?)?$",
+                        normalized, re.IGNORECASE)
+        if wait:
+            value = wait.group(1).lower()
+            seconds = _monitor_number(value) if not value.replace(".", "").isdigit() else float(value)
+            return {"do": "wait_s", "arg": seconds}
         patterns = (
             ("switch", r"^(?:switch to|go to|navigate to|focus|bring up) (.+)"),
             ("close", r"^close (.+)"),
@@ -464,6 +566,30 @@ class Router:
                 time.sleep(0.05)
                 pyperclip.copy(old)
         return ""
+
+    def _place_step(self, step):
+        from winctl import place_window
+        try:
+            placed = place_window(step["arg"], monitor=step.get("monitor"),
+                                  region=step.get("region", "full"))
+        except (OSError, RuntimeError, ValueError) as exc:
+            return f"I couldn't place {step['arg']}: {exc}"
+        if not placed:
+            return f"I couldn't find {step['arg']} to place."
+        region = placed["region"].replace("-", " ")
+        region_text = "full screen" if region == "full" else (
+            region if " " in region else f"{region} half")
+        return (f"{placed['title'][:40]} on monitor {placed['monitor']}, "
+                f"{region_text}.")
+
+    @staticmethod
+    def _desktop(direction):
+        if direction not in {"next", "previous"}:
+            raise ValueError("desktop direction must be next or previous")
+        import keyboard
+        keyboard.send("win+ctrl+right" if direction == "next" else
+                      "win+ctrl+left")
+        return f"{direction.title()} desktop."
 
     @staticmethod
     def _keys(keys):
@@ -566,6 +692,26 @@ class Router:
                         "search": self._search, "type": self._type,
                         "keys": self._named_keys}
             return handlers[action](arg.strip())
+        if intent and intent[0] == "answer" and _action_shaped(text):
+            trigger = normalize_workflow(text)
+            name = _workflow_slug(text)
+
+            def teach(answer):
+                heard = normalize_workflow(answer)
+                if heard in {"yes", "yeah", "yep", "sure", "okay", "ok"}:
+                    return creation_dialog(
+                        name, self.workflows, self.parse_action,
+                        triggers=[trigger], taught_confirmation=True)
+                if heard in {"no", "nope", "cancel", "never mind", "nevermind"}:
+                    return self._chat_answer(contextual_text)
+                return Question("Please say yes or no.", teach,
+                                cancel_text="Okay.")
+            return Question("I don't know how to do that yet. Teach me the steps?",
+                            teach, cancel_text="Okay.")
+        return self._chat_answer(contextual_text)
+
+    def _chat_answer(self, contextual_text):
+        import llm
         out, _ = llm.chain(
             self.cfg["cleanup"],
             "You are a terse voice assistant. Answer in one or two spoken sentences, "

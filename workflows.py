@@ -16,7 +16,12 @@ import time
 
 PRIMITIVES = frozenset({
     "open", "close", "switch", "price", "search", "type", "keys",
-    "wait_s", "wait_window", "say", "ask",
+    "wait_s", "wait_window", "say", "ask", "place", "desktop",
+})
+
+PLACE_REGIONS = frozenset({
+    "full", "left", "right", "top", "bottom",
+    "top-left", "top-right", "bottom-left", "bottom-right",
 })
 
 
@@ -49,6 +54,16 @@ def _validate_step(step):
     if not isinstance(step, dict) or step.get("do") not in PRIMITIVES:
         return False
     if "arg" not in step:
+        return False
+    if step["do"] == "place":
+        if not isinstance(step["arg"], str) or not step["arg"].strip():
+            return False
+        if step.get("region", "full") not in PLACE_REGIONS:
+            return False
+        monitor = step.get("monitor")
+        if monitor is not None and (not isinstance(monitor, int) or monitor < 1):
+            return False
+    if step["do"] == "desktop" and step["arg"] not in {"next", "previous"}:
         return False
     if "timeout_s" in step and not isinstance(step["timeout_s"], (int, float)):
         return False
@@ -239,8 +254,19 @@ class WorkflowRunner:
 
     def _execute(self, step):
         action, arg = step["do"], step.get("arg")
-        if action in {"open", "close", "switch", "price", "search", "type"}:
+        if action in {"open", "close", "switch", "price", "search", "type",
+                      "desktop"}:
             self._router_call(action, arg)
+        elif action == "place":
+            if self.router is not None:
+                self.router._place_step(step)
+            elif callable(self.primitives):
+                self.primitives(action, dict(step))
+            else:
+                fn = self.primitives.get("place")
+                if fn is None:
+                    raise RuntimeError("workflow primitive unavailable: place")
+                fn(dict(step))
         elif action == "keys":
             self.key_sender(str(arg))
         elif action == "wait_s":
@@ -270,13 +296,19 @@ class WorkflowRunner:
                     self._execute(child)
 
 
-def creation_dialog(name, store, intent_parser):
+def creation_dialog(name, store, intent_parser, *, triggers=None,
+                    taught_confirmation=False):
     """Build the first Question in a side-effect-free voice creation dialog.
 
     ``intent_parser(answer)`` may return ``(action, arg)`` or a dict with
     ``action``/``do`` and ``arg``. Only workflow-safe primitives are accepted.
     """
     workflow_name = str(name).strip()
+    seeded_triggers = []
+    for trigger in triggers or [workflow_name]:
+        trigger = normalize(trigger)
+        if trigger and trigger not in seeded_triggers:
+            seeded_triggers.append(trigger)
     steps = []
     failures = 0
 
@@ -285,12 +317,16 @@ def creation_dialog(name, store, intent_parser):
         if isinstance(value, (tuple, list)) and len(value) >= 2:
             action, arg = value[0], value[1]
         elif isinstance(value, dict):
-            action, arg = value.get("do", value.get("action")), value.get("arg")
+            step = dict(value)
+            action = step.pop("action", step.get("do", None))
+            step["do"] = action
+            arg = step.get("arg")
         else:
             return None
         if action not in PRIMITIVES or action == "ask" or arg is None:
             return None
-        step = {"do": action, "arg": arg}
+        if not isinstance(value, dict):
+            step = {"do": action, "arg": arg}
         return step if _validate_step(step) else None
 
     def handle(answer):
@@ -302,8 +338,10 @@ def creation_dialog(name, store, intent_parser):
             if not steps:
                 return "Workflow creation cancelled; no steps were added."
             recipe = {"name": workflow_name,
-                      "triggers": [normalize(workflow_name)], "steps": steps}
+                      "triggers": seeded_triggers, "steps": steps}
             store.save(recipe)
+            if taught_confirmation:
+                return f"Saved. Say '{seeded_triggers[0]}' any time."
             return f"Saved workflow {workflow_name} with {len(steps)} steps."
         step = parse(answer)
         if step is None:
