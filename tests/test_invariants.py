@@ -19,6 +19,7 @@ import llm  # noqa: E402
 from store import TranscriptStore, decode_wav, wav_bytes  # noqa: E402
 from live import LiveWorker, wake_command  # noqa: E402
 from commands import Router  # noqa: E402
+from hud import HudState  # noqa: E402
 
 
 # ---------- llm.chain: nothing leaves the box ----------
@@ -137,17 +138,21 @@ def test_live_wake_alone_awaits_and_routes_follow_up():
         def __init__(self): self.calls = []
         def handle(self, text): self.calls.append(text); return "done"
     engine, router, clock = Engine(), RouterStub(), _FakeClock()
-    responses, spoken = [], []
+    responses, spoken, heard, awaiting = [], [], [], []
     worker = LiveWorker(_FakeRecorder(), router, None, {
         "engine": "fake", "wake_word": "flow", "silence_ms": 280,
         "max_utterance_s": 12}, engine=engine, vad=_FakeVad(), clock=clock,
-        response_fn=responses.append, speak_fn=spoken.append)
+        response_fn=responses.append, speak_fn=spoken.append,
+        heard_fn=lambda text, command: heard.append((text, command)),
+        awaiting_fn=lambda active, deadline: awaiting.append((active, deadline)))
     worker.start()
     worker._decode_and_act(np.zeros(512), worker._generation)
     assert worker.awaiting_command and responses == ["Yes?"] and spoken == ["Yes?"]
+    assert heard == [("Flow.", "")] and awaiting[-1] == (True, 108.0)
     engine.text = "open youtube"
     worker._decode_and_act(np.zeros(512), worker._generation)
     assert router.calls == ["open youtube"] and not worker.awaiting_command
+    assert heard[-1] == ("open youtube", "open youtube")
     worker.close()
 
 
@@ -205,6 +210,44 @@ def test_ignored_live_utterance_never_stores():
 def test_live_module_has_no_network_client_import():
     source = (ROOT / "live.py").read_text(encoding="utf-8")
     assert "import requests" not in source and "urllib" not in source
+
+
+# ---------- HUD state (no Tk/display) ----------
+
+def test_hud_expands_and_collapses_at_idle_boundary():
+    hud = HudState()
+    hud.set_enabled(True, now=10.0)
+    assert hud.tick(17.999)
+    assert not hud.tick(18.0)
+    hud.utterance("flow open notes", command="open notes", now=20.0)
+    assert hud.expanded
+    hud.set_enabled(False, now=21.0)
+    hud.utterance("late stale decode", command="oops", now=22.0)
+    assert not hud.enabled and not hud.expanded
+
+
+def test_hud_ignored_style_and_new_utterance_clear_interaction():
+    hud = HudState()
+    hud.set_enabled(True, now=1.0)
+    hud.utterance("flow first", command="first", now=2.0)
+    hud.append("extra", now=2.1)
+    hud.utterance("background speech", ignored=True, now=3.0)
+    assert hud.ignored and list(hud.thinking) == []
+    assert hud.status == "Say ‘flow’ first"
+    hud.utterance("flow second", command="second", now=4.0)
+    assert not hud.ignored and "first" not in " ".join(hud.thinking)
+
+
+def test_hud_line_buffer_trims_oldest_and_awaiting_expires():
+    hud = HudState(max_lines=3)
+    hud.set_enabled(True, now=1.0)
+    for i in range(5):
+        hud.append(f"line {i}", now=2.0 + i)
+    assert list(hud.thinking) == ["line 2", "line 3", "line 4"]
+    hud.set_status("Yes?", question=True, deadline=20.0, now=12.0)
+    assert hud.question and hud.status_text(12.1) == "Yes?  8s"
+    hud.tick(20.1)
+    assert not hud.question
 
 
 # ---------- command router (no OS actions, model, or network) ----------

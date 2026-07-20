@@ -139,7 +139,7 @@ class LiveWorker:
 
     def __init__(self, recorder, router, store, cfg, *, engine=None, vad=None,
                  speak_fn=None, response_fn=None, state_fn=None, ignored_fn=None,
-                 clock=None):
+                 heard_fn=None, awaiting_fn=None, clock=None):
         self.recorder = recorder
         self.router = router
         self.store = store
@@ -151,6 +151,8 @@ class LiveWorker:
         self.response_fn = response_fn or (lambda _text: None)
         self.state_fn = state_fn or (lambda: None)
         self.ignored_fn = ignored_fn or (lambda _text: None)
+        self.heard_fn = heard_fn or (lambda _text, _command: None)
+        self.awaiting_fn = awaiting_fn or (lambda _active, _deadline: None)
         self.clock = clock or time.monotonic
         self._q = recorder.subscribe(maxsize=96)
         self._lock = threading.Lock()
@@ -191,6 +193,7 @@ class LiveWorker:
             self._cancel_awaiting_locked()
             self._invalidate_locked()
         self._drain()
+        self.awaiting_fn(False, 0.0)
         self.state_fn()
         print("[live] off")
 
@@ -200,6 +203,7 @@ class LiveWorker:
             self._cancel_awaiting_locked()
             self._invalidate_locked()
         self._drain()
+        self.awaiting_fn(False, 0.0)
         self.state_fn()
 
     def resume(self, reason="external"):
@@ -303,6 +307,7 @@ class LiveWorker:
             print(f"[live] ignored: {text}")
             self.ignored_fn(text)
             return
+        self.heard_fn(text, command)
         if command == "":
             self.pause("live-sapi")
             try:
@@ -313,6 +318,10 @@ class LiveWorker:
                 if self._enabled and not self._pauses:
                     self.awaiting_command = True
                     self.awaiting_command_deadline = self.clock() + 8.0
+                    deadline = self.awaiting_command_deadline
+                else:
+                    deadline = 0.0
+            self.awaiting_fn(bool(deadline), deadline)
             self.response_fn("Yes?")
             return
         if not self._valid(generation):

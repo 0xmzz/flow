@@ -599,6 +599,8 @@ class Overlay:
         except Exception:
             pass
         root.configure(bg=bg)
+        from hud import HudView
+        hud = HudView(root, tk)
 
         BW, GAP, WH = 3, 2, 22
         wave_w = self.N_BARS * (BW + GAP)
@@ -668,6 +670,9 @@ class Overlay:
                 while True:
                     s = self._q.get_nowait()
                     kind = s[0] if isinstance(s, tuple) else s
+                    if kind == "hud":
+                        hud.handle(s[1:])
+                        continue
                     hide_at[0] = None
                     revert_mode[0] = None
                     status.config(fg=fg)
@@ -714,6 +719,13 @@ class Overlay:
                 print(f"[overlay] poll error (continuing): {e}")
             if st["mode"] in ("rec", "work", "live"):
                 draw_wave()
+            hud_expanded = hud.update()
+            if hud_expanded and st["mode"] == "live":
+                root.withdraw()
+            elif (not hud_expanded and hud.state.enabled
+                  and st["mode"] == "live"):
+                root.deiconify()
+                place()
             if hide_at[0] is not None and time.time() > hide_at[0]:
                 hide_at[0] = None
                 if revert_mode[0] == "live":
@@ -899,7 +911,9 @@ class Flow:
                     self.recorder, self.router, self.store, self.cfg["live"],
                     speak_fn=speak, response_fn=self._show_live_response,
                     state_fn=self.restore_base_state,
-                    ignored_fn=self._show_live_ignored)
+                    ignored_fn=self._show_live_ignored,
+                    heard_fn=self._show_live_heard,
+                    awaiting_fn=self._show_live_awaiting)
             except Exception as e:
                 print(f"[live] disabled: model/VAD startup failed ({e})")
         if self.cfg["cleanup"]["enabled"] and self.cfg["cleanup"]["provider"] == "ollama":
@@ -944,6 +958,9 @@ class Flow:
         else:
             state = "idle"
         self.set_icon(state)
+        if self.overlay:
+            self.overlay.set(("hud", "enabled",
+                              bool(self.live_worker and self.live_worker.enabled)))
         if self.tray:
             suffix = f"; live [{self.cfg.get('live_hotkey')}] ON" \
                 if self.live_worker and self.live_worker.enabled else ""
@@ -951,11 +968,19 @@ class Flow:
 
     def _show_live_response(self, response):
         if self.overlay and response:
-            self.overlay.set(("say", response))
+            self.overlay.set(("hud", "response", response))
 
     def _show_live_ignored(self, text):
         if self.overlay:
-            self.overlay.set(("ignored", (text or "")[:40]))
+            self.overlay.set(("hud", "ignored", text or ""))
+
+    def _show_live_heard(self, text, command):
+        if self.overlay:
+            self.overlay.set(("hud", "heard", text or "", command or ""))
+
+    def _show_live_awaiting(self, active, deadline):
+        if self.overlay:
+            self.overlay.set(("hud", "awaiting", bool(active), deadline))
 
     def on_press(self, mode="dictate"):
         with self._session_lock:
