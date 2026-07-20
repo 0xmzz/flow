@@ -16,6 +16,7 @@ import time
 import urllib.parse
 import webbrowser
 
+from agents import AgentError, AgentRunner, select_lane
 from workflows import Question, RecipeStore, WorkflowRunner, creation_dialog
 
 
@@ -163,15 +164,24 @@ def _strip_tails(text):
 
 class Router:
     def __init__(self, cfg, *, workflow_store=None, workflow_runner=None,
-                 intent_parser=None):
+                 intent_parser=None, agent_runner=None):
         self.cfg = cfg
         self.workflows = workflow_store or RecipeStore()
         self.workflow_progress_fn = lambda _name, _i, _n, _text: None
         self.workflow_complete_fn = lambda _text: None
         self.workflow_ask_fn = None
         self.intent_parser = intent_parser
+        self.agent_progress_fn = lambda _lane, _tail: None
+        self.agent_complete_fn = lambda _result: None
+        self.agent_runner = agent_runner or AgentRunner()
         self.workflow_runner = workflow_runner or WorkflowRunner(
             router=self, ask_fn=self._ask_workflow)
+
+    def configure_agents(self, *, progress=None, complete=None):
+        if progress is not None:
+            self.agent_progress_fn = progress
+        if complete is not None:
+            self.agent_complete_fn = complete
 
     def configure_workflows(self, *, progress=None, complete=None, ask=None):
         if progress is not None:
@@ -208,6 +218,9 @@ class Router:
             if ratio >= 0.8:
                 t = match + ((" " + parts[1]) if len(parts) == 2 else "")
 
+        if t in {"stop", "cancel"} and self.agent_runner.running:
+            self.agent_runner.cancel()
+            return "Cancelling agent."
         if t in {"stop", "cancel"} and self.workflow_runner.running:
             self.workflow_runner.cancel()
             return "Cancelling workflow."
@@ -247,6 +260,14 @@ class Router:
                 complete=self.workflow_complete_fn)
             return (f"Running workflow {recipe['name']}." if started
                     else "A workflow is already running.")
+
+        explicit = re.match(
+            r"^(?:ask\s+(codex|claude)\s+to|send\s+to\s+(codex|claude))\s+(.+)$",
+            text.strip().rstrip(".!?"), re.IGNORECASE)
+        if explicit:
+            return self._confirm_agent(
+                explicit.group(3).strip(),
+                (explicit.group(1) or explicit.group(2)).lower())
 
         # --- crypto price ---
         if any(k in t for k in ("price", "how much", "trading at", "worth")):
@@ -423,13 +444,18 @@ class Router:
         raw, _ = llm.chain(
             self.cfg["cleanup"],
             'Extract the voice-command intent. Reply with STRICT JSON only: '
-            '{"action":"open|close|switch|price|search|type|answer",'
-            '"arg":"<string>"}. Use answer for questions or conversation.',
+            '{"action":"open|close|switch|price|search|type|agent|answer",'
+            '"arg":"<string>"}. Use agent when the request is a multi-step '
+            'or open-ended task beyond the listed skills, including coding, '
+            'research, file manipulation, or anything requiring reasoning. '
+            'Use answer for questions or conversation.',
             text, max_tokens=80,
             local_only=self.cfg.get("local_only", True))
         intent = self._parse_intent(raw)
         if intent and intent[0] != "answer" and intent[1].strip():
             action, arg = intent
+            if action == "agent":
+                return self._confirm_agent(arg.strip())
             handlers = {"open": self._open, "close": self._close,
                         "switch": self._switch, "price": self._price,
                         "search": self._search, "type": self._type}
@@ -444,6 +470,34 @@ class Router:
             text, max_tokens=200,
             local_only=self.cfg.get("local_only", True))
         return out or "I couldn't reach the assistant."
+
+    def _confirm_agent(self, task, lane=None):
+        if self.agent_runner.running:
+            return "An agent is already running."
+        try:
+            selected = select_lane(lane, self.agent_runner.lanes)
+        except AgentError as exc:
+            return str(exc)
+        preview = " ".join(task.split())
+        preview = preview[:57].rstrip() + ("..." if len(preview) > 60 else "")
+
+        def confirm(answer):
+            heard = str(answer).strip().lower().rstrip(".!?")
+            if heard in {"yes", "yeah", "yep", "sure", "confirm"}:
+                try:
+                    started = self.agent_runner.start(
+                        task, selected.name, progress=self.agent_progress_fn,
+                        complete=self.agent_complete_fn)
+                except AgentError as exc:
+                    return str(exc)
+                return (f"Sending to {selected.name}." if started else
+                        "An agent is already running.")
+            if heard in {"no", "nope", "cancel", "never mind", "nevermind"}:
+                return "Okay, not sending."
+            return Question("Please say yes or no.", confirm,
+                            cancel_text="Okay, not sending.")
+        return Question(f"Send to {selected.name}: {preview}?", confirm,
+                        cancel_text="Okay, not sending.")
 
     @staticmethod
     def _parse_intent(raw):
@@ -461,6 +515,6 @@ class Router:
                 continue
             action, arg = value.get("action"), value.get("arg")
             if (action in {"open", "close", "switch", "price", "search",
-                           "type", "answer"} and isinstance(arg, str)):
+                           "type", "agent", "answer"} and isinstance(arg, str)):
                 return action, arg
         return None

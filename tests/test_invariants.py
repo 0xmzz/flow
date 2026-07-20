@@ -17,6 +17,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import llm  # noqa: E402
+from agents import (AgentCancelled, AgentError, AgentRunner, dispatch,
+                    select_lane)  # noqa: E402
 from store import TranscriptStore, decode_wav, wav_bytes  # noqa: E402
 from live import LiveWorker, wake_command  # noqa: E402
 from commands import Router  # noqa: E402
@@ -410,6 +412,121 @@ def test_workflow_voice_creation_dialog_with_fake_intents():
         assert store.get("demo")["steps"] == [
             {"do": "open", "arg": "chrome"},
             {"do": "type", "arg": "Hello"}]
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+# ---------- Phase C agent lanes (all lanes are fakes) ----------
+
+class _FakeLane:
+    def __init__(self, name, available=True, result="done", run_fn=None):
+        self.name = name
+        self._available = available
+        self.result = result
+        self.run_fn = run_fn
+        self.calls = []
+
+    def available(self):
+        return self._available
+
+    def run(self, task, progress_fn, cancel_event):
+        self.calls.append(task)
+        if self.run_fn:
+            return self.run_fn(task, progress_fn, cancel_event)
+        return self.result
+
+
+def test_agent_lane_registry_selection_and_unavailable_fallback():
+    lanes = [_FakeLane("first", False), _FakeLane("second", True, "ok")]
+    assert select_lane(lanes=lanes).name == "second"
+    assert dispatch("task", lanes=lanes) == "ok"
+    with pytest.raises(AgentError, match="first is not available"):
+        dispatch("task", lane="first", lanes=lanes)
+    with pytest.raises(AgentError, match="No agent lanes"):
+        dispatch("task", lanes=[_FakeLane("off", False)])
+
+
+def test_agent_confirmation_yes_runs_and_no_aborts():
+    lane = _FakeLane("fake", result="Finished the requested work.")
+    test_root = ROOT / "data" / "test-tmp"
+    runner = AgentRunner([lane], log_path=test_root / "confirm.jsonl")
+    router = _router()
+    router.agent_runner = runner
+    try:
+        question = router._confirm_agent("Keep My Task Case")
+        assert isinstance(question, Question)
+        assert question.text == "Send to fake: Keep My Task Case?"
+        assert question.handler("no") == "Okay, not sending."
+        assert lane.calls == []
+        question = router._confirm_agent("Keep My Task Case")
+        assert question.handler("yes") == "Sending to fake."
+        runner.thread.join(2)
+        assert lane.calls == ["Keep My Task Case"]
+    finally:
+        shutil.rmtree(test_root, ignore_errors=True)
+
+
+def test_agent_intent_returns_confirmation(monkeypatch):
+    lane = _FakeLane("fake")
+    router = _router()
+    router.agent_runner = AgentRunner([lane],
+                                      log_path=ROOT / "data" / "test-tmp" / "intent.jsonl")
+    monkeypatch.setattr(llm, "chain", lambda *args, **kwargs:
+                        ('{"action":"agent","arg":"Research This Topic"}', "fake"))
+    question = router.handle("please investigate this thoroughly")
+    assert isinstance(question, Question)
+    assert question.text == "Send to fake: Research This Topic?"
+
+
+def test_agent_progress_throttle_and_jsonl_log():
+    root = ROOT / "data" / "test-tmp"
+    shutil.rmtree(root, ignore_errors=True)
+    clock = _FakeClock()
+
+    def run(_task, progress, _cancel):
+        progress("one")
+        clock.advance(1)
+        progress("two")
+        clock.advance(1)
+        progress("three")
+        return "full result"
+
+    lane = _FakeLane("fake", run_fn=run)
+    progress, completed = [], []
+    runner = AgentRunner([lane], log_path=root / "agent_runs.jsonl",
+                         clock=clock)
+    try:
+        assert runner.start("test task", progress=lambda *x: progress.append(x),
+                            complete=completed.append)
+        runner.thread.join(2)
+        assert progress == [("fake", "one"), ("fake", "three")]
+        assert completed[0]["outcome"] == "ok"
+        lines = (root / "agent_runs.jsonl").read_text(encoding="utf-8").splitlines()
+        record = json.loads(lines[0])
+        assert record["lane"] == "fake" and record["task"] == "test task"
+        assert record["outcome"] == "ok" and record["result_tail"] == "full result"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_agent_cancel_path_is_logged():
+    root = ROOT / "data" / "test-tmp"
+    entered = threading.Event()
+
+    def run(_task, _progress, cancel):
+        entered.set()
+        assert cancel.wait(1)
+        raise AgentCancelled("cancelled")
+
+    runner = AgentRunner([_FakeLane("fake", run_fn=run)],
+                         log_path=root / "agent_runs.jsonl")
+    try:
+        assert runner.start("long task")
+        assert entered.wait(1)
+        runner.cancel()
+        runner.thread.join(2)
+        record = json.loads((root / "agent_runs.jsonl").read_text().strip())
+        assert record["outcome"] == "cancelled"
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

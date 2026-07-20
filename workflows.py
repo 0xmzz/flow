@@ -27,6 +27,7 @@ class Question:
     text: str
     handler: object
     cancel: object = None
+    cancel_text: str = "Cancelled."
 
     @property
     def question(self):

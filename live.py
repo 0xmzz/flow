@@ -212,6 +212,9 @@ class LiveWorker:
             runner = getattr(self.router, "workflow_runner", None)
             if runner and runner.running:
                 runner.cancel()
+            agent = getattr(self.router, "agent_runner", None)
+            if agent and agent.running:
+                agent.cancel()
         self._drain()
         if reason != "live-sapi":
             self.awaiting_fn(False, 0.0)
@@ -399,14 +402,20 @@ class LiveWorker:
             legacy_follow_up = (self.awaiting_command and question is None
                                 and now <= self.awaiting_command_deadline)
             runner = getattr(self.router, "workflow_runner", None)
-            bare_cancel = (str(text).strip().lower().rstrip(".!?")
-                           in {"stop", "cancel"} and runner and runner.running)
+            agent = getattr(self.router, "agent_runner", None)
+            cancel_word = str(text).strip().lower().rstrip(".!?") in {"stop", "cancel"}
+            bare_agent_cancel = cancel_word and agent and agent.running
+            bare_cancel = cancel_word and runner and runner.running
             if not question and not legacy_follow_up and self.awaiting_command:
                 self._cancel_awaiting_locked()
         # Wake-worded commands always win. A bare stop/cancel also reaches an
         # active workflow so long waits can be aborted hands-free.
         if wake is not None:
             command = wake
+        elif bare_agent_cancel:
+            agent.cancel()
+            self.response_fn("Cancelling agent.")
+            return
         elif bare_cancel:
             runner.cancel()
             self.response_fn("Cancelling workflow.")
@@ -417,7 +426,7 @@ class LiveWorker:
                 with self._lock:
                     self._cancel_awaiting_locked()
                 self.awaiting_fn(False, 0.0)
-                self.response_fn("Cancelled.")
+                self.response_fn(question.cancel_text)
                 return
             with self._lock:
                 if self.awaiting_input is question:

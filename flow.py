@@ -918,6 +918,9 @@ class Flow:
                     progress=self._show_workflow_progress,
                     complete=self.live_worker.deliver_async,
                     ask=self.live_worker.ask_workflow)
+                self.router.configure_agents(
+                    progress=self._show_agent_progress,
+                    complete=self._complete_agent)
             except Exception as e:
                 print(f"[live] disabled: model/VAD startup failed ({e})")
         if self.cfg["cleanup"]["enabled"] and self.cfg["cleanup"]["provider"] == "ollama":
@@ -990,6 +993,27 @@ class Flow:
         if self.overlay:
             self.overlay.set(("hud", "workflow", name, index, total,
                               description))
+
+    def _show_agent_progress(self, lane, tail):
+        if self.overlay:
+            self.overlay.set(("hud", "agent", lane, tail))
+
+    def _complete_agent(self, result):
+        from agents import short_summary
+        outcome, text = result["outcome"], result.get("text") or ""
+        if outcome == "ok":
+            spoken = short_summary(text) or f"{result['lane']} finished."
+            full = text[:400] or spoken
+        elif outcome == "cancelled":
+            spoken = f"The {result['lane']} agent was cancelled."
+            full = spoken
+        else:
+            reason = (" ".join(text.split())[:120] or outcome).rstrip(".!?")
+            spoken = f"The {result['lane']} agent failed: {reason}."
+            full = spoken
+        self.live_worker.deliver_async(spoken)
+        if self.overlay:
+            self.overlay.set(("hud", "agent_result", full))
 
     def on_press(self, mode="dictate"):
         with self._session_lock:

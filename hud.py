@@ -172,6 +172,13 @@ class HudView:
             if header not in self.state.thinking:
                 self.state.append(header)
             self.state.append(f"step {event[2]}/{event[3]}: {event[4]}")
+        elif kind == "agent":
+            header = f"agent: {event[1]}"
+            if header not in self.state.thinking:
+                self.state.append(header)
+            self.state.append(event[2])
+        elif kind == "agent_result":
+            self.state.set_status(event[1])
 
     def update(self):
         self.state.tick()
