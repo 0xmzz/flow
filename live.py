@@ -17,6 +17,7 @@ from pathlib import Path
 import numpy as np
 
 from workflows import Question
+from commands import KNOWN_SITES, ROUTER_VERBS
 
 
 SAMPLE_RATE = 16_000
@@ -24,6 +25,51 @@ FRAME_SAMPLES = 512                 # 32 ms, required by Silero
 PRE_FRAMES = 5                      # 160 ms
 POST_FRAMES = 5                     # 160 ms
 GREETINGS = {"hey", "hi", "ok", "okay", "yo", "so"}
+FILLERS = {"yeah", "yes", "ok", "okay", "hmm", "uh", "um", "right", "cool"}
+QUIET_PHRASES = {"stop listening", "go to sleep", "that's all", "thats all",
+                 "that s all"}
+
+
+def correct_live_text(text, wake_word="flow", vocab=(), workflow_words=()):
+    """Lightly repair Parakeet tokens using only local command vocabulary."""
+    raw = str(text or "")
+    candidates = []
+    for value in (list(ROUTER_VERBS) + list(vocab or ())
+                  + list(workflow_words or ()) + list(KNOWN_SITES)):
+        candidates.extend(re.findall(r"[\w']+", str(value).lower()))
+    candidates = sorted(set(candidates), key=lambda value: (-len(value), value))
+    wake = re.sub(r"[^\w]", "", str(wake_word or "").lower())
+
+    index = 0
+    def replace(match):
+        nonlocal index
+        token = match.group(0)
+        lowered = token.lower()
+        first = index == 0
+        index += 1
+        if len(lowered) < 3:
+            return token
+        if first and wake:
+            ratio = difflib.SequenceMatcher(None, lowered, wake).ratio()
+            if ratio >= 0.7 or lowered in {"floats", "flows", "floor", "flo"}:
+                return wake.capitalize() if token[:1].isupper() else wake
+        if lowered in candidates:
+            return token
+        scored = []
+        for value in candidates:
+            forms = (value, value[:-1]) if value.endswith("s") else (value,)
+            score = max(difflib.SequenceMatcher(None, lowered, form).ratio()
+                        for form in forms)
+            scored.append((score, value))
+        if not scored:
+            return token
+        best = max(score for score, _value in scored)
+        matches = [value for score, value in scored if score == best]
+        if best < 0.8 or len(matches) != 1:
+            return token
+        value = matches[0]
+        return value.capitalize() if token[:1].isupper() else value
+    return re.sub(r"[\w']+", replace, raw)
 
 
 def wake_command(text, wake_word="flow"):
@@ -141,7 +187,8 @@ class LiveWorker:
 
     def __init__(self, recorder, router, store, cfg, *, engine=None, vad=None,
                  speak_fn=None, response_fn=None, state_fn=None, ignored_fn=None,
-                 heard_fn=None, awaiting_fn=None, clock=None):
+                 heard_fn=None, awaiting_fn=None, conversation_fn=None,
+                 clock=None):
         self.recorder = recorder
         self.router = router
         self.store = store
@@ -155,6 +202,7 @@ class LiveWorker:
         self.ignored_fn = ignored_fn or (lambda _text: None)
         self.heard_fn = heard_fn or (lambda _text, _command: None)
         self.awaiting_fn = awaiting_fn or (lambda _active, _deadline: None)
+        self.conversation_fn = conversation_fn or (lambda _active, _deadline: None)
         self.clock = clock or time.monotonic
         self._q = recorder.subscribe(maxsize=96)
         self._lock = threading.Lock()
@@ -167,6 +215,7 @@ class LiveWorker:
         self.awaiting_input = None
         self.awaiting_input_deadline = 0.0
         self._dialog_token = 0
+        self.conversation_deadline = 0.0
         threading.Thread(target=self._loop, daemon=True, name="live-worker").start()
 
     @property
@@ -185,6 +234,7 @@ class LiveWorker:
                 return
             self._enabled = True
             self._cancel_awaiting_locked()
+            self._clear_conversation_locked()
             self._invalidate_locked()
         self._drain()
         self.state_fn()
@@ -196,9 +246,11 @@ class LiveWorker:
                 return
             self._enabled = False
             self._cancel_awaiting_locked()
+            self._clear_conversation_locked()
             self._invalidate_locked()
         self._drain()
         self.awaiting_fn(False, 0.0)
+        self.conversation_fn(False, 0.0)
         self.state_fn()
         print("[live] off")
 
@@ -207,6 +259,7 @@ class LiveWorker:
             self._pauses.add(reason)
             if reason != "live-sapi":
                 self._cancel_awaiting_locked()
+                self._clear_conversation_locked()
             self._invalidate_locked()
         if reason != "live-sapi":
             runner = getattr(self.router, "workflow_runner", None)
@@ -218,6 +271,7 @@ class LiveWorker:
         self._drain()
         if reason != "live-sapi":
             self.awaiting_fn(False, 0.0)
+            self.conversation_fn(False, 0.0)
         self.state_fn()
 
     def resume(self, reason="external"):
@@ -247,6 +301,37 @@ class LiveWorker:
                 question.cancel()
             except Exception:
                 pass
+
+    def _clear_conversation_locked(self):
+        self.conversation_deadline = 0.0
+
+    def _conversation_active_locked(self, now):
+        if self.conversation_deadline and now >= self.conversation_deadline:
+            self._clear_conversation_locked()
+        return bool(self.conversation_deadline)
+
+    def _touch_conversation(self):
+        seconds = float(self.cfg.get("conversation_s", 45.0) or 0.0)
+        with self._lock:
+            if seconds <= 0 or not self._enabled or self._pauses:
+                return 0.0
+            self.conversation_deadline = self.clock() + seconds
+            deadline = self.conversation_deadline
+        self.conversation_fn(True, deadline)
+        return deadline
+
+    def _workflow_words(self):
+        store = getattr(self.router, "workflows", None)
+        if not store:
+            return []
+        words = []
+        try:
+            for recipe in store.list():
+                words.append(recipe.get("name", ""))
+                words.extend(recipe.get("triggers", ()))
+        except Exception:
+            pass
+        return words
 
     def _install_question(self, question, timeout_s=30.0):
         with self._lock:
@@ -394,9 +479,13 @@ class LiveWorker:
         if not self._valid(generation):
             print("[live] discarded stale decode")
             return
+        text = correct_live_text(
+            text, self.cfg.get("wake_word"), self.cfg.get("vocab", ()),
+            self._workflow_words())
         wake = wake_command(text, self.cfg.get("wake_word"))
         with self._lock:
             now = self.clock()
+            conversation = self._conversation_active_locked(now)
             question = (self.awaiting_input
                         if now <= self.awaiting_input_deadline else None)
             legacy_follow_up = (self.awaiting_command and question is None
@@ -408,6 +497,25 @@ class LiveWorker:
             bare_cancel = cancel_word and runner and runner.running
             if not question and not legacy_follow_up and self.awaiting_command:
                 self._cancel_awaiting_locked()
+        if conversation:
+            self._touch_conversation()
+        if wake is not None:
+            self._touch_conversation()
+        normalized = re.sub(r"[^\w\s']", "", wake if wake is not None else text,
+                            flags=re.UNICODE).lower().replace("’", "'").strip()
+        if (wake is not None or conversation) and normalized in QUIET_PHRASES:
+            with self._lock:
+                self._cancel_awaiting_locked()
+                self._clear_conversation_locked()
+            self.awaiting_fn(False, 0.0)
+            self.conversation_fn(False, 0.0)
+            self.response_fn("Going quiet.")
+            self.pause("live-sapi")
+            try:
+                self.speak_fn("Going quiet.")
+            finally:
+                self.resume("live-sapi")
+            return
         # Wake-worded commands always win. A bare stop/cancel also reaches an
         # active workflow so long waits can be aborted hands-free.
         if wake is not None:
@@ -421,6 +529,7 @@ class LiveWorker:
             self.response_fn("Cancelling workflow.")
             return
         elif question is not None:
+            self._touch_conversation()
             answer = text.strip()
             if answer.lower().rstrip(".!?") in {"cancel", "never mind", "nevermind"}:
                 with self._lock:
@@ -447,11 +556,17 @@ class LiveWorker:
                 self._cancel_awaiting_locked()
             self.awaiting_fn(False, 0.0)
             command = text.strip()
+        elif conversation:
+            command = text.strip()
         else:
             command = None
         if command is None:
             print(f"[live] ignored: {text}")
             self.ignored_fn(text)
+            return
+        if conversation and wake is None and not command:
+            return
+        if conversation and wake is None and command.lower().rstrip(".!?") in FILLERS:
             return
         self.heard_fn(text, command)
         if command == "":

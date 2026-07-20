@@ -101,7 +101,8 @@ DEFAULTS = {
     "hotkey": "f8",                # hold to dictate (paste transcript at cursor)
     "command_hotkey": "right alt",    # hold to issue a spoken COMMAND (acts + speaks back)
     "live_hotkey": "f9",
-    "live": {"enabled": True, "wake_word": "flow", "silence_ms": 280,
+    "live": {"enabled": True, "wake_word": "flow", "conversation_s": 45.0,
+             "silence_ms": 280,
              "max_utterance_s": 12, "engine": "nemo-parakeet-tdt-0.6b-v3"},
     "model": "large-v3",           # full v3 handles whispered/quiet speech better than turbo
     "device": "cuda",
@@ -1011,13 +1012,16 @@ class Flow:
         if self.cfg.get("live", {}).get("enabled", True):
             try:
                 from live import LiveWorker
+                live_cfg = dict(self.cfg["live"])
+                live_cfg["vocab"] = list(self.cfg.get("vocab") or ())
                 self.live_worker = LiveWorker(
-                    self.recorder, self.router, self.store, self.cfg["live"],
+                    self.recorder, self.router, self.store, live_cfg,
                     speak_fn=speak, response_fn=self._show_live_response,
                     state_fn=self.restore_base_state,
                     ignored_fn=self._show_live_ignored,
                     heard_fn=self._show_live_heard,
-                    awaiting_fn=self._show_live_awaiting)
+                    awaiting_fn=self._show_live_awaiting,
+                    conversation_fn=self._show_live_conversation)
                 self.router.configure_workflows(
                     progress=self._show_workflow_progress,
                     complete=self.live_worker.deliver_async,
@@ -1104,17 +1108,28 @@ class Flow:
         return name
 
     def startup_mic_check(self):
-        """Log — and quietly fix — a dead default input before first use."""
+        """Log — and quietly fix — a dead default input before first use.
+
+        Runs on a daemon thread with `busy` held: probing/retargeting must not
+        interleave with a recording, and every other retarget caller already
+        runs under `busy` — on_press and remote_start both bail while it's
+        locked, so a press during the (normally 0.3s) probe is dropped rather
+        than corrupted."""
         if self.cfg["mode"] == "client" or not self.cfg.get("mic_silence_guard", True):
             return
-        level = probe_input(self.recorder.device_index, self.cfg["sample_rate"], 0.3)
-        name = self.recorder.device_name or "default input"
-        if level >= SILENCE_PEAK / 4:  # room tone clears this; digital silence doesn't
-            print(f"[mic] {name} live at startup (peak {level:.5f})")
-            return
-        print(f"[mic] {name} is silent at startup (peak {level:.5f})")
-        if self.cfg.get("mic_autoswitch", True):
-            self.recover_mic(min_gap_s=0.0)
+        with self.busy:
+            with self._session_lock:
+                if self.recording:
+                    return  # a session beat us to the mic; leave it alone
+            level = probe_input(self.recorder.device_index,
+                                self.cfg["sample_rate"], 0.3)
+            name = self.recorder.device_name or "default input"
+            if level >= SILENCE_PEAK / 4:  # room tone clears this; silence doesn't
+                print(f"[mic] {name} live at startup (peak {level:.5f})")
+                return
+            print(f"[mic] {name} is silent at startup (peak {level:.5f})")
+            if self.cfg.get("mic_autoswitch", True):
+                self.recover_mic(min_gap_s=0.0)
 
     def set_icon(self, state, context=None):
         if self.tray:
@@ -1158,6 +1173,10 @@ class Flow:
     def _show_live_awaiting(self, active, deadline):
         if self.overlay:
             self.overlay.set(("hud", "awaiting", bool(active), deadline))
+
+    def _show_live_conversation(self, active, deadline):
+        if self.overlay:
+            self.overlay.set(("hud", "conversation", bool(active), deadline))
 
     def _show_workflow_progress(self, name, index, total, description):
         if self.overlay:
@@ -1565,10 +1584,13 @@ class Flow:
 
     def run(self):
         self.maybe_start_server()
-        self.startup_mic_check()
         # Raw hook (never suppresses) so we can distinguish left vs right ctrl
-        # and never eat the key from other apps.
+        # and never eat the key from other apps. Registered BEFORE the mic
+        # probe: the dead-headset probe path scans devices for seconds, and
+        # hotkeys must already be live during it.
         keyboard.hook(self._on_key)
+        threading.Thread(target=self.startup_mic_check, daemon=True,
+                         name="mic-startup-check").start()
         try:
             import webbrowser
 

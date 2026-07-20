@@ -147,8 +147,8 @@ KNOWN_SITES = {
     "google": "https://google.com",
 }
 
-_VERBS = ("open", "launch", "start", "close", "switch", "search", "google",
-          "price", "type", "write", "help")
+ROUTER_VERBS = ("open", "launch", "start", "close", "switch", "search", "google",
+                "price", "type", "write", "help", "run")
 _TAIL_RE = re.compile(
     r"\s+(?:right\s+now|at\s+the\s+moment|real\s+quick|for\s+me|currently|"
     r"quickly|today|please|now)\s*$")
@@ -207,13 +207,13 @@ class Router:
         t = re.sub(r"^(?:(?:actually|also|and|then)\s+)+", "", t)
         t = _strip_tails(t)
         parts = t.split(maxsplit=1)
-        if parts and parts[0] not in _VERBS:
+        if parts and parts[0] not in ROUTER_VERBS:
             heard = parts[0]
             forms = {heard, heard.replace("th", "")}
             if heard.endswith("s"):
                 forms.add(heard[:-1])
             scored = [(difflib.SequenceMatcher(None, form, verb).ratio(), verb)
-                      for form in forms for verb in _VERBS]
+                      for form in forms for verb in ROUTER_VERBS]
             ratio, match = max(scored)
             if ratio >= 0.8:
                 t = match + ((" " + parts[1]) if len(parts) == 2 else "")
@@ -298,6 +298,10 @@ class Router:
         # --- open an app or site ---
         m = re.search(r"^(?:open|launch|start) (.+)", t)
         if m:
+            names = [re.sub(r"^open\s+", "", part.strip())
+                     for part in m.group(1).split(" and ")]
+            if len(names) > 1 and all(names):
+                return " ".join(filter(None, (self._open(name) for name in names)))
             return self._open(m.group(1).strip())
 
         # --- web search ---
@@ -405,7 +409,9 @@ class Router:
         return ""
 
     def _open(self, name):
-        n = name.lower().strip()
+        name = re.sub(r"\s+(?:in the browser|in chrome|on the web|online)\s*$",
+                      "", name, flags=re.IGNORECASE).strip()
+        n = name.lower()
         # 0) drives and common folders ("open c drive", "open downloads")
         m = re.match(r"^(?:the )?([a-z])(?: |-)?drive$", n)
         if m:
@@ -426,7 +432,7 @@ class Router:
         if app:
             return f"Opening {app}."
         # 3) known sites / domains
-        key = name.replace(" ", "").replace("dot", ".")
+        key = n.replace(" ", "").replace("dot", ".")
         if key in KNOWN_SITES:
             webbrowser.open(KNOWN_SITES[key])
             return f"Opening {name}."
@@ -437,18 +443,48 @@ class Router:
             os.startfile(name)  # noqa: launches by file association
             return f"Opening {name}."
         except Exception:
+            words = set(re.findall(r"\b[\w]+\b", n))
+            for site in sorted(KNOWN_SITES, key=len, reverse=True):
+                if set(site.split()) <= words:
+                    webbrowser.open(KNOWN_SITES[site])
+                    return f"Opening {site}."
+            apps = installed_apps()
+            for app in sorted(apps, key=len, reverse=True):
+                if re.search(rf"\b{re.escape(app)}\b", n):
+                    opened = open_app(app)
+                    if opened:
+                        return f"Opening {opened}."
             return f"I couldn't find {name} to open."
+
+    def _run_workflow(self, name):
+        recipe = self.workflows.get(name) or self.workflows.match(name)
+        if not recipe:
+            return f"I couldn't find workflow {name}."
+        if self.workflow_runner.running:
+            return "A workflow is already running."
+        started = self.workflow_runner.start(
+            recipe, progress=lambda i, total, description:
+            self.workflow_progress_fn(recipe["name"], i, total, description),
+            complete=self.workflow_complete_fn)
+        return (f"Running workflow {recipe['name']}." if started
+                else "A workflow is already running.")
 
     def _fallback(self, text):
         import llm
+        workflow_context = [
+            {"name": recipe["name"], "triggers": recipe.get("triggers", [])}
+            for recipe in self.workflows.list()
+        ]
         raw, _ = llm.chain(
             self.cfg["cleanup"],
             'Extract the voice-command intent. Reply with STRICT JSON only: '
-            '{"action":"open|close|switch|price|search|type|agent|answer",'
-            '"arg":"<string>"}. Use agent when the request is a multi-step '
-            'or open-ended task beyond the listed skills, including coding, '
-            'research, file manipulation, or anything requiring reasoning. '
-            'Use answer for questions or conversation.',
+            '{"action":"open|close|switch|price|search|type|workflow|agent|answer",'
+            '"arg":"<string>"}. Available workflows: '
+            + json.dumps(workflow_context) + '. Use workflow for requests '
+            'to run a named workflow or recipe. Agent is ONLY for a concrete, '
+            'delegable task with a deliverable. Capability or meta questions '
+            '(can you make workflows, are you able to X, what can you do) are '
+            'always answer, never agent. Use answer for all questions and conversation.',
             text, max_tokens=80,
             local_only=self.cfg.get("local_only", True))
         intent = self._parse_intent(raw)
@@ -456,6 +492,8 @@ class Router:
             action, arg = intent
             if action == "agent":
                 return self._confirm_agent(arg.strip())
+            if action == "workflow":
+                return self._run_workflow(arg.strip())
             handlers = {"open": self._open, "close": self._close,
                         "switch": self._switch, "price": self._price,
                         "search": self._search, "type": self._type}
@@ -515,6 +553,6 @@ class Router:
                 continue
             action, arg = value.get("action"), value.get("arg")
             if (action in {"open", "close", "switch", "price", "search",
-                           "type", "agent", "answer"} and isinstance(arg, str)):
+                           "type", "workflow", "agent", "answer"} and isinstance(arg, str)):
                 return action, arg
         return None

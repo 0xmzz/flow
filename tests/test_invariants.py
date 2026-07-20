@@ -20,7 +20,7 @@ import llm  # noqa: E402
 from agents import (AgentCancelled, AgentError, AgentRunner, dispatch,
                     select_lane)  # noqa: E402
 from store import TranscriptStore, decode_wav, wav_bytes  # noqa: E402
-from live import LiveWorker, wake_command  # noqa: E402
+from live import LiveWorker, correct_live_text, wake_command  # noqa: E402
 from commands import Router  # noqa: E402
 from hud import HudState  # noqa: E402
 from workflows import (Question, RecipeStore, WorkflowRunner,
@@ -153,6 +153,7 @@ def test_live_wake_alone_awaits_and_routes_follow_up():
     worker.start()
     worker._decode_and_act(np.zeros(512), worker._generation)
     assert worker.awaiting_command and responses == ["Yes?"] and spoken == ["Yes?"]
+    assert worker.conversation_deadline == 145.0
     assert heard == [("Flow.", "")] and awaiting[-1] == (True, 108.0)
     engine.text = "open youtube"
     worker._decode_and_act(np.zeros(512), worker._generation)
@@ -172,7 +173,8 @@ def test_live_awaiting_command_expires_and_pause_cancels():
     ignored, clock, engine = [], _FakeClock(), Engine()
     worker = LiveWorker(_FakeRecorder(), RouterStub(), None, {
         "engine": "fake", "wake_word": "flow", "silence_ms": 280,
-        "max_utterance_s": 12}, engine=engine, vad=_FakeVad(), clock=clock,
+        "max_utterance_s": 12, "conversation_s": 0},
+        engine=engine, vad=_FakeVad(), clock=clock,
         ignored_fn=ignored.append)
     worker.start()
     worker._decode_and_act(np.zeros(512), worker._generation)
@@ -238,10 +240,112 @@ def test_ignored_live_utterance_never_stores():
         def handle(self, _text): raise AssertionError("ignored audio routed")
     worker = LiveWorker(Recorder(), Router(), Store(), {
         "engine": "fake", "wake_word": "flow", "silence_ms": 280,
-        "max_utterance_s": 12}, engine=Engine(), vad=Vad())
+        "max_utterance_s": 12, "conversation_s": 0}, engine=Engine(), vad=Vad())
     worker.start()
     worker._decode_and_act(__import__("numpy").zeros(512), worker._generation)
     worker.close()
+
+
+def test_live_conversation_enters_resets_expires_and_pause_exits():
+    import numpy as np
+    class Engine:
+        provider = "CPU"
+        text = "flow hello"
+        def decode(self, _audio): return self.text, 0.01
+    class RouterStub:
+        def __init__(self): self.calls = []
+        def handle(self, text): self.calls.append(text); return "done"
+    engine, router, clock = Engine(), RouterStub(), _FakeClock()
+    conversation = []
+    worker = LiveWorker(_FakeRecorder(), router, None, {
+        "engine": "fake", "wake_word": "flow", "silence_ms": 280,
+        "max_utterance_s": 12, "conversation_s": 45},
+        engine=engine, vad=_FakeVad(), clock=clock,
+        conversation_fn=lambda active, deadline:
+        conversation.append((active, deadline)))
+    worker.start()
+    worker._decode_and_act(np.zeros(512), worker._generation)
+    assert router.calls == ["hello"] and worker.conversation_deadline == 145.0
+    clock.advance(30)
+    engine.text = "open youtube"
+    worker._decode_and_act(np.zeros(512), worker._generation)
+    assert router.calls[-1] == "open youtube"
+    assert worker.conversation_deadline == 175.0
+    clock.advance(45)
+    engine.text = "expired speech"
+    worker._decode_and_act(np.zeros(512), worker._generation)
+    assert router.calls[-1] == "open youtube"
+    engine.text = "flow back"
+    worker._decode_and_act(np.zeros(512), worker._generation)
+    worker.pause("recorder-owner")
+    assert not worker.conversation_deadline and conversation[-1] == (False, 0.0)
+    worker.resume("recorder-owner")
+    engine.text = "flow again"
+    worker._decode_and_act(np.zeros(512), worker._generation)
+    worker.stop()
+    assert not worker.conversation_deadline
+    worker.close()
+
+
+@pytest.mark.parametrize("phrase", ["stop listening", "go to sleep", "that's all"])
+def test_live_conversation_exit_phrases(phrase):
+    import numpy as np
+    class Engine:
+        provider = "CPU"
+        text = "flow hello"
+        def decode(self, _audio): return self.text, 0.01
+    class RouterStub:
+        def handle(self, _text): return "done"
+    engine, clock, spoken = Engine(), _FakeClock(), []
+    worker = LiveWorker(_FakeRecorder(), RouterStub(), None, {
+        "engine": "fake", "wake_word": "flow", "silence_ms": 280,
+        "max_utterance_s": 12, "conversation_s": 45},
+        engine=engine, vad=_FakeVad(), clock=clock, speak_fn=spoken.append)
+    worker.start()
+    worker._decode_and_act(np.zeros(512), worker._generation)
+    engine.text = phrase
+    worker._decode_and_act(np.zeros(512), worker._generation)
+    assert spoken[-1] == "Going quiet." and not worker.conversation_deadline
+    worker.close()
+
+
+def test_live_conversation_swallows_filler_but_question_gets_it():
+    import numpy as np
+    class Engine:
+        provider = "CPU"
+        text = "flow start"
+        def decode(self, _audio): return self.text, 0.01
+    answers = []
+    class RouterStub:
+        def __init__(self): self.calls = []
+        def handle(self, text):
+            self.calls.append(text)
+            if text == "ask":
+                return Question("Ready?", lambda answer:
+                                answers.append(answer) or "Thanks.")
+            return "done"
+    engine, router = Engine(), RouterStub()
+    worker = LiveWorker(_FakeRecorder(), router, None, {
+        "engine": "fake", "wake_word": "flow", "silence_ms": 280,
+        "max_utterance_s": 12, "conversation_s": 45},
+        engine=engine, vad=_FakeVad())
+    worker.start()
+    worker._decode_and_act(np.zeros(512), worker._generation)
+    engine.text = "okay"
+    worker._decode_and_act(np.zeros(512), worker._generation)
+    assert router.calls == ["start"]
+    engine.text = "ask"
+    worker._decode_and_act(np.zeros(512), worker._generation)
+    engine.text = "yes"
+    worker._decode_and_act(np.zeros(512), worker._generation)
+    assert answers == ["yes"]
+    worker.close()
+
+
+def test_live_token_correction_uses_vocab_and_initial_wake_only():
+    assert correct_live_text("workful", "flow", ["workflows"]) == "workflows"
+    assert correct_live_text("Floats open YouTube", "flow") == "Flow open YouTube"
+    assert correct_live_text("to youtube", "flow", ["go"]) == "to youtube"
 
 
 def test_live_module_has_no_network_client_import():
@@ -287,6 +391,15 @@ def test_hud_line_buffer_trims_oldest_and_awaiting_expires():
     assert not hud.question
 
 
+def test_hud_conversation_countdown_yields_to_question():
+    hud = HudState()
+    hud.set_enabled(True, now=1.0)
+    hud.set_conversation(True, deadline=50.0, now=5.0)
+    assert hud.status_text(5.1) == "Conversation  45s"
+    hud.set_status("Which one?", question=True, deadline=20.0, now=6.0)
+    assert hud.status_text(12.1) == "Which one?  8s"
+
+
 # ---------- command router (no OS actions, model, or network) ----------
 
 def _router():
@@ -321,6 +434,37 @@ def test_type_skill_pastes_and_restores(monkeypatch):
     monkeypatch.setattr(commands.time, "sleep", lambda _s: None)
     assert _router().handle("write hello there") == ""
     assert copied == ["hello there", "old clip"] and keys == ["ctrl+v"]
+
+
+def test_open_strips_venue_and_rescues_site_in_phrase(monkeypatch):
+    import commands
+    router = _router()
+    seen, opened = [], []
+    monkeypatch.setattr(commands, "switch_to", lambda _name: None)
+    monkeypatch.setattr(commands, "open_app", lambda name:
+                        seen.append(name) or ("YouTube" if name == "youtube" else None))
+    assert router._open("YouTube in the browser") == "Opening YouTube."
+    assert seen == ["YouTube"]
+    monkeypatch.setattr(commands, "open_app", lambda _name: None)
+    monkeypatch.setattr(commands, "installed_apps", lambda: {})
+    monkeypatch.setattr(commands.os, "startfile", lambda _name:
+                        (_ for _ in ()).throw(OSError()))
+    monkeypatch.setattr(commands.webbrowser, "open", opened.append)
+    assert router._open("to YouTube in the browser") == "Opening youtube."
+    assert opened == [commands.KNOWN_SITES["youtube"]]
+
+
+def test_compound_open_splits_only_open_command(monkeypatch):
+    router, seen = _router(), []
+    monkeypatch.setattr(router, "_open", lambda name:
+                        seen.append(name) or f"opened {name}")
+    assert router.handle("open chrome and open youtube") == (
+        "opened chrome opened youtube")
+    assert seen == ["chrome", "youtube"]
+    seen.clear()
+    assert router.handle("open chrome and youtube") == (
+        "opened chrome opened youtube")
+    assert seen == ["chrome", "youtube"]
 
 
 def test_intent_json_dispatch_and_answer_fallback(monkeypatch):

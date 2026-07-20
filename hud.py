@@ -20,6 +20,7 @@ class HudState:
         self.status = ""
         self.question = False
         self.awaiting_deadline = 0.0
+        self.conversation_deadline = 0.0
         self.last_event = 0.0
 
     def set_enabled(self, enabled, now=None):
@@ -30,6 +31,7 @@ class HudState:
         if not self.enabled:
             self.question = False
             self.awaiting_deadline = 0.0
+            self.conversation_deadline = 0.0
 
     def _touch(self, now):
         if not self.enabled:
@@ -76,11 +78,19 @@ class HudState:
         self.question = bool(active)
         self.awaiting_deadline = float(deadline or 0.0) if active else 0.0
 
+    def set_conversation(self, active, deadline=0.0, now=None):
+        now = time.monotonic() if now is None else now
+        if not self._touch(now):
+            return
+        self.conversation_deadline = float(deadline or 0.0) if active else 0.0
+
     def tick(self, now=None):
         now = time.monotonic() if now is None else now
         if self.question and self.awaiting_deadline and now > self.awaiting_deadline:
             self.question = False
             self.awaiting_deadline = 0.0
+        if self.conversation_deadline and now >= self.conversation_deadline:
+            self.conversation_deadline = 0.0
         if self.enabled and self.expanded and now - self.last_event >= self.IDLE_S:
             self.expanded = False
         return self.expanded
@@ -90,6 +100,11 @@ class HudState:
         if self.question and self.awaiting_deadline:
             remaining = max(0, int(self.awaiting_deadline - now + 0.999))
             return f"{self.status}  {remaining}s" if remaining else self.status
+        if self.conversation_deadline:
+            remaining = max(0, int(self.conversation_deadline - now + 0.999))
+            conversation = f"Conversation  {remaining}s" if remaining else "Conversation"
+            return (f"{self.status}  ·  {conversation}"
+                    if self.status else conversation)
         return self.status
 
 
@@ -167,6 +182,8 @@ class HudView:
                 deadline=self.state.awaiting_deadline)
         elif kind == "awaiting":
             self.state.set_awaiting(event[1], event[2])
+        elif kind == "conversation":
+            self.state.set_conversation(event[1], event[2])
         elif kind == "workflow":
             header = f"workflow: {event[1]}"
             if header not in self.state.thinking:
