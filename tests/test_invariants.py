@@ -481,6 +481,79 @@ def test_intent_json_dispatch_and_answer_fallback(monkeypatch):
     assert calls == [80, 80, 200]
 
 
+def test_live_memory_is_bounded_expires_resets_and_excludes_questions(monkeypatch):
+    clock = _FakeClock()
+    router = Router({"cleanup": {}, "local_only": True}, clock=clock)
+    monkeypatch.setattr(router, "handle", lambda text: f"reply {text}")
+    for index in range(7):
+        router.handle_live(str(index))
+    assert [item[1] for item in router._conversation] == [str(i) for i in range(1, 7)]
+    router.handle("stateless")
+    assert len(router._conversation) == 6
+    monkeypatch.setattr(router, "handle", lambda _text: Question("Which?", object()))
+    router.handle_live("question")
+    assert len(router._conversation) == 6
+    clock.advance(120.1)
+    assert router._conversation_text("now") == "User: now"
+    monkeypatch.setattr(router, "handle", lambda _text: "again")
+    router.handle_live("new")
+    router.reset_conversation()
+    assert not router._conversation
+
+
+def test_live_fallback_context_reaches_intent_and_chat_and_affirmation_dispatches(monkeypatch):
+    seen = []
+
+    def fake_chain(_cfg, _system, text, **kwargs):
+        seen.append((kwargs["max_tokens"], text))
+        if kwargs["max_tokens"] == 200:
+            return "Say: open chrome", "fake"
+        if "User: yes do it" in text:
+            return '{"action":"open","arg":"chrome"}', "fake"
+        return '{"action":"answer","arg":""}', "fake"
+
+    monkeypatch.setattr(llm, "chain", fake_chain)
+    router = _router()
+    router.remember_exchange("earlier", "Earlier reply")
+    opened = []
+    monkeypatch.setattr(router, "_open", lambda arg: opened.append(arg) or f"Opening {arg}.")
+    assert router.handle_live("could you put a browser on screen") == "Say: open chrome"
+    assert router.handle_live("yes do it") == "Opening chrome."
+    assert opened == ["chrome"]
+    affirmation = [text for tokens, text in seen
+                   if tokens == 80 and "User: yes do it" in text][0]
+    assert "User: could you put a browser on screen\nYou said: Say: open chrome" in affirmation
+    first_chat = [text for tokens, text in seen if tokens == 200][0]
+    assert "User: earlier\nYou said: Earlier reply" in first_chat
+    assert first_chat.endswith("User: could you put a browser on screen")
+    assert all(len(text) <= 800 for _tokens, text in seen)
+
+
+@pytest.mark.parametrize(("spoken", "chord"), [
+    ("new tab", "ctrl+t"), ("open a new tab", "ctrl+t"),
+    ("reopen tab", "ctrl+shift+t"), ("next tab", "ctrl+tab"),
+    ("previous tab", "ctrl+shift+tab"), ("refresh", "f5"),
+    ("reload", "f5"), ("go back", "alt+left"),
+    ("go forward", "alt+right"),
+])
+def test_browser_key_skills_are_blind_and_silent(monkeypatch, spoken, chord):
+    import keyboard
+    sent = []
+    monkeypatch.setattr(keyboard, "send", sent.append)
+    assert _router().handle(spoken) == ""
+    assert sent == [chord]
+
+
+def test_navigate_to_google_reaches_site_opening(monkeypatch):
+    import commands
+    opened = []
+    monkeypatch.setattr(commands, "switch_to", lambda _name: None)
+    monkeypatch.setattr(commands, "open_app", lambda _name: None)
+    monkeypatch.setattr(commands.webbrowser, "open", opened.append)
+    assert _router().handle("navigate to google") == "Opening google."
+    assert opened == [commands.KNOWN_SITES["google"]]
+
+
 # ---------- Phase B workflows (all OS effects injected) ----------
 
 def test_workflow_store_round_trip_and_fuzzy_trigger():

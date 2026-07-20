@@ -12,9 +12,11 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 import urllib.parse
 import webbrowser
+from collections import deque
 
 from agents import AgentError, AgentRunner, select_lane
 from workflows import Question, RecipeStore, WorkflowRunner, creation_dialog
@@ -147,7 +149,7 @@ KNOWN_SITES = {
     "google": "https://google.com",
 }
 
-ROUTER_VERBS = ("open", "launch", "start", "close", "switch", "search", "google",
+ROUTER_VERBS = ("open", "reopen", "launch", "start", "close", "switch", "navigate", "search", "google",
                 "price", "type", "write", "help", "run")
 _TAIL_RE = re.compile(
     r"\s+(?:right\s+now|at\s+the\s+moment|real\s+quick|for\s+me|currently|"
@@ -164,7 +166,7 @@ def _strip_tails(text):
 
 class Router:
     def __init__(self, cfg, *, workflow_store=None, workflow_runner=None,
-                 intent_parser=None, agent_runner=None):
+                 intent_parser=None, agent_runner=None, clock=None):
         self.cfg = cfg
         self.workflows = workflow_store or RecipeStore()
         self.workflow_progress_fn = lambda _name, _i, _n, _text: None
@@ -174,8 +176,53 @@ class Router:
         self.agent_progress_fn = lambda _lane, _tail: None
         self.agent_complete_fn = lambda _result: None
         self.agent_runner = agent_runner or AgentRunner()
+        self.clock = clock or time.monotonic
+        self._conversation = deque(maxlen=6)
+        self._conversation_lock = threading.Lock()
+        self._conversation_epoch = 0
         self.workflow_runner = workflow_runner or WorkflowRunner(
             router=self, ask_fn=self._ask_workflow)
+
+    def reset_conversation(self):
+        with self._conversation_lock:
+            self._conversation.clear()
+            self._conversation_epoch += 1
+
+    def _prune_conversation_locked(self, now):
+        while self._conversation and now - self._conversation[0][0] > 120.0:
+            self._conversation.popleft()
+
+    def remember_exchange(self, user_text, response_text, epoch=None):
+        if not isinstance(response_text, str):
+            return
+        now = self.clock()
+        with self._conversation_lock:
+            if epoch is not None and epoch != self._conversation_epoch:
+                return
+            self._prune_conversation_locked(now)
+            self._conversation.append((now, str(user_text), response_text))
+
+    def _conversation_text(self, text, limit=800):
+        now = self.clock()
+        with self._conversation_lock:
+            self._prune_conversation_locked(now)
+            exchanges = list(self._conversation)
+        current = "User: " + str(text)
+        if len(current) >= limit:
+            return current[:limit]
+        blocks = [f"User: {user}\nYou said: {response}"
+                  for _timestamp, user, response in exchanges]
+        while blocks and len("\n".join(blocks + [current])) > limit:
+            blocks.pop(0)
+        combined = "\n".join(blocks + [current])
+        return combined[-limit:] if len(combined) > limit else combined
+
+    def handle_live(self, text):
+        with self._conversation_lock:
+            epoch = self._conversation_epoch
+        response = self.handle(text)
+        self.remember_exchange(text, response, epoch=epoch)
+        return response
 
     def configure_agents(self, *, progress=None, complete=None):
         if progress is not None:
@@ -286,8 +333,18 @@ class Router:
                     "Search the web: say search for something. Anything else, "
                     "I answer with the local model.")
 
+        key_commands = {
+            "new tab": "ctrl+t", "open a new tab": "ctrl+t",
+            "open new tab": "ctrl+t", "reopen tab": "ctrl+shift+t",
+            "next tab": "ctrl+tab", "previous tab": "ctrl+shift+tab",
+            "refresh": "f5", "reload": "f5", "go back": "alt+left",
+            "go forward": "alt+right",
+        }
+        if t in key_commands:
+            return self._keys(key_commands[t])
+
         # --- switch to an open window ---
-        m = re.search(r"^(?:switch to|go to|focus|bring up) (.+)", t)
+        m = re.search(r"^(?:switch to|go to|navigate to|focus|bring up) (.+)", t)
         if m:
             return self._switch(m.group(1).strip())
 
@@ -323,7 +380,7 @@ class Router:
         raw = str(text or "").strip()
         normalized = raw.rstrip(".!?")
         patterns = (
-            ("switch", r"^(?:switch to|go to|focus|bring up) (.+)"),
+            ("switch", r"^(?:switch to|go to|navigate to|focus|bring up) (.+)"),
             ("close", r"^close (.+)"),
             ("open", r"^(?:open|launch|start) (.+)"),
             ("search", r"^(?:search|google|look up)(?: for)? (.+)"),
@@ -408,6 +465,12 @@ class Router:
                 pyperclip.copy(old)
         return ""
 
+    @staticmethod
+    def _keys(keys):
+        import keyboard
+        keyboard.send(keys)
+        return ""
+
     def _open(self, name):
         name = re.sub(r"\s+(?:in the browser|in chrome|on the web|online)\s*$",
                       "", name, flags=re.IGNORECASE).strip()
@@ -471,6 +534,7 @@ class Router:
 
     def _fallback(self, text):
         import llm
+        contextual_text = self._conversation_text(text)
         workflow_context = [
             {"name": recipe["name"], "triggers": recipe.get("triggers", [])}
             for recipe in self.workflows.list()
@@ -478,14 +542,17 @@ class Router:
         raw, _ = llm.chain(
             self.cfg["cleanup"],
             'Extract the voice-command intent. Reply with STRICT JSON only: '
-            '{"action":"open|close|switch|price|search|type|workflow|agent|answer",'
+            '{"action":"open|close|switch|price|search|type|keys|workflow|agent|answer",'
             '"arg":"<string>"}. Available workflows: '
             + json.dumps(workflow_context) + '. Use workflow for requests '
             'to run a named workflow or recipe. Agent is ONLY for a concrete, '
             'delegable task with a deliverable. Capability or meta questions '
             '(can you make workflows, are you able to X, what can you do) are '
-            'always answer, never agent. Use answer for all questions and conversation.',
-            text, max_tokens=80,
+            'always answer, never agent. Use answer for all questions and conversation. '
+            'Keys arg must be one of: new tab, reopen tab, next tab, previous tab, '
+            'refresh, go back, go forward. If the current utterance is an affirmation '
+            'after You said a suggested command, map it to that command action.',
+            contextual_text, max_tokens=80,
             local_only=self.cfg.get("local_only", True))
         intent = self._parse_intent(raw)
         if intent and intent[0] != "answer" and intent[1].strip():
@@ -496,18 +563,32 @@ class Router:
                 return self._run_workflow(arg.strip())
             handlers = {"open": self._open, "close": self._close,
                         "switch": self._switch, "price": self._price,
-                        "search": self._search, "type": self._type}
+                        "search": self._search, "type": self._type,
+                        "keys": self._named_keys}
             return handlers[action](arg.strip())
         out, _ = llm.chain(
             self.cfg["cleanup"],
-            "You are a terse voice assistant. Answer in one or two spoken "
-            "sentences, no markdown. You control this Windows PC by voice. "
-            "If asked for an action you cannot perform, say what you CAN do "
-            "(open/close/switch apps, crypto prices, web search, type text) â€” "
-            "never claim you cannot browse the internet.",
-            text, max_tokens=200,
+            "You are a terse voice assistant. Answer in one or two spoken sentences, "
+            "no markdown. You control this PC ONLY through these listed skills: "
+            "open, close, switch, crypto price, web search, type text, browser keys, "
+            "workflows, and agent dispatch. Never offer an action outside that list. "
+            "Never say you can do an action without doing it. The intent lane already "
+            "handles actions; this lane answers questions and gives brief acknowledgements. "
+            "If the user seems to want an action, suggest the exact spoken command, for "
+            "example: Say: open chrome.",
+            contextual_text, max_tokens=200,
             local_only=self.cfg.get("local_only", True))
         return out or "I couldn't reach the assistant."
+
+    def _named_keys(self, operation):
+        mapping = {
+            "new tab": "ctrl+t", "reopen tab": "ctrl+shift+t",
+            "next tab": "ctrl+tab", "previous tab": "ctrl+shift+tab",
+            "refresh": "f5", "reload": "f5", "go back": "alt+left",
+            "go forward": "alt+right",
+        }
+        key = operation.lower().strip()
+        return self._keys(mapping[key]) if key in mapping else ""
 
     def _confirm_agent(self, task, lane=None):
         if self.agent_runner.running:
@@ -553,6 +634,6 @@ class Router:
                 continue
             action, arg = value.get("action"), value.get("arg")
             if (action in {"open", "close", "switch", "price", "search",
-                           "type", "workflow", "agent", "answer"} and isinstance(arg, str)):
+                           "type", "keys", "workflow", "agent", "answer"} and isinstance(arg, str)):
                 return action, arg
         return None

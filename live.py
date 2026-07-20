@@ -236,6 +236,7 @@ class LiveWorker:
             self._cancel_awaiting_locked()
             self._clear_conversation_locked()
             self._invalidate_locked()
+        self._reset_router_conversation()
         self._drain()
         self.state_fn()
         print("[live] listening")
@@ -248,6 +249,7 @@ class LiveWorker:
             self._cancel_awaiting_locked()
             self._clear_conversation_locked()
             self._invalidate_locked()
+        self._reset_router_conversation()
         self._drain()
         self.awaiting_fn(False, 0.0)
         self.conversation_fn(False, 0.0)
@@ -262,6 +264,7 @@ class LiveWorker:
                 self._clear_conversation_locked()
             self._invalidate_locked()
         if reason != "live-sapi":
+            self._reset_router_conversation()
             runner = getattr(self.router, "workflow_runner", None)
             if runner and runner.running:
                 runner.cancel()
@@ -305,10 +308,17 @@ class LiveWorker:
     def _clear_conversation_locked(self):
         self.conversation_deadline = 0.0
 
+    def _reset_router_conversation(self):
+        reset = getattr(self.router, "reset_conversation", None)
+        if reset:
+            reset()
+
     def _conversation_active_locked(self, now):
+        expired = False
         if self.conversation_deadline and now >= self.conversation_deadline:
             self._clear_conversation_locked()
-        return bool(self.conversation_deadline)
+            expired = True
+        return bool(self.conversation_deadline), expired
 
     def _touch_conversation(self):
         seconds = float(self.cfg.get("conversation_s", 45.0) or 0.0)
@@ -485,7 +495,7 @@ class LiveWorker:
         wake = wake_command(text, self.cfg.get("wake_word"))
         with self._lock:
             now = self.clock()
-            conversation = self._conversation_active_locked(now)
+            conversation, conversation_expired = self._conversation_active_locked(now)
             question = (self.awaiting_input
                         if now <= self.awaiting_input_deadline else None)
             legacy_follow_up = (self.awaiting_command and question is None
@@ -497,6 +507,8 @@ class LiveWorker:
             bare_cancel = cancel_word and runner and runner.running
             if not question and not legacy_follow_up and self.awaiting_command:
                 self._cancel_awaiting_locked()
+        if conversation_expired:
+            self._reset_router_conversation()
         if conversation:
             self._touch_conversation()
         if wake is not None:
@@ -507,6 +519,7 @@ class LiveWorker:
             with self._lock:
                 self._cancel_awaiting_locked()
                 self._clear_conversation_locked()
+            self._reset_router_conversation()
             self.awaiting_fn(False, 0.0)
             self.conversation_fn(False, 0.0)
             self.response_fn("Going quiet.")
@@ -549,6 +562,9 @@ class LiveWorker:
                 result = question.handler(answer)
             except Exception as exc:
                 result = f"That dialog failed: {exc}"
+            remember = getattr(self.router, "remember_exchange", None)
+            if remember:
+                remember(answer, result)
             self._present_result(result)
             return
         elif legacy_follow_up:
@@ -587,7 +603,8 @@ class LiveWorker:
             return
         if not self._valid(generation):
             return
-        response = self.router.handle(command)
+        handle = getattr(self.router, "handle_live", self.router.handle)
+        response = handle(command)
         if not self._valid(generation):
             return
         if self.store:
