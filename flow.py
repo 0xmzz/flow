@@ -104,6 +104,7 @@ DEFAULTS = {
     "live": {"enabled": True, "wake_word": "flow", "conversation_s": 45.0,
              "silence_ms": 280,
              "max_utterance_s": 12, "engine": "nemo-parakeet-tdt-0.6b-v3"},
+    "tts": {"engine": "kokoro", "voice": "af_heart", "speed": 1.05},
     "model": "large-v3",           # full v3 handles whispered/quiet speech better than turbo
     "device": "cuda",
     "compute_type": "float16",
@@ -1000,6 +1001,8 @@ class Flow:
         self.store = TranscriptStore(
             APP_DIR / h["dir"], archive_audio=h["archive_audio"]
         ) if h["enabled"] else None
+        import speech
+        speech.configure(self.cfg.get("tts"))
         print(f"Loading {self.cfg['model']} on {self.cfg['device']}...")
         t0 = time.time()
         from faster_whisper import WhisperModel
@@ -1205,6 +1208,8 @@ class Flow:
             self.overlay.set(("hud", "agent_result", full))
 
     def on_press(self, mode="dictate"):
+        import speech
+        speech.stop()
         with self._session_lock:
             if self.recording or self.busy.locked():
                 return
@@ -1555,6 +1560,8 @@ class Flow:
                     if not self.live_worker:
                         print("[live] unavailable")
                     elif self.live_worker.enabled:
+                        import speech
+                        speech.stop()
                         self.live_worker.stop()
                     else:
                         self.live_worker.start()

@@ -24,16 +24,9 @@ from workflows import (Question, RecipeStore, WorkflowRunner, creation_dialog,
 
 
 def speak(text):
-    """Speak text via Windows SAPI (hands-free result, no screen needed)."""
-    if not text:
-        return
-    try:
-        import comtypes
-        import comtypes.client
-        comtypes.CoInitialize()
-        comtypes.client.CreateObject("SAPI.SpVoice").Speak(text)
-    except Exception as e:
-        print(f"[speak] {e}")
+    """Speak text synchronously through the configured local TTS lane."""
+    from speech import speak as speech_speak
+    return speech_speak(text)
 
 
 def _fmt_price(p):
