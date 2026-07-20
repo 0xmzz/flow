@@ -258,7 +258,12 @@ class Router:
         self._conversation_lock = threading.Lock()
         self._conversation_epoch = 0
         self.workflow_runner = workflow_runner or WorkflowRunner(
-            router=self, ask_fn=self._ask_workflow)
+            router=self, ask_fn=self._ask_workflow, recipe_store=self.workflows,
+            agent_runner=self.agent_runner)
+        if getattr(self.workflow_runner, "recipe_store", None) is None:
+            self.workflow_runner.recipe_store = self.workflows
+        if getattr(self.workflow_runner, "agent_runner", None) is None:
+            self.workflow_runner.agent_runner = self.agent_runner
 
     def reset_conversation(self):
         with self._conversation_lock:
@@ -352,8 +357,9 @@ class Router:
         # Workflow management is explicit so recipe triggers cannot shadow it.
         if t == "list workflows":
             names = self.workflows.names()
-            return ("Workflows: " + ", ".join(names) + "." if names
-                    else "You don't have any workflows yet.")
+            return (("Workflows: " + ", ".join(names) +
+                     ". Workflows can run other workflows.") if names
+                    else "You don't have any workflows yet. Workflows can run other workflows.")
         m = re.search(r"^delete workflow (.+)$", t)
         if m:
             name = m.group(1).strip()
@@ -372,7 +378,15 @@ class Router:
         m = re.search(r"^create a workflow called (.+)$", t)
         if m:
             return creation_dialog(
-                m.group(1).strip(), self.workflows, self.parse_action)
+                m.group(1).strip(), self.workflows, self.parse_action,
+                agent_runner=self.agent_runner)
+
+        if re.search(r"^run .+\bthen\s+(?:ask\s+(?:codex|claude)\s+to|send\s+to\s+(?:codex|claude))\b", t):
+            return "I can't split that into commands. Teach it as a workflow instead."
+
+        explicit_workflow = re.match(r"^run\s+(?:my\s+|the\s+)?(.+?)\s+workflow$", t)
+        if explicit_workflow:
+            return self._run_workflow(explicit_workflow.group(1).strip())
 
         desktop = _parse_desktop(t)
         if desktop:
@@ -468,6 +482,12 @@ class Router:
             return self.intent_parser(text)
         raw = str(text or "").strip()
         normalized = raw.rstrip(".!?")
+        explicit_agent = re.match(
+            r"^(?:ask\s+(codex|claude)\s+to|send\s+to\s+(codex|claude))\s+(.+)$",
+            normalized, re.IGNORECASE)
+        if explicit_agent:
+            return {"do": "agent", "arg": explicit_agent.group(3).strip(),
+                    "lane": (explicit_agent.group(1) or explicit_agent.group(2)).lower()}
         placement = _parse_place(normalized)
         if placement:
             return placement
@@ -671,7 +691,9 @@ class Router:
             '{"action":"open|close|switch|price|search|type|keys|workflow|agent|answer",'
             '"arg":"<string>"}. Available workflows: '
             + json.dumps(workflow_context) + '. Use workflow for requests '
-            'to run a named workflow or recipe. Agent is ONLY for a concrete, '
+            'to run a named workflow or recipe. Never split a request that runs '
+            'a workflow and then asks an agent; suggest teaching one workflow. '
+            'Agent is ONLY for a concrete, '
             'delegable task with a deliverable. Capability or meta questions '
             '(can you make workflows, are you able to X, what can you do) are '
             'always answer, never agent. Use answer for all questions and conversation. '
@@ -701,7 +723,8 @@ class Router:
                 if heard in {"yes", "yeah", "yep", "sure", "okay", "ok"}:
                     return creation_dialog(
                         name, self.workflows, self.parse_action,
-                        triggers=[trigger], taught_confirmation=True)
+                        triggers=[trigger], taught_confirmation=True,
+                        agent_runner=self.agent_runner)
                 if heard in {"no", "nope", "cancel", "never mind", "nevermind"}:
                     return self._chat_answer(contextual_text)
                 return Question("Please say yes or no.", teach,

@@ -24,7 +24,7 @@ from live import LiveWorker, correct_live_text, wake_command  # noqa: E402
 from commands import Router  # noqa: E402
 from hud import HudState  # noqa: E402
 from workflows import (Question, RecipeStore, WorkflowRunner,
-                       creation_dialog)  # noqa: E402
+                       creation_dialog, validate_recipe)  # noqa: E402
 
 
 # ---------- llm.chain: nothing leaves the box ----------
@@ -631,6 +631,151 @@ def test_workflow_voice_creation_dialog_with_fake_intents():
             {"do": "type", "arg": "Hello"}]
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+
+def test_workflow_composition_progress_cycles_and_depth():
+    root = ROOT / "data" / "test-tmp" / "composition"
+    shutil.rmtree(root, ignore_errors=True)
+    store = RecipeStore(root)
+    calls, progress = [], []
+    recipes = [
+        {"name": "third", "triggers": ["third"],
+         "steps": [{"do": "open", "arg": "three"}]},
+        {"name": "second", "triggers": ["second"],
+         "steps": [{"do": "open", "arg": "two"}, {"do": "run", "arg": "third"}]},
+        {"name": "first", "triggers": ["first"],
+         "steps": [{"do": "open", "arg": "one"}, {"do": "run", "arg": "second"}]},
+    ]
+    for recipe in recipes:
+        store.save(recipe)
+    runner = WorkflowRunner(recipe_store=store,
+                            primitives=lambda action, arg: calls.append((action, arg)))
+    done = []
+    runner.start(recipes[-1], progress=lambda *item: progress.append(item),
+                 complete=done.append)
+    runner.thread.join(2)
+    assert calls == [("open", "one"), ("open", "two"), ("open", "three")]
+    assert [item[2] for item in progress] == [
+        "open one", "second > open two", "second > third > open three"]
+    assert done == ["Workflow first complete."]
+
+    store.save({"name": "self", "triggers": ["self"],
+                "steps": [{"do": "run", "arg": "self"}]})
+    done = []
+    runner.start(store.get("self"), complete=done.append)
+    runner.thread.join(2)
+    assert "recursive workflow: self > self" in done[0]
+
+    store.save({"name": "cycle a", "triggers": ["cycle a"],
+                "steps": [{"do": "run", "arg": "cycle b"}]})
+    store.save({"name": "cycle b", "triggers": ["cycle b"],
+                "steps": [{"do": "run", "arg": "cycle a"}]})
+    done = []
+    runner.start(store.get("cycle a"), complete=done.append)
+    runner.thread.join(2)
+    assert "recursive workflow: cycle a > cycle b > cycle a" in done[0]
+
+    store.save({"name": "fourth", "triggers": ["fourth"],
+                "steps": [{"do": "open", "arg": "four"}]})
+    store.save({"name": "third deep", "triggers": ["third deep"],
+                "steps": [{"do": "run", "arg": "fourth"}]})
+    store.save({"name": "second deep", "triggers": ["second deep"],
+                "steps": [{"do": "run", "arg": "third deep"}]})
+    deep = {"name": "first deep", "triggers": ["first deep"],
+            "steps": [{"do": "run", "arg": "second deep"}]}
+    done = []
+    runner.start(deep, complete=done.append)
+    runner.thread.join(2)
+    assert "maximum depth 3" in done[0]
+    shutil.rmtree(root, ignore_errors=True)
+
+
+def test_workflow_if_window_schema_and_branches():
+    calls = []
+    recipe = {"name": "window", "triggers": ["window"], "steps": [
+        {"do": "if_window", "arg": "Visual Studio Code",
+         "then": [{"do": "say", "arg": "yes"}],
+         "else": [{"do": "say", "arg": "no"}]}]}
+    assert validate_recipe(recipe)
+    assert not validate_recipe({**recipe, "steps": [
+        {"do": "if_window", "arg": "code", "else": []}]})
+    runner = WorkflowRunner(title_supplier=lambda: ["notes - visual studio code"],
+                            speak_fn=calls.append)
+    runner.start(recipe)
+    runner.thread.join(2)
+    assert calls == ["yes"]
+    calls.clear()
+    runner = WorkflowRunner(title_supplier=lambda: ["calculator"],
+                            speak_fn=calls.append)
+    runner.start(recipe)
+    runner.thread.join(2)
+    assert calls == ["no"]
+
+
+def test_workflow_agent_success_failure_cancel_and_source():
+    root = ROOT / "data" / "test-tmp" / "workflow-agent"
+    shutil.rmtree(root, ignore_errors=True)
+    lane = _FakeLane("codex", result="done")
+    agent = AgentRunner([lane], log_path=root / "runs.jsonl")
+    recipe = {"name": "agents", "triggers": ["agents"],
+              "steps": [{"do": "agent", "arg": "do work", "lane": "codex"}]}
+    progress, done = [], []
+    runner = WorkflowRunner(agent_runner=agent)
+    runner.start(recipe, progress=lambda *x: progress.append(x), complete=done.append)
+    runner.thread.join(2)
+    assert done == ["Workflow agents complete."] and lane.calls == ["do work"]
+    record = json.loads((root / "runs.jsonl").read_text().splitlines()[0])
+    assert record["source"] == "workflow:agents"
+
+    def fail(_task, _progress, _cancel):
+        raise AgentError("broken")
+    agent = AgentRunner([_FakeLane("codex", run_fn=fail)], log_path=root / "fail.jsonl")
+    runner = WorkflowRunner(agent_runner=agent)
+    done = []
+    runner.start(recipe, complete=done.append)
+    runner.thread.join(2)
+    assert "failed: agent error: broken" in done[0]
+
+    entered = threading.Event()
+    def block(_task, _progress, cancel):
+        entered.set()
+        cancel.wait(1)
+        raise AgentCancelled("cancelled")
+    agent = AgentRunner([_FakeLane("codex", run_fn=block)], log_path=root / "cancel.jsonl")
+    runner = WorkflowRunner(agent_runner=agent)
+    done = []
+    runner.start(recipe, complete=done.append)
+    assert entered.wait(1)
+    runner.cancel()
+    runner.thread.join(2)
+    assert done == ["Workflow agents cancelled."]
+    shutil.rmtree(root, ignore_errors=True)
+
+
+def test_workflow_creation_run_if_window_and_agent_confirmation():
+    root = ROOT / "data" / "test-tmp" / "creation-new"
+    shutil.rmtree(root, ignore_errors=True)
+    store = RecipeStore(root)
+    store.save({"name": "Morning Setup", "triggers": ["morning setup"],
+                "steps": [{"do": "open", "arg": "chrome"}]})
+    lane = _FakeLane("codex")
+    agent = AgentRunner([lane], log_path=root / "runs.jsonl")
+    parser = lambda text: ({"do": "agent", "arg": "fix it", "lane": "codex"}
+                           if text == "agent" else ("open", "notes"))
+    question = creation_dialog("composed", store, parser, agent_runner=agent)
+    question = question.handler("run the morning setup workflow")
+    question = question.handler("if notes is open, open notes")
+    question = question.handler("agent")
+    assert question.text == "Step sends a task to codex. Keep it?"
+    question = question.handler("yes")
+    response = question.handler("done")
+    assert response == "Saved workflow composed with 3 steps."
+    assert store.get("composed")["steps"] == [
+        {"do": "run", "arg": "Morning Setup"},
+        {"do": "if_window", "arg": "notes", "then": [{"do": "open", "arg": "notes"}]},
+        {"do": "agent", "arg": "fix it", "lane": "codex"}]
+    assert lane.calls == []
+    shutil.rmtree(root, ignore_errors=True)
 
 
 # ---------- Phase C agent lanes (all lanes are fakes) ----------

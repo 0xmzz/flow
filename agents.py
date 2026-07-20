@@ -162,7 +162,7 @@ class AgentRunner:
     def cancel(self):
         self.cancel_event.set()
 
-    def start(self, task, lane=None, progress=None, complete=None):
+    def start(self, task, lane=None, progress=None, complete=None, source=None):
         with self._lock:
             if self.running:
                 return False
@@ -170,12 +170,12 @@ class AgentRunner:
             self.cancel_event = threading.Event()
             self.thread = threading.Thread(
                 target=self._run,
-                args=(selected, str(task).strip(), progress, complete),
+                args=(selected, str(task).strip(), progress, complete, source),
                 name="flow-agent", daemon=True)
             self.thread.start()
         return True
 
-    def _run(self, lane, task, progress, complete):
+    def _run(self, lane, task, progress, complete, source):
         started = self.clock()
         outcome, result = "ok", ""
         last_progress = [float("-inf")]
@@ -193,16 +193,18 @@ class AgentRunner:
         except Exception as exc:
             outcome, result = "error", str(exc)
         duration = max(0.0, self.clock() - started)
-        self._log(lane.name, task, outcome, duration, result)
+        self._log(lane.name, task, outcome, duration, result, source)
         if complete:
             complete({"lane": lane.name, "outcome": outcome, "text": result,
                       "duration_s": duration})
 
-    def _log(self, lane, task, outcome, duration, result):
+    def _log(self, lane, task, outcome, duration, result, source=None):
         record = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "lane": lane,
                   "task": task, "outcome": outcome,
                   "duration_s": round(duration, 3),
                   "result_tail": str(result or "")[-400:]}
+        if source is not None:
+            record["source"] = str(source)
         try:
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
             with self.log_path.open("a", encoding="utf-8") as handle:
