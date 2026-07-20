@@ -914,6 +914,10 @@ class Flow:
                     ignored_fn=self._show_live_ignored,
                     heard_fn=self._show_live_heard,
                     awaiting_fn=self._show_live_awaiting)
+                self.router.configure_workflows(
+                    progress=self._show_workflow_progress,
+                    complete=self.live_worker.deliver_async,
+                    ask=self.live_worker.ask_workflow)
             except Exception as e:
                 print(f"[live] disabled: model/VAD startup failed ({e})")
         if self.cfg["cleanup"]["enabled"] and self.cfg["cleanup"]["provider"] == "ollama":
@@ -981,6 +985,11 @@ class Flow:
     def _show_live_awaiting(self, active, deadline):
         if self.overlay:
             self.overlay.set(("hud", "awaiting", bool(active), deadline))
+
+    def _show_workflow_progress(self, name, index, total, description):
+        if self.overlay:
+            self.overlay.set(("hud", "workflow", name, index, total,
+                              description))
 
     def on_press(self, mode="dictate"):
         with self._session_lock:
@@ -1161,6 +1170,11 @@ class Flow:
                         return
                     print(f"[command] heard: {text}")
                     response = self.router.handle(text)
+                    if not isinstance(response, str):
+                        # Dialogs (Question objects) only work in live mode,
+                        # where the next utterance routes back as the answer.
+                        response = ("That needs a follow-up answer — use live "
+                                    f"mode ({self.cfg.get('live_hotkey')}) for it.")
                 print(f"[command] -> {response}")
                 if self.overlay and response:
                     self.overlay.set(("say", response))

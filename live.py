@@ -16,6 +16,8 @@ from pathlib import Path
 
 import numpy as np
 
+from workflows import Question
+
 
 SAMPLE_RATE = 16_000
 FRAME_SAMPLES = 512                 # 32 ms, required by Silero
@@ -162,6 +164,9 @@ class LiveWorker:
         self._reset_pending = True
         self.awaiting_command = False
         self.awaiting_command_deadline = 0.0
+        self.awaiting_input = None
+        self.awaiting_input_deadline = 0.0
+        self._dialog_token = 0
         threading.Thread(target=self._loop, daemon=True, name="live-worker").start()
 
     @property
@@ -200,10 +205,16 @@ class LiveWorker:
     def pause(self, reason="external"):
         with self._lock:
             self._pauses.add(reason)
-            self._cancel_awaiting_locked()
+            if reason != "live-sapi":
+                self._cancel_awaiting_locked()
             self._invalidate_locked()
+        if reason != "live-sapi":
+            runner = getattr(self.router, "workflow_runner", None)
+            if runner and runner.running:
+                runner.cancel()
         self._drain()
-        self.awaiting_fn(False, 0.0)
+        if reason != "live-sapi":
+            self.awaiting_fn(False, 0.0)
         self.state_fn()
 
     def resume(self, reason="external"):
@@ -222,8 +233,92 @@ class LiveWorker:
         self._reset_pending = True
 
     def _cancel_awaiting_locked(self):
+        question = self.awaiting_input
         self.awaiting_command = False
         self.awaiting_command_deadline = 0.0
+        self.awaiting_input = None
+        self.awaiting_input_deadline = 0.0
+        self._dialog_token += 1
+        if question and question.cancel:
+            try:
+                question.cancel()
+            except Exception:
+                pass
+
+    def _install_question(self, question, timeout_s=30.0):
+        with self._lock:
+            if not self._enabled or self._pauses:
+                if question.cancel:
+                    question.cancel()
+                return False
+            self._cancel_awaiting_locked()
+            self.awaiting_input = question
+            self.awaiting_input_deadline = self.clock() + timeout_s
+            self.awaiting_command = True  # compatibility alias
+            self.awaiting_command_deadline = self.awaiting_input_deadline
+            self._dialog_token += 1
+            token = self._dialog_token
+            deadline = self.awaiting_input_deadline
+        self.awaiting_fn(True, deadline)
+
+        def expire():
+            remaining = max(0.0, deadline - self.clock())
+            if remaining:
+                time.sleep(remaining)
+            with self._lock:
+                if token != self._dialog_token or self.clock() < deadline:
+                    return
+                self._cancel_awaiting_locked()
+            self.awaiting_fn(False, 0.0)
+        threading.Thread(target=expire, daemon=True,
+                         name="live-dialog-timeout").start()
+        return True
+
+    def ask_workflow(self, text, cancel_event):
+        """Publish a yes/no Question and block a workflow worker safely."""
+        answered = threading.Event()
+        result = {"value": None}
+
+        def cancel():
+            answered.set()
+
+        def handle(answer):
+            heard = str(answer).strip().lower().rstrip(".!?")
+            if heard in {"yes", "yeah", "yep", "sure"}:
+                result["value"] = True
+            elif heard in {"no", "nope"}:
+                result["value"] = False
+            else:
+                return Question("Please say yes or no.", handle, cancel)
+            answered.set()
+            return "Continuing workflow."
+
+        question = Question(text, handle, cancel)
+        self.response_fn(text)
+        self.pause("live-sapi")
+        try:
+            self.speak_fn(text)
+        finally:
+            self.resume("live-sapi")
+        if not self._install_question(question, 30.0):
+            return None
+        while not answered.wait(0.1):
+            if cancel_event.is_set():
+                with self._lock:
+                    if self.awaiting_input is question:
+                        self._cancel_awaiting_locked()
+                self.awaiting_fn(False, 0.0)
+                return None
+        return result["value"]
+
+    def deliver_async(self, response):
+        """Show and speak a result produced by a background workflow."""
+        with self._lock:
+            can_speak = self._enabled and not self._pauses
+        if can_speak:
+            self._present_result(response)
+        elif response:
+            self.response_fn(response)
 
     def _valid(self, generation):
         with self._lock:
@@ -296,13 +391,55 @@ class LiveWorker:
         if not self._valid(generation):
             print("[live] discarded stale decode")
             return
+        wake = wake_command(text, self.cfg.get("wake_word"))
         with self._lock:
             now = self.clock()
-            follow_up = (self.awaiting_command
-                         and now <= self.awaiting_command_deadline)
-            self._cancel_awaiting_locked()
-        command = text.strip() if follow_up else wake_command(
-            text, self.cfg.get("wake_word"))
+            question = (self.awaiting_input
+                        if now <= self.awaiting_input_deadline else None)
+            legacy_follow_up = (self.awaiting_command and question is None
+                                and now <= self.awaiting_command_deadline)
+            runner = getattr(self.router, "workflow_runner", None)
+            bare_cancel = (str(text).strip().lower().rstrip(".!?")
+                           in {"stop", "cancel"} and runner and runner.running)
+            if not question and not legacy_follow_up and self.awaiting_command:
+                self._cancel_awaiting_locked()
+        # Wake-worded commands always win. A bare stop/cancel also reaches an
+        # active workflow so long waits can be aborted hands-free.
+        if wake is not None:
+            command = wake
+        elif bare_cancel:
+            runner.cancel()
+            self.response_fn("Cancelling workflow.")
+            return
+        elif question is not None:
+            answer = text.strip()
+            if answer.lower().rstrip(".!?") in {"cancel", "never mind", "nevermind"}:
+                with self._lock:
+                    self._cancel_awaiting_locked()
+                self.awaiting_fn(False, 0.0)
+                self.response_fn("Cancelled.")
+                return
+            with self._lock:
+                if self.awaiting_input is question:
+                    self.awaiting_input = None
+                    self.awaiting_input_deadline = 0.0
+                    self.awaiting_command = False
+                    self.awaiting_command_deadline = 0.0
+                    self._dialog_token += 1
+            self.awaiting_fn(False, 0.0)
+            try:
+                result = question.handler(answer)
+            except Exception as exc:
+                result = f"That dialog failed: {exc}"
+            self._present_result(result)
+            return
+        elif legacy_follow_up:
+            with self._lock:
+                self._cancel_awaiting_locked()
+            self.awaiting_fn(False, 0.0)
+            command = text.strip()
+        else:
+            command = None
         if command is None:
             print(f"[live] ignored: {text}")
             self.ignored_fn(text)
@@ -336,7 +473,18 @@ class LiveWorker:
                 audio=audio, sample_rate=SAMPLE_RATE,
             )
         print(f"[live] heard: {text} -> {response}")
-        if response:
+        self._present_result(response)
+
+    def _present_result(self, response):
+        if isinstance(response, Question):
+            self.response_fn(response.text)
+            self.pause("live-sapi")
+            try:
+                self.speak_fn(response.text)
+            finally:
+                self.resume("live-sapi")
+            self._install_question(response, 30.0)
+        elif response:
             self.response_fn(response)
             self.pause("live-sapi")
             try:

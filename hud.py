@@ -167,6 +167,11 @@ class HudView:
                 deadline=self.state.awaiting_deadline)
         elif kind == "awaiting":
             self.state.set_awaiting(event[1], event[2])
+        elif kind == "workflow":
+            header = f"workflow: {event[1]}"
+            if header not in self.state.thinking:
+                self.state.append(header)
+            self.state.append(f"step {event[2]}/{event[3]}: {event[4]}")
 
     def update(self):
         self.state.tick()

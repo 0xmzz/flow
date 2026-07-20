@@ -16,6 +16,8 @@ import time
 import urllib.parse
 import webbrowser
 
+from workflows import Question, RecipeStore, WorkflowRunner, creation_dialog
+
 
 def speak(text):
     """Speak text via Windows SAPI (hands-free result, no screen needed)."""
@@ -160,8 +162,29 @@ def _strip_tails(text):
 
 
 class Router:
-    def __init__(self, cfg):
+    def __init__(self, cfg, *, workflow_store=None, workflow_runner=None,
+                 intent_parser=None):
         self.cfg = cfg
+        self.workflows = workflow_store or RecipeStore()
+        self.workflow_progress_fn = lambda _name, _i, _n, _text: None
+        self.workflow_complete_fn = lambda _text: None
+        self.workflow_ask_fn = None
+        self.intent_parser = intent_parser
+        self.workflow_runner = workflow_runner or WorkflowRunner(
+            router=self, ask_fn=self._ask_workflow)
+
+    def configure_workflows(self, *, progress=None, complete=None, ask=None):
+        if progress is not None:
+            self.workflow_progress_fn = progress
+        if complete is not None:
+            self.workflow_complete_fn = complete
+        if ask is not None:
+            self.workflow_ask_fn = ask
+
+    def _ask_workflow(self, text, cancel_event):
+        if self.workflow_ask_fn is None:
+            raise RuntimeError("workflow question bridge unavailable")
+        return self.workflow_ask_fn(text, cancel_event)
 
     def handle(self, text):
         """Return a short spoken response for a command."""
@@ -184,6 +207,46 @@ class Router:
             ratio, match = max(scored)
             if ratio >= 0.8:
                 t = match + ((" " + parts[1]) if len(parts) == 2 else "")
+
+        if t in {"stop", "cancel"} and self.workflow_runner.running:
+            self.workflow_runner.cancel()
+            return "Cancelling workflow."
+
+        # Workflow management is explicit so recipe triggers cannot shadow it.
+        if t == "list workflows":
+            names = self.workflows.names()
+            return ("Workflows: " + ", ".join(names) + "." if names
+                    else "You don't have any workflows yet.")
+        m = re.search(r"^delete workflow (.+)$", t)
+        if m:
+            name = m.group(1).strip()
+            if not self.workflows.get(name):
+                return f"I couldn't find workflow {name}."
+
+            def confirm(answer):
+                heard = str(answer).strip().lower().rstrip(".!?")
+                if heard in {"yes", "yeah", "yep", "sure", "confirm"}:
+                    self.workflows.delete(name)
+                    return f"Deleted workflow {name}."
+                if heard in {"no", "nope", "cancel", "never mind", "nevermind"}:
+                    return "Deletion cancelled."
+                return Question("Please say yes or no.", confirm)
+            return Question(f"Delete workflow {name}?", confirm)
+        m = re.search(r"^create a workflow called (.+)$", t)
+        if m:
+            return creation_dialog(
+                m.group(1).strip(), self.workflows, self.parse_action)
+
+        recipe = self.workflows.match(t)
+        if recipe:
+            if self.workflow_runner.running:
+                return "A workflow is already running."
+            started = self.workflow_runner.start(
+                recipe, progress=lambda i, total, description:
+                self.workflow_progress_fn(recipe["name"], i, total, description),
+                complete=self.workflow_complete_fn)
+            return (f"Running workflow {recipe['name']}." if started
+                    else "A workflow is already running.")
 
         # --- crypto price ---
         if any(k in t for k in ("price", "how much", "trading at", "worth")):
@@ -227,6 +290,39 @@ class Router:
 
         # --- fallback: ask the LLM ---
         return self._fallback(text)
+
+    def parse_action(self, text):
+        """Resolve a spoken creation step without executing it."""
+        if self.intent_parser is not None:
+            return self.intent_parser(text)
+        raw = str(text or "").strip()
+        normalized = raw.rstrip(".!?")
+        patterns = (
+            ("switch", r"^(?:switch to|go to|focus|bring up) (.+)"),
+            ("close", r"^close (.+)"),
+            ("open", r"^(?:open|launch|start) (.+)"),
+            ("search", r"^(?:search|google|look up)(?: for)? (.+)"),
+            ("type", r"^(?:type|write) (.+)"),
+        )
+        for action, pattern in patterns:
+            match = re.search(pattern, normalized, re.IGNORECASE)
+            if match:
+                return action, match.group(1).strip()
+        if re.search(r"price|how much|trading at|worth", normalized,
+                     re.IGNORECASE):
+            match = (re.search(r"price of (?:the )?(.+)", normalized, re.I)
+                     or re.search(r"^(.+?) price$", normalized, re.I))
+            if match:
+                return "price", match.group(1).strip()
+        import llm
+        value, _ = llm.chain(
+            self.cfg["cleanup"],
+            'Extract the action only. Reply with STRICT JSON: '
+            '{"action":"open|close|switch|price|search|type|answer",'
+            '"arg":"<string>"}.', raw, max_tokens=80,
+            local_only=self.cfg.get("local_only", True))
+        intent = self._parse_intent(value)
+        return intent if intent and intent[0] != "answer" else None
 
     FOLDERS = {
         "downloads": "Downloads", "documents": "Documents", "desktop": "Desktop",

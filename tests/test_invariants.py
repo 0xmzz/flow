@@ -4,6 +4,7 @@ Run: .venv\\Scripts\\python -m pytest tests -q
 """
 
 import json
+import shutil
 import sys
 import threading
 import time
@@ -20,6 +21,8 @@ from store import TranscriptStore, decode_wav, wav_bytes  # noqa: E402
 from live import LiveWorker, wake_command  # noqa: E402
 from commands import Router  # noqa: E402
 from hud import HudState  # noqa: E402
+from workflows import (Question, RecipeStore, WorkflowRunner,
+                       creation_dialog)  # noqa: E402
 
 
 # ---------- llm.chain: nothing leaves the box ----------
@@ -183,6 +186,38 @@ def test_live_awaiting_command_expires_and_pause_cancels():
     worker.close()
 
 
+def test_live_question_routes_bare_answer_but_wake_command_has_priority():
+    import numpy as np
+    class Engine:
+        provider = "CPU"
+        text = "flow begin dialog"
+        def decode(self, _audio): return self.text, 0.01
+    answers = []
+    class RouterStub:
+        workflow_runner = None
+        def handle(self, text):
+            if text == "begin dialog":
+                return Question("Which one?", lambda answer:
+                                answers.append(answer) or "Thanks.")
+            return f"command {text}"
+    engine, responses = Engine(), []
+    worker = LiveWorker(_FakeRecorder(), RouterStub(), None, {
+        "engine": "fake", "wake_word": "flow", "silence_ms": 280,
+        "max_utterance_s": 12}, engine=engine, vad=_FakeVad(),
+        response_fn=responses.append)
+    worker.start()
+    worker._decode_and_act(np.zeros(512), worker._generation)
+    assert worker.awaiting_input and responses[-1] == "Which one?"
+    engine.text = "flow list workflows"
+    worker._decode_and_act(np.zeros(512), worker._generation)
+    assert worker.awaiting_input and responses[-1] == "command list workflows"
+    engine.text = "the first one"
+    worker._decode_and_act(np.zeros(512), worker._generation)
+    assert answers == ["the first one"] and responses[-1] == "Thanks."
+    assert not worker.awaiting_input
+    worker.close()
+
+
 def test_ignored_live_utterance_never_stores():
     class Recorder:
         def subscribe(self, maxsize=96):
@@ -298,6 +333,85 @@ def test_intent_json_dispatch_and_answer_fallback(monkeypatch):
     assert router.handle("put calculator on screen") == "opened calculator"
     assert router.handle("why is the sky blue") == "A concise answer."
     assert calls == [80, 80, 200]
+
+
+# ---------- Phase B workflows (all OS effects injected) ----------
+
+def test_workflow_store_round_trip_and_fuzzy_trigger():
+    root = ROOT / ".test-workflows-phase-b"
+    shutil.rmtree(root, ignore_errors=True)
+    try:
+        store = RecipeStore(root)
+        recipe = {"name": "Morning Setup",
+                  "triggers": ["morning setup", "start my morning"],
+                  "steps": [{"do": "open", "arg": "chrome"}]}
+        store.save(recipe)
+        assert store.get("morning setup") == recipe
+        assert store.match("morning set up")["name"] == "Morning Setup"
+        assert store.match("completely unrelated") is None
+        assert RecipeStore(root).list() == [recipe]
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_workflow_runner_order_cancel_and_ask_yes_branch():
+    calls, progress, completed = [], [], []
+    runner = WorkflowRunner(
+        primitives=lambda action, arg: calls.append((action, arg)),
+        ask_fn=lambda question, cancel: calls.append(("ask", question)) or True)
+    recipe = {"name": "desk", "triggers": ["desk"], "steps": [
+        {"do": "open", "arg": "notes"},
+        {"do": "ask", "arg": "Search too?", "yes": [
+            {"do": "search", "arg": "today"}]},
+        {"do": "type", "arg": "Ready"}]}
+    assert runner.start(recipe, progress=lambda *args: progress.append(args),
+                        complete=completed.append)
+    runner.thread.join(2)
+    assert calls == [("open", "notes"), ("ask", "Search too?"),
+                     ("search", "today"), ("type", "Ready")]
+    assert [item[:2] for item in progress] == [(1, 3), (2, 3), (3, 3)]
+    assert completed == ["Workflow desk complete."]
+
+    entered, release = threading.Event(), threading.Event()
+    clock = _FakeClock()
+    def fake_wait(delay):
+        entered.set()
+        release.wait(1)
+        clock.advance(delay)
+    runner = WorkflowRunner(wait_fn=fake_wait, clock=clock)
+    waiting = {"name": "waiter", "triggers": ["waiter"],
+               "steps": [{"do": "wait_s", "arg": 30},
+                         {"do": "say", "arg": "too late"}]}
+    done = []
+    runner.start(waiting, complete=done.append)
+    assert entered.wait(1)
+    runner.cancel()
+    release.set()
+    runner.thread.join(2)
+    assert done == ["Workflow waiter cancelled."]
+
+
+def test_workflow_voice_creation_dialog_with_fake_intents():
+    root = ROOT / ".test-workflow-dialog"
+    shutil.rmtree(root, ignore_errors=True)
+    try:
+        store = RecipeStore(root)
+        intents = {"open chrome": ("open", "chrome"),
+                   "type Hello": ("type", "Hello")}
+        question = creation_dialog("Demo", store, intents.get)
+        assert isinstance(question, Question)
+        question = question.handler("nonsense")
+        assert isinstance(question, Question)
+        question = question.handler("open chrome")
+        assert isinstance(question, Question)
+        question = question.handler("type Hello")
+        response = question.handler("done")
+        assert response == "Saved workflow Demo with 2 steps."
+        assert store.get("demo")["steps"] == [
+            {"do": "open", "arg": "chrome"},
+            {"do": "type", "arg": "Hello"}]
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 # ---------- flow module helpers (no Flow() init: no GPU) ----------

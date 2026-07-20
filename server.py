@@ -205,6 +205,8 @@ def make_server(flow, host, port, token):
                 text, _ = flow.transcribe_and_store(
                     audio, sample_rate=sr, source="remote-command", window=device)
                 response = flow.router.handle(text) if text else ""
+                if not isinstance(response, str):  # dialogs are live-mode only
+                    response = "That command needs a follow-up answer; not available remotely."
                 return self._json(200, {"text": text, "response": response})
             if path == "/v1/audio/transcriptions":
                 ctype = self.headers.get("Content-Type", "")
