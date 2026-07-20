@@ -622,6 +622,7 @@ class Overlay:
         st = {"mode": "idle"}
         agc = {"ref": 0.08}  # decaying reference peak for auto-gain
         hide_at = [None]
+        revert_mode = [None]
 
         def place():
             root.update_idletasks()
@@ -667,6 +668,9 @@ class Overlay:
                 while True:
                     s = self._q.get_nowait()
                     kind = s[0] if isinstance(s, tuple) else s
+                    hide_at[0] = None
+                    revert_mode[0] = None
+                    status.config(fg=fg)
                     if kind == "rec":
                         status.config(text="Listening")
                         context.config(
@@ -692,6 +696,14 @@ class Overlay:
                         show("say")
                         place()
                         hide_at[0] = time.time() + max(4, min(12, len(s[1]) / 18))
+                    elif kind == "ignored":
+                        heard = (s[1] or "")[:40]
+                        status.config(text=heard or "Heard something", fg=sub)
+                        context.config(text="say 'flow' first", fg=sub)
+                        show("live")
+                        place()
+                        hide_at[0] = time.time() + 1.5
+                        revert_mode[0] = "live"
                     else:  # idle
                         if hide_at[0] is None:
                             st["mode"] = "idle"
@@ -704,8 +716,15 @@ class Overlay:
                 draw_wave()
             if hide_at[0] is not None and time.time() > hide_at[0]:
                 hide_at[0] = None
-                st["mode"] = "idle"
-                root.withdraw()
+                if revert_mode[0] == "live":
+                    revert_mode[0] = None
+                    status.config(text="Live listening", fg=fg)
+                    context.config(text="Say the wake word, then a command", fg=sub)
+                    show("live")
+                    place()
+                else:
+                    st["mode"] = "idle"
+                    root.withdraw()
             root.after(45, poll)  # ~22fps waveform; always reschedule
 
         poll()
@@ -879,7 +898,8 @@ class Flow:
                 self.live_worker = LiveWorker(
                     self.recorder, self.router, self.store, self.cfg["live"],
                     speak_fn=speak, response_fn=self._show_live_response,
-                    state_fn=self.restore_base_state)
+                    state_fn=self.restore_base_state,
+                    ignored_fn=self._show_live_ignored)
             except Exception as e:
                 print(f"[live] disabled: model/VAD startup failed ({e})")
         if self.cfg["cleanup"]["enabled"] and self.cfg["cleanup"]["provider"] == "ollama":
@@ -932,6 +952,10 @@ class Flow:
     def _show_live_response(self, response):
         if self.overlay and response:
             self.overlay.set(("say", response))
+
+    def _show_live_ignored(self, text):
+        if self.overlay:
+            self.overlay.set(("ignored", (text or "")[:40]))
 
     def on_press(self, mode="dictate"):
         with self._session_lock:

@@ -144,6 +144,20 @@ KNOWN_SITES = {
     "google": "https://google.com",
 }
 
+_VERBS = ("open", "launch", "start", "close", "switch", "search", "google",
+          "price", "type", "write", "help")
+_TAIL_RE = re.compile(
+    r"\s+(?:right\s+now|at\s+the\s+moment|real\s+quick|for\s+me|currently|"
+    r"quickly|today|please|now)\s*$")
+
+
+def _strip_tails(text):
+    previous = None
+    while text != previous:
+        previous = text
+        text = _TAIL_RE.sub("", text).strip()
+    return text
+
 
 class Router:
     def __init__(self, cfg):
@@ -157,7 +171,19 @@ class Router:
         t = re.sub(r"^(?:hey |ok |okay |so |um |uh )+", "", t)
         t = re.sub(r"^(?:can|could|would|will) you (?:please )?", "", t)
         t = re.sub(r"^please ", "", t)
-        t = re.sub(r"\s+(?:for me|please|now|real quick|quickly)$", "", t)
+        t = re.sub(r"^(?:(?:actually|also|and|then)\s+)+", "", t)
+        t = _strip_tails(t)
+        parts = t.split(maxsplit=1)
+        if parts and parts[0] not in _VERBS:
+            heard = parts[0]
+            forms = {heard, heard.replace("th", "")}
+            if heard.endswith("s"):
+                forms.add(heard[:-1])
+            scored = [(difflib.SequenceMatcher(None, form, verb).ratio(), verb)
+                      for form in forms for verb in _VERBS]
+            ratio, match = max(scored)
+            if ratio >= 0.8:
+                t = match + ((" " + parts[1]) if len(parts) == 2 else "")
 
         # --- crypto price ---
         if any(k in t for k in ("price", "how much", "trading at", "worth")):
@@ -166,16 +192,8 @@ class Router:
                  or re.search(r"what(?:'?s| is) (.+?) (?:currently )?(?:trading )?at", t)
                  or re.search(r"^(.+?) price$", t))
             if m:
-                q = m.group(1).strip()
-                try:
-                    res = _coingecko_price(q)
-                except Exception as e:
-                    return f"I couldn't reach the price feed: {e}"
-                if not res:
-                    return f"I couldn't find a price for {q}."
-                name, price, chg = res
-                chg_s = f", {chg:+.1f} percent in the last day" if chg is not None else ""
-                return f"{name} is {_fmt_price(price)}{chg_s}."
+                q = _strip_tails(m.group(1).strip())
+                return self._price(q)
 
         # --- discoverability ---
         if re.search(r"^(what can you do|help|commands|what do you do)$", t):
@@ -187,12 +205,11 @@ class Router:
         # --- switch to an open window ---
         m = re.search(r"^(?:switch to|go to|focus|bring up) (.+)", t)
         if m:
-            title = switch_to(m.group(1).strip())
-            if title:
-                return f"Switched to {title[:40]}."
-            # "go to X" might mean a site — fall through to open
-            t2 = m.group(1).strip()
-            return self._open(t2)
+            return self._switch(m.group(1).strip())
+
+        m = re.search(r"^close (.+)", t)
+        if m:
+            return self._close(m.group(1).strip())
 
         # --- open an app or site ---
         m = re.search(r"^(?:open|launch|start) (.+)", t)
@@ -202,9 +219,11 @@ class Router:
         # --- web search ---
         m = re.search(r"^(?:search|google|look up)(?: for)? (.+)", t)
         if m:
-            webbrowser.open("https://www.google.com/search?q="
-                            + urllib.parse.quote(m.group(1)))
-            return f"Searching for {m.group(1)}."
+            return self._search(m.group(1).strip())
+
+        m = re.search(r"^(?:type|write) (.+)", t)
+        if m:
+            return self._type(m.group(1))
 
         # --- fallback: ask the LLM ---
         return self._fallback(text)
@@ -213,6 +232,60 @@ class Router:
         "downloads": "Downloads", "documents": "Documents", "desktop": "Desktop",
         "pictures": "Pictures", "videos": "Videos", "music": "Music",
     }
+
+    def _price(self, query):
+        q = _strip_tails(query.strip())
+        try:
+            res = _coingecko_price(q)
+        except Exception as e:
+            return f"I couldn't reach the price feed: {e}"
+        if not res:
+            return f"I couldn't find a price for {q}."
+        name, price, chg = res
+        chg_s = f", {chg:+.1f} percent in the last day" if chg is not None else ""
+        return f"{name} is {_fmt_price(price)}{chg_s}."
+
+    def _switch(self, name):
+        title = switch_to(name)
+        if title:
+            return f"Switched to {title[:40]}."
+        return self._open(name)
+
+    def _search(self, query):
+        webbrowser.open("https://www.google.com/search?q="
+                        + urllib.parse.quote(query))
+        return f"Searching for {query}."
+
+    def _close(self, name):
+        n = re.sub(r"^the\s+", "", name.lower().strip())
+        if n in ("tab", "window"):
+            import keyboard
+            keyboard.send("ctrl+w" if n == "tab" else "alt+f4")
+            return ""
+        wins = _windows_list()
+        titles = {title.lower(): hwnd for hwnd, title in wins if title.strip()}
+        key = _match(n, titles)
+        if not key:
+            return f"I couldn't find {name} to close."
+        ctypes.windll.user32.PostMessageW(titles[key], 0x0010, 0, 0)
+        return f"Closing {key.title()[:40]}."
+
+    def _type(self, text):
+        import keyboard
+        import pyperclip
+        try:
+            old = pyperclip.paste()
+        except Exception:
+            old = None
+        try:
+            pyperclip.copy(text)
+            time.sleep(0.02)
+            keyboard.send("ctrl+v")
+        finally:
+            if old is not None:
+                time.sleep(0.05)
+                pyperclip.copy(old)
+        return ""
 
     def _open(self, name):
         n = name.lower().strip()
@@ -251,10 +324,47 @@ class Router:
 
     def _fallback(self, text):
         import llm
+        raw, _ = llm.chain(
+            self.cfg["cleanup"],
+            'Extract the voice-command intent. Reply with STRICT JSON only: '
+            '{"action":"open|close|switch|price|search|type|answer",'
+            '"arg":"<string>"}. Use answer for questions or conversation.',
+            text, max_tokens=80,
+            local_only=self.cfg.get("local_only", True))
+        intent = self._parse_intent(raw)
+        if intent and intent[0] != "answer" and intent[1].strip():
+            action, arg = intent
+            handlers = {"open": self._open, "close": self._close,
+                        "switch": self._switch, "price": self._price,
+                        "search": self._search, "type": self._type}
+            return handlers[action](arg.strip())
         out, _ = llm.chain(
             self.cfg["cleanup"],
             "You are a terse voice assistant. Answer in one or two spoken "
-            "sentences, no markdown.",
+            "sentences, no markdown. You control this Windows PC by voice. "
+            "If asked for an action you cannot perform, say what you CAN do "
+            "(open/close/switch apps, crypto prices, web search, type text) â€” "
+            "never claim you cannot browse the internet.",
             text, max_tokens=200,
             local_only=self.cfg.get("local_only", True))
         return out or "I couldn't reach the assistant."
+
+    @staticmethod
+    def _parse_intent(raw):
+        if not isinstance(raw, str):
+            return None
+        decoder = json.JSONDecoder()
+        for index, char in enumerate(raw):
+            if char != "{":
+                continue
+            try:
+                value, _ = decoder.raw_decode(raw[index:])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(value, dict):
+                continue
+            action, arg = value.get("action"), value.get("arg")
+            if (action in {"open", "close", "switch", "price", "search",
+                           "type", "answer"} and isinstance(arg, str)):
+                return action, arg
+        return None

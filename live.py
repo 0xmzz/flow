@@ -21,22 +21,25 @@ SAMPLE_RATE = 16_000
 FRAME_SAMPLES = 512                 # 32 ms, required by Silero
 PRE_FRAMES = 5                      # 160 ms
 POST_FRAMES = 5                     # 160 ms
+GREETINGS = {"hey", "hi", "ok", "okay", "yo", "so"}
 
 
 def wake_command(text, wake_word="flow"):
-    """Return command text after a first-token fuzzy wake gate, else None."""
+    """Return command, empty string for wake-only, or None for no wake match."""
     text = (text or "").strip()
     if not text:
         return None
     if wake_word is None:
         return text
-    parts = text.split(maxsplit=1)
+    parts = text.split()
     first = re.sub(r"[^\w]", "", parts[0].lower(), flags=re.UNICODE)
+    if first in GREETINGS and len(parts) > 1:
+        parts = parts[1:]
+        first = re.sub(r"[^\w]", "", parts[0].lower(), flags=re.UNICODE)
     wake = re.sub(r"[^\w]", "", str(wake_word).lower(), flags=re.UNICODE)
     if not first or not wake or difflib.SequenceMatcher(None, first, wake).ratio() < 0.75:
         return None
-    command = parts[1].strip() if len(parts) == 2 else ""
-    return command or None
+    return " ".join(parts[1:]).strip()
 
 
 class SileroVad:
@@ -135,7 +138,8 @@ class LiveWorker:
     """Keyboard-free VAD/segmentation/ASR/command worker."""
 
     def __init__(self, recorder, router, store, cfg, *, engine=None, vad=None,
-                 speak_fn=None, response_fn=None, state_fn=None):
+                 speak_fn=None, response_fn=None, state_fn=None, ignored_fn=None,
+                 clock=None):
         self.recorder = recorder
         self.router = router
         self.store = store
@@ -146,12 +150,16 @@ class LiveWorker:
         self.speak_fn = speak_fn or (lambda _text: None)
         self.response_fn = response_fn or (lambda _text: None)
         self.state_fn = state_fn or (lambda: None)
+        self.ignored_fn = ignored_fn or (lambda _text: None)
+        self.clock = clock or time.monotonic
         self._q = recorder.subscribe(maxsize=96)
         self._lock = threading.Lock()
         self._enabled = False
         self._pauses = set()
         self._generation = 0
         self._reset_pending = True
+        self.awaiting_command = False
+        self.awaiting_command_deadline = 0.0
         threading.Thread(target=self._loop, daemon=True, name="live-worker").start()
 
     @property
@@ -169,6 +177,7 @@ class LiveWorker:
             if self._enabled:
                 return
             self._enabled = True
+            self._cancel_awaiting_locked()
             self._invalidate_locked()
         self._drain()
         self.state_fn()
@@ -179,6 +188,7 @@ class LiveWorker:
             if not self._enabled:
                 return
             self._enabled = False
+            self._cancel_awaiting_locked()
             self._invalidate_locked()
         self._drain()
         self.state_fn()
@@ -187,6 +197,7 @@ class LiveWorker:
     def pause(self, reason="external"):
         with self._lock:
             self._pauses.add(reason)
+            self._cancel_awaiting_locked()
             self._invalidate_locked()
         self._drain()
         self.state_fn()
@@ -205,6 +216,10 @@ class LiveWorker:
     def _invalidate_locked(self):
         self._generation += 1
         self._reset_pending = True
+
+    def _cancel_awaiting_locked(self):
+        self.awaiting_command = False
+        self.awaiting_command_deadline = 0.0
 
     def _valid(self, generation):
         with self._lock:
@@ -277,9 +292,28 @@ class LiveWorker:
         if not self._valid(generation):
             print("[live] discarded stale decode")
             return
-        command = wake_command(text, self.cfg.get("wake_word"))
+        with self._lock:
+            now = self.clock()
+            follow_up = (self.awaiting_command
+                         and now <= self.awaiting_command_deadline)
+            self._cancel_awaiting_locked()
+        command = text.strip() if follow_up else wake_command(
+            text, self.cfg.get("wake_word"))
         if command is None:
             print(f"[live] ignored: {text}")
+            self.ignored_fn(text)
+            return
+        if command == "":
+            self.pause("live-sapi")
+            try:
+                self.speak_fn("Yes?")
+            finally:
+                self.resume("live-sapi")
+            with self._lock:
+                if self._enabled and not self._pauses:
+                    self.awaiting_command = True
+                    self.awaiting_command_deadline = self.clock() + 8.0
+            self.response_fn("Yes?")
             return
         if not self._valid(generation):
             return

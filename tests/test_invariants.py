@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT))
 import llm  # noqa: E402
 from store import TranscriptStore, decode_wav, wav_bytes  # noqa: E402
 from live import LiveWorker, wake_command  # noqa: E402
+from commands import Router  # noqa: E402
 
 
 # ---------- llm.chain: nothing leaves the box ----------
@@ -95,8 +96,10 @@ def test_wav_roundtrip():
     ("flow open youtube", "open youtube"),
     ("Flo, open youtube", "open youtube"),
     ("floh open youtube", "open youtube"),
+    ("Hey flow.", ""),
+    ("okay Flo, open youtube", "open youtube"),
     ("hello flow", None),
-    ("flow", None),
+    ("flow", ""),
 ])
 def test_live_wake_gate(heard, expected):
     assert wake_command(heard, "flow") == expected
@@ -104,6 +107,75 @@ def test_live_wake_gate(heard, expected):
 
 def test_live_wake_gate_can_be_disabled():
     assert wake_command("open youtube", None) == "open youtube"
+
+
+class _FakeRecorder:
+    def subscribe(self, maxsize=96):
+        import queue
+        return queue.Queue()
+    def unsubscribe(self, _q): pass
+
+
+class _FakeVad:
+    def reset(self): pass
+    def probability(self, _frame): return 0.0
+
+
+class _FakeClock:
+    def __init__(self): self.now = 100.0
+    def __call__(self): return self.now
+    def advance(self, seconds): self.now += seconds
+
+
+def test_live_wake_alone_awaits_and_routes_follow_up():
+    import numpy as np
+    class Engine:
+        provider = "CPU"
+        text = "Flow."
+        def decode(self, _audio): return self.text, 0.01
+    class RouterStub:
+        def __init__(self): self.calls = []
+        def handle(self, text): self.calls.append(text); return "done"
+    engine, router, clock = Engine(), RouterStub(), _FakeClock()
+    responses, spoken = [], []
+    worker = LiveWorker(_FakeRecorder(), router, None, {
+        "engine": "fake", "wake_word": "flow", "silence_ms": 280,
+        "max_utterance_s": 12}, engine=engine, vad=_FakeVad(), clock=clock,
+        response_fn=responses.append, speak_fn=spoken.append)
+    worker.start()
+    worker._decode_and_act(np.zeros(512), worker._generation)
+    assert worker.awaiting_command and responses == ["Yes?"] and spoken == ["Yes?"]
+    engine.text = "open youtube"
+    worker._decode_and_act(np.zeros(512), worker._generation)
+    assert router.calls == ["open youtube"] and not worker.awaiting_command
+    worker.close()
+
+
+def test_live_awaiting_command_expires_and_pause_cancels():
+    import numpy as np
+    class Engine:
+        provider = "CPU"
+        text = "flow"
+        def decode(self, _audio): return self.text, 0.01
+    class RouterStub:
+        def handle(self, _text): raise AssertionError("expired command routed")
+    ignored, clock, engine = [], _FakeClock(), Engine()
+    worker = LiveWorker(_FakeRecorder(), RouterStub(), None, {
+        "engine": "fake", "wake_word": "flow", "silence_ms": 280,
+        "max_utterance_s": 12}, engine=engine, vad=_FakeVad(), clock=clock,
+        ignored_fn=ignored.append)
+    worker.start()
+    worker._decode_and_act(np.zeros(512), worker._generation)
+    clock.advance(8.1)
+    engine.text = "open youtube"
+    worker._decode_and_act(np.zeros(512), worker._generation)
+    assert ignored == ["open youtube"] and not worker.awaiting_command
+    engine.text = "flow"
+    worker._decode_and_act(np.zeros(512), worker._generation)
+    assert worker.awaiting_command
+    worker.pause("recorder-owner")
+    assert not worker.awaiting_command
+    worker.close()
 
 
 def test_ignored_live_utterance_never_stores():
@@ -133,6 +205,56 @@ def test_ignored_live_utterance_never_stores():
 def test_live_module_has_no_network_client_import():
     source = (ROOT / "live.py").read_text(encoding="utf-8")
     assert "import requests" not in source and "urllib" not in source
+
+
+# ---------- command router (no OS actions, model, or network) ----------
+
+def _router():
+    return Router({"cleanup": {}, "local_only": True})
+
+
+def test_price_temporal_tail_is_removed(monkeypatch):
+    import commands
+    seen = []
+    monkeypatch.setattr(commands, "_coingecko_price",
+                        lambda q: seen.append(q) or ("Bitcoin", 1.0, 0.0))
+    assert _router().handle("price of bitcoin right now").startswith("Bitcoin is")
+    assert seen == ["bitcoin"]
+
+
+def test_close_homophone_routes_to_close(monkeypatch):
+    router = _router()
+    seen = []
+    monkeypatch.setattr(router, "_close", lambda arg: seen.append(arg) or "closed")
+    assert router.handle("clothes youtube") == "closed"
+    assert seen == ["youtube"]
+
+
+def test_type_skill_pastes_and_restores(monkeypatch):
+    import commands
+    import keyboard
+    import pyperclip
+    copied, keys = [], []
+    monkeypatch.setattr(pyperclip, "paste", lambda: "old clip")
+    monkeypatch.setattr(pyperclip, "copy", copied.append)
+    monkeypatch.setattr(keyboard, "send", keys.append)
+    monkeypatch.setattr(commands.time, "sleep", lambda _s: None)
+    assert _router().handle("write hello there") == ""
+    assert copied == ["hello there", "old clip"] and keys == ["ctrl+v"]
+
+
+def test_intent_json_dispatch_and_answer_fallback(monkeypatch):
+    calls = []
+    outputs = iter([('prefix {"action":"open","arg":"calculator"} suffix', "x"),
+                    ('{"action":"answer","arg":""}', "x"),
+                    ("A concise answer.", "x")])
+    monkeypatch.setattr(llm, "chain", lambda *a, **kw:
+                        calls.append(kw.get("max_tokens")) or next(outputs))
+    router = _router()
+    monkeypatch.setattr(router, "_open", lambda arg: f"opened {arg}")
+    assert router.handle("put calculator on screen") == "opened calculator"
+    assert router.handle("why is the sky blue") == "A concise answer."
+    assert calls == [80, 80, 200]
 
 
 # ---------- flow module helpers (no Flow() init: no GPU) ----------
