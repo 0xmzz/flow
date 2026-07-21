@@ -93,6 +93,7 @@ DEFAULTS = {
     # Devices whose dictations join YOUR corpus/Hermes context. Anything else
     # is stored private: no audio archive, excluded from the Hermes sweep.
     "trusted_devices": ["android-bubble", "phone", "work-vm"],
+    "weather_location": "Dubai",
     # Mic selection. None = follow the Windows default input. A string matches
     # a device NAME (case-insensitive substring) because indices churn.
     "input_device": None,
@@ -1044,18 +1045,21 @@ class Flow:
     def _warm_ollama(self):
         import requests
         c = self.cfg["cleanup"]
-        try:
-            t0 = time.time()
-            requests.post(
-                (c["base_url"] or "http://127.0.0.1:11434") + "/api/chat",
-                json={"model": c["model"], "stream": False, "think": False,
-                      "keep_alive": -1,
-                      "messages": [{"role": "user", "content": "hi"}]},
-                timeout=300,
-            ).raise_for_status()
-            print(f"[cleanup] local model {c['model']} warm in {time.time()-t0:.1f}s")
-        except Exception as e:
-            print(f"[cleanup] warmup failed ({e}) — is Ollama running?")
+        while True:
+            try:
+                t0 = time.time()
+                requests.post(
+                    (c["base_url"] or "http://127.0.0.1:11434") + "/api/chat",
+                    json={"model": c["model"], "stream": False, "think": False,
+                          "keep_alive": -1,
+                          "messages": [{"role": "user", "content": "hi"}]},
+                    timeout=300,
+                ).raise_for_status()
+                print(f"[cleanup] local model {c['model']} warm in {time.time()-t0:.1f}s")
+                return
+            except Exception as e:
+                print(f"[cleanup] warmup failed ({e}) — retrying in 60s")
+                time.sleep(60)
 
     def mic_is_deaf(self, audio):
         """True when the captured audio is digital silence.

@@ -511,8 +511,12 @@ class LiveWorker:
             self._reset_router_conversation()
         if conversation:
             self._touch_conversation()
+        first_today = False
         if wake is not None:
             self._touch_conversation()
+            claim = getattr(self.router, "claim_first_conversation_today", None)
+            if claim:
+                first_today = claim()
         normalized = re.sub(r"[^\w\s']", "", wake if wake is not None else text,
                             flags=re.UNICODE).lower().replace("’", "'").strip()
         if (wake is not None or conversation) and normalized in QUIET_PHRASES:
@@ -586,6 +590,11 @@ class LiveWorker:
             return
         self.heard_fn(text, command)
         if command == "":
+            greeting = getattr(self.router, "proactive_greeting", lambda _first: None)(
+                first_today)
+            if isinstance(greeting, Question):
+                self._present_result(greeting)
+                return
             self.pause("live-sapi")
             try:
                 self.speak_fn("Yes?")

@@ -187,6 +187,8 @@ Leaves your hardware, ever:
 
 1. **CoinGecko / opened sites** — the extracted query of a voice command
    ("bitcoin"), not your speech.
+2. **Open-Meteo** — only the configured or spoken location string is sent for
+   geocoding; its derived coordinates are then sent to the forecast feed.
 
 That's the list. `local_only: true` (the default) makes `llm.chain` DROP any
 lane whose endpoint isn't provably loopback before calling it — a cloud

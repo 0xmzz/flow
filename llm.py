@@ -7,11 +7,23 @@ model, api_key / api_key_env, extra_body.
 """
 
 import os
+import time
 from urllib.parse import urlparse
 
 import requests
 
 _LOOPBACK = {"127.0.0.1", "localhost", "::1", "0.0.0.0", ""}
+
+
+def _connection_refused(exc):
+    current = exc
+    while current is not None:
+        if getattr(current, "errno", None) in {111, 10061}:
+            return True
+        current = current.__cause__ or current.__context__
+    message = str(exc).lower()
+    return ("connection refused" in message or "actively refused" in message
+            or "[winerror 10061]" in message)
 
 
 def is_local(p):
@@ -27,15 +39,19 @@ def call_provider(p, system, text, max_tokens=2048):
     """One LLM call against a provider block. Raises on any failure."""
     provider = p.get("provider", "ollama")
     if provider == "ollama":
-        r = requests.post(
-            (p.get("base_url") or "http://127.0.0.1:11434") + "/api/chat",
-            json={"model": p["model"], "stream": False, "think": False,
-                  "keep_alive": -1,
-                  "messages": [{"role": "system", "content": system},
-                               {"role": "user", "content": text}],
-                  **p.get("extra_body", {})},
-            timeout=20,
-        )
+        url = (p.get("base_url") or "http://127.0.0.1:11434") + "/api/chat"
+        body = {"model": p["model"], "stream": False, "think": False,
+                "keep_alive": -1,
+                "messages": [{"role": "system", "content": system},
+                             {"role": "user", "content": text}],
+                **p.get("extra_body", {})}
+        try:
+            r = requests.post(url, json=body, timeout=20)
+        except Exception as exc:
+            if not _connection_refused(exc):
+                raise
+            time.sleep(2)
+            r = requests.post(url, json=body, timeout=20)
         r.raise_for_status()
         out = r.json()["message"]["content"].strip()
     elif provider == "anthropic":

@@ -7,6 +7,7 @@ LLM. Each skill is a small, testable unit — add more over time.
 """
 
 import ctypes
+import datetime
 import difflib
 import json
 import os
@@ -17,10 +18,80 @@ import time
 import urllib.parse
 import webbrowser
 from collections import deque
+from pathlib import Path
 
 from agents import AgentError, AgentRunner, select_lane
 from workflows import (Question, RecipeStore, WorkflowRunner, creation_dialog,
                        normalize as normalize_workflow)
+
+
+DATA_DIR = Path(__file__).parent / "data"
+OFFLINE_LINE = ("My language model is offline — direct commands still work, "
+                "say help for the list.")
+_intent_log_lock = threading.Lock()
+_intent_log_local = threading.local()
+_live_state_lock = threading.Lock()
+
+
+def machine_context(*, workflows=(), workflow_running=False,
+                    agent_running=False, now=None, windows_supplier=None,
+                    monitors_supplier=None):
+    """Return a cheap, fresh, bounded snapshot of useful machine state."""
+    now = now or datetime.datetime.now()
+    if windows_supplier is None:
+        windows_supplier = _windows_list
+    if monitors_supplier is None:
+        from winctl import enumerate_monitors
+        monitors_supplier = enumerate_monitors
+    titles = []
+    seen = set()
+    try:
+        for _handle, value in windows_supplier():
+            title = " ".join(str(value or "").split())
+            key = title.casefold()
+            if title and key not in seen:
+                seen.add(key)
+                titles.append(title[:48])
+            if len(titles) == 8:
+                break
+    except Exception:
+        pass
+    try:
+        monitor_count = len(monitors_supplier())
+    except Exception:
+        monitor_count = 0
+    try:
+        names = [" ".join(str(name).split())[:32] for name in workflows if name]
+    except Exception:
+        names = []
+    running = []
+    if workflow_running:
+        running.append("workflow")
+    if agent_running:
+        running.append("agent")
+    prefix = f"Machine: {now.strftime('%A %H:%M')}; windows: "
+    suffix = (f"; monitors: {monitor_count}; "
+              f"workflows: {(', '.join(names[:6]) or 'none')[:120]}; "
+              f"running: {', '.join(running) or 'none'}")
+    window_budget = max(0, 400 - len(prefix) - len(suffix))
+    windows = (", ".join(titles) or "none")[:window_budget]
+    return (prefix + windows + suffix)[:400]
+
+
+def _morning_rule(context):
+    return (context["first_today"] and 5 <= context["now"].hour < 11
+            and context.get("morning_workflow") is not None)
+
+
+def _morning_question(context):
+    return f"Morning. Want me to run {context['morning_workflow']['name']}?"
+
+
+def _morning_action(router, context):
+    return router._run_workflow(context["morning_workflow"]["name"])
+
+
+GREETING_RULES = [(_morning_rule, _morning_question, _morning_action)]
 
 
 def speak(text):
@@ -53,6 +124,47 @@ def _coingecko_price(query):
     ).json()
     d = p.get(coin["id"], {})
     return coin.get("name", coin["id"]), d.get("usd"), d.get("usd_24h_change")
+
+
+_WEATHER_CODES = {
+    0: "clear", 1: "mostly clear", 2: "partly cloudy", 3: "overcast",
+    45: "foggy", 48: "foggy", 51: "light drizzle", 53: "drizzle",
+    55: "heavy drizzle", 61: "light rain", 63: "rain", 65: "heavy rain",
+    71: "light snow", 73: "snow", 75: "heavy snow", 77: "snow grains",
+    80: "rain showers", 81: "rain showers", 82: "heavy rain showers",
+    85: "snow showers", 86: "heavy snow showers", 95: "thunderstorms",
+    96: "thunderstorms with hail", 99: "thunderstorms with hail",
+}
+
+
+def _open_meteo(location):
+    """Fetch current and today's weather; only the location string is geocoded."""
+    import requests
+    geo = requests.get(
+        "https://geocoding-api.open-meteo.com/v1/search",
+        params={"name": location, "count": 1, "language": "en", "format": "json"},
+        timeout=6)
+    geo.raise_for_status()
+    places = geo.json().get("results") or []
+    if not places:
+        raise ValueError("location not found")
+    place = places[0]
+    forecast = requests.get(
+        "https://api.open-meteo.com/v1/forecast",
+        params={"latitude": place["latitude"], "longitude": place["longitude"],
+                "current": "temperature_2m,apparent_temperature,weather_code",
+                "daily": "temperature_2m_max,temperature_2m_min",
+                "forecast_days": 1, "timezone": "auto"}, timeout=6)
+    forecast.raise_for_status()
+    data = forecast.json()
+    current, daily = data["current"], data["daily"]
+    return {"place": place.get("name") or location,
+            "temp": current["temperature_2m"],
+            "feels": current["apparent_temperature"],
+            "condition": _WEATHER_CODES.get(current.get("weather_code"),
+                                              "unknown conditions"),
+            "high": daily["temperature_2m_max"][0],
+            "low": daily["temperature_2m_min"][0]}
 
 
 _app_cache = {"t": 0.0, "apps": {}}
@@ -261,7 +373,9 @@ def _workflow_slug(text):
 class Router:
     def __init__(self, cfg, *, workflow_store=None, workflow_runner=None,
                  intent_parser=None, agent_runner=None, clock=None,
-                 layout_supplier=None, apps_supplier=None):
+                 layout_supplier=None, apps_supplier=None, now_fn=None,
+                 windows_supplier=None, monitors_supplier=None,
+                 state_path=None, intent_log_path=None):
         self.cfg = cfg
         self.workflows = workflow_store or RecipeStore()
         self.workflow_progress_fn = lambda _name, _i, _n, _text: None
@@ -274,6 +388,12 @@ class Router:
         self.clock = clock or time.monotonic
         self.layout_supplier = layout_supplier
         self.apps_supplier = apps_supplier or installed_apps
+        self.now_fn = now_fn or datetime.datetime.now
+        self.windows_supplier = windows_supplier
+        self.monitors_supplier = monitors_supplier
+        self.state_path = Path(state_path) if state_path else DATA_DIR / "live_state.json"
+        self.intent_log_path = (Path(intent_log_path) if intent_log_path else
+                                DATA_DIR / "intent_log.jsonl")
         self._conversation = deque(maxlen=6)
         self._conversation_lock = threading.Lock()
         self._conversation_epoch = 0
@@ -345,7 +465,92 @@ class Router:
             raise RuntimeError("workflow question bridge unavailable")
         return self.workflow_ask_fn(text, cancel_event)
 
+    def _machine_context(self):
+        return machine_context(
+            workflows=self.workflows.names(),
+            workflow_running=self.workflow_runner.running,
+            agent_running=self.agent_runner.running,
+            now=self.now_fn(), windows_supplier=self.windows_supplier,
+            monitors_supplier=self.monitors_supplier)
+
+    def _log_intent(self, text, action, *, arg=None, source, context_chars=None):
+        record = {"ts": self.now_fn().isoformat(), "text": str(text),
+                  "action": str(action), "source": source}
+        if arg is not None:
+            record["arg"] = str(arg)
+        if context_chars is not None:
+            record["context_chars"] = int(context_chars)
+        try:
+            with _intent_log_lock:
+                self.intent_log_path.parent.mkdir(parents=True, exist_ok=True)
+                with self.intent_log_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            print(f"[intent-log] failed: {exc}")
+        _intent_log_local.count = getattr(_intent_log_local, "count", 0) + 1
+
+    def _fast(self, text, action, response, arg=None):
+        self._log_intent(text, action, arg=arg, source="fastpath")
+        return response
+
+    def claim_first_conversation_today(self):
+        """Atomically record a wake interaction and report if it is today's first."""
+        today = self.now_fn().date().isoformat()
+        with _live_state_lock:
+            state = {}
+            try:
+                state = json.loads(self.state_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                pass
+            first = state.get("last_conversation_date") != today
+            if first:
+                state["last_conversation_date"] = today
+                try:
+                    self.state_path.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = self.state_path.with_suffix(".json.tmp")
+                    temporary.write_text(json.dumps(state, indent=2) + "\n",
+                                         encoding="utf-8")
+                    temporary.replace(self.state_path)
+                except OSError as exc:
+                    print(f"[live-state] failed: {exc}")
+            return first
+
+    def proactive_greeting(self, first_today):
+        recipes = self.workflows.list()
+        morning = next((recipe for recipe in recipes if any(
+            re.search(r"day|morning", str(value), re.IGNORECASE)
+            for value in [recipe.get("name", ""), *recipe.get("triggers", [])])), None)
+        context = {"now": self.now_fn(), "first_today": bool(first_today),
+                   "morning_workflow": morning}
+        for predicate, question, action in GREETING_RULES:
+            if not predicate(context):
+                continue
+
+            def handle(answer, selected=action, values=context):
+                heard = normalize_workflow(answer)
+                if heard in {"yes", "yeah", "yep", "sure", "okay", "ok"}:
+                    return selected(self, values)
+                if heard in {"no", "nope", "cancel", "never mind", "nevermind"}:
+                    return "Okay."
+                return Question("Please say yes or no.", handle)
+            return Question(question(context), handle, cancel_text="Okay.")
+        return None
+
     def handle(self, text):
+        """Resolve one utterance and ensure the decision corpus gets one row."""
+        before = getattr(_intent_log_local, "count", 0)
+        response = self._handle_impl(text)
+        if getattr(_intent_log_local, "count", 0) == before:
+            heard = normalize_workflow(text)
+            first = heard.split()[0] if heard else "unknown"
+            aliases = {"launch": "open", "start": "open", "navigate": "switch",
+                       "focus": "switch", "google": "search", "write": "type",
+                       "run": "workflow", "save": "save_layout", "remember": "save_layout",
+                       "what": "help"}
+            self._log_intent(text, aliases.get(first, first), source="fastpath")
+        return response
+
+    def _handle_impl(self, text):
         """Return a short spoken response for a command."""
         t = text.strip().rstrip(".!?").lower()
         # Spoken commands come wrapped in politeness — strip it so the verb
@@ -409,7 +614,8 @@ class Router:
 
         explicit_workflow = re.match(r"^run\s+(?:my\s+|the\s+)?(.+?)\s+workflow$", t)
         if explicit_workflow:
-            return self._run_workflow(explicit_workflow.group(1).strip())
+            arg = explicit_workflow.group(1).strip()
+            return self._fast(text, "workflow", self._run_workflow(arg), arg)
 
         desktop = _parse_desktop(t)
         if desktop:
@@ -431,16 +637,26 @@ class Router:
                 recipe, progress=lambda i, total, description:
                 self.workflow_progress_fn(recipe["name"], i, total, description),
                 complete=self.workflow_complete_fn)
-            return (f"Running workflow {recipe['name']}." if started
-                    else "A workflow is already running.")
+            response = (f"Running workflow {recipe['name']}." if started
+                        else "A workflow is already running.")
+            return self._fast(text, "workflow", response, recipe["name"])
 
         explicit = re.match(
             r"^(?:ask\s+(codex|claude)\s+to|send\s+to\s+(codex|claude))\s+(.+)$",
             text.strip().rstrip(".!?"), re.IGNORECASE)
         if explicit:
-            return self._confirm_agent(
+            return self._fast(text, "agent", self._confirm_agent(
                 explicit.group(3).strip(),
-                (explicit.group(1) or explicit.group(2)).lower())
+                (explicit.group(1) or explicit.group(2)).lower()),
+                explicit.group(3).strip())
+
+        # --- weather ---
+        weather = (re.match(r"^weather in (.+)$", t)
+                   or re.match(r"^(?:what(?:'?s| is) )?(?:the )?weather(?: today| now| like)?$", t))
+        if weather:
+            place = (weather.group(1).strip() if weather.lastindex else
+                     self.cfg.get("weather_location", "Dubai"))
+            return self._fast(text, "weather", self._weather(place), place)
 
         # --- crypto price ---
         if any(k in t for k in ("price", "how much", "trading at", "worth")):
@@ -450,12 +666,13 @@ class Router:
                  or re.search(r"^(.+?) price$", t))
             if m:
                 q = _strip_tails(m.group(1).strip())
-                return self._price(q)
+                return self._fast(text, "price", self._price(q), q)
 
         # --- discoverability ---
         if re.search(r"^(what can you do|help|commands|what do you do)$", t):
             return ("I can open apps: say open WhatsApp. Switch windows: say "
                     "switch to Chrome. Check crypto: say price of bitcoin. "
+                    "Check weather: say weather in Paris. "
                     "Search the web: say search for something. Anything else, "
                     "I answer with the local model.")
 
@@ -472,11 +689,13 @@ class Router:
         # --- switch to an open window ---
         m = re.search(r"^(?:switch to|go to|navigate to|focus|bring up) (.+)", t)
         if m:
-            return self._switch(m.group(1).strip())
+            arg = m.group(1).strip()
+            return self._fast(text, "switch", self._switch(arg), arg)
 
         m = re.search(r"^close (.+)", t)
         if m:
-            return self._close(m.group(1).strip())
+            arg = m.group(1).strip()
+            return self._fast(text, "close", self._close(arg), arg)
 
         # --- open an app or site ---
         m = re.search(r"^(?:open|launch|start) (.+)", t)
@@ -484,17 +703,21 @@ class Router:
             names = [re.sub(r"^open\s+", "", part.strip())
                      for part in m.group(1).split(" and ")]
             if len(names) > 1 and all(names):
-                return " ".join(filter(None, (self._open(name) for name in names)))
-            return self._open(m.group(1).strip())
+                response = " ".join(filter(None, (self._open(name) for name in names)))
+                return self._fast(text, "open", response, ", ".join(names))
+            arg = m.group(1).strip()
+            return self._fast(text, "open", self._open(arg), arg)
 
         # --- web search ---
         m = re.search(r"^(?:search|google|look up)(?: for)? (.+)", t)
         if m:
-            return self._search(m.group(1).strip())
+            arg = m.group(1).strip()
+            return self._fast(text, "search", self._search(arg), arg)
 
         m = re.search(r"^(?:type|write) (.+)", t)
         if m:
-            return self._type(m.group(1))
+            arg = m.group(1)
+            return self._fast(text, "type", self._type(arg), arg)
 
         # --- fallback: ask the LLM ---
         return self._fallback(text)
@@ -567,6 +790,15 @@ class Router:
         name, price, chg = res
         chg_s = f", {chg:+.1f} percent in the last day" if chg is not None else ""
         return f"{name} is {_fmt_price(price)}{chg_s}."
+
+    def _weather(self, location):
+        try:
+            value = _open_meteo(location)
+            return (f"{value['place']} is {value['temp']:.0f} degrees, feels like "
+                    f"{value['feels']:.0f}, {value['condition']}. Today's high is "
+                    f"{value['high']:.0f} and low is {value['low']:.0f}.")
+        except Exception:
+            return "The weather service didn't answer."
 
     def _switch(self, name):
         title = switch_to(name)
@@ -768,14 +1000,15 @@ class Router:
     def _fallback(self, text):
         import llm
         contextual_text = self._conversation_text(text)
+        state = self._machine_context()
         workflow_context = [
             {"name": recipe["name"], "triggers": recipe.get("triggers", [])}
             for recipe in self.workflows.list()
         ]
-        raw, _ = llm.chain(
+        raw, lane = llm.chain(
             self.cfg["cleanup"],
-            'Extract the voice-command intent. Reply with STRICT JSON only: '
-            '{"action":"open|close|switch|price|search|type|keys|workflow|save_layout|agent|answer",'
+            state + '\nExtract the voice-command intent. Reply with STRICT JSON only: '
+            '{"action":"open|close|switch|price|weather|search|type|keys|workflow|save_layout|agent|answer",'
             '"arg":"<string>"}. Available workflows: '
             + json.dumps(workflow_context) + '. Use workflow for requests '
             'to run a named workflow or recipe. Never split a request that runs '
@@ -786,12 +1019,23 @@ class Router:
             'always answer, never agent. Use answer for all questions and conversation. '
             'Keys arg must be one of: new tab, reopen tab, next tab, previous tab, '
             'refresh, go back, go forward. If the current utterance is an affirmation '
-            'after You said a suggested command, map it to that command action.',
+            'after You said a suggested command, map it to that command action. '
+            'Examples: "price of bitcoin" -> price; "what is the weather like" '
+            '-> weather; "weather in Paris" -> weather with arg Paris. '
+            'Use the machine snapshot to ground answers such as which tabs or windows '
+            'are open and prefer workflow/skill actions using real window names.',
             contextual_text, max_tokens=80,
+            cloud_system='Extract intent as strict JSON with action and arg; no machine context.',
             local_only=self.cfg.get("local_only", True))
+        if raw is None and lane is None:
+            self._log_intent(text, "offline", arg="", source="llm",
+                             context_chars=len(state))
+            return OFFLINE_LINE
         intent = self._parse_intent(raw)
         if intent and intent[0] != "answer" and intent[1].strip():
             action, arg = intent
+            self._log_intent(text, action, arg=arg, source="llm",
+                             context_chars=len(state))
             if action == "agent":
                 return self._confirm_agent(arg.strip())
             if action == "workflow":
@@ -800,6 +1044,7 @@ class Router:
                 return self._save_layout(arg.strip())
             handlers = {"open": self._open, "close": self._close,
                         "switch": self._switch, "price": self._price,
+                        "weather": self._weather,
                         "search": self._search, "type": self._type,
                         "keys": self._named_keys}
             return handlers[action](arg.strip())
@@ -815,28 +1060,36 @@ class Router:
                         triggers=[trigger], taught_confirmation=True,
                         agent_runner=self.agent_runner)
                 if heard in {"no", "nope", "cancel", "never mind", "nevermind"}:
-                    return self._chat_answer(contextual_text)
+                    return self._chat_answer(contextual_text, state)[0]
                 return Question("Please say yes or no.", teach,
                                 cancel_text="Okay.")
+            self._log_intent(text, "answer", arg="", source="llm",
+                             context_chars=len(state))
             return Question("I don't know how to do that yet. Teach me the steps?",
                             teach, cancel_text="Okay.")
-        return self._chat_answer(contextual_text)
+        answer, _lane = self._chat_answer(contextual_text, state)
+        self._log_intent(text, "answer" if answer != OFFLINE_LINE else "offline",
+                         arg="", source="llm", context_chars=len(state))
+        return answer
 
-    def _chat_answer(self, contextual_text):
+    def _chat_answer(self, contextual_text, state):
         import llm
         out, _ = llm.chain(
             self.cfg["cleanup"],
-            "You are a terse voice assistant. Answer in one or two spoken sentences, "
+            state + "\nYou are a terse voice assistant. Answer in one or two spoken sentences, "
             "no markdown. You control this PC ONLY through these listed skills: "
             "open, close, switch, crypto price, web search, type text, browser keys, "
             "workflows, and agent dispatch. Never offer an action outside that list. "
             "Never say you can do an action without doing it. The intent lane already "
             "handles actions; this lane answers questions and gives brief acknowledgements. "
             "If the user seems to want an action, suggest the exact spoken command, for "
-            "example: Say: open chrome.",
+            "example: Say: open chrome. Use the machine snapshot to ground answers "
+            "such as which tabs or windows are open and prefer workflow/skill actions "
+            "using real window names.",
             contextual_text, max_tokens=200,
+            cloud_system="You are a terse voice assistant. Answer in one or two spoken sentences.",
             local_only=self.cfg.get("local_only", True))
-        return out or "I couldn't reach the assistant."
+        return out or OFFLINE_LINE, _
 
     def _named_keys(self, operation):
         mapping = {
@@ -891,7 +1144,7 @@ class Router:
             if not isinstance(value, dict):
                 continue
             action, arg = value.get("action"), value.get("arg")
-            if (action in {"open", "close", "switch", "price", "search",
+            if (action in {"open", "close", "switch", "price", "weather", "search",
                            "type", "keys", "workflow", "save_layout", "agent", "answer"} and isinstance(arg, str)):
                 return action, arg
         return None
