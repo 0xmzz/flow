@@ -55,7 +55,8 @@ def client_self_update():
     if vfile.exists() and vfile.read_text().strip() == ver:
         return
     for f in ("flow.py", "store.py", "llm.py", "commands.py", "supervisor.py",
-              "flow.ico"):
+              "workflows.py", "agents.py", "winctl.py", "speech.py", "hud.py",
+              "live.py", "flow.ico"):
         try:
             data = urllib.request.urlopen(url + "/client/file/" + f, timeout=20).read()
             (APP / f).write_bytes(data)

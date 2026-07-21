@@ -264,7 +264,9 @@ def make_server(flow, host, port, token):
                 d = Path(__file__).parent
                 h = hashlib.sha1()
                 for f in ("flow.py", "store.py", "llm.py", "commands.py",
-                          "supervisor.py", "flow.ico"):
+                          "supervisor.py", "workflows.py", "agents.py",
+                          "winctl.py", "speech.py", "hud.py", "live.py",
+                          "flow.ico"):
                     p = d / f
                     if p.exists():
                         h.update(p.read_bytes())
@@ -273,7 +275,9 @@ def make_server(flow, host, port, token):
                 from pathlib import Path
                 name = path.split("/")[-1]
                 allowed = {"flow.py", "store.py", "llm.py", "commands.py",
-                           "supervisor.py", "flow.ico"}
+                           "supervisor.py", "workflows.py", "agents.py",
+                           "winctl.py", "speech.py", "hud.py", "live.py",
+                           "flow.ico"}
                 if name not in allowed:
                     return self._json(404, {"error": "not found"})
                 f = Path(__file__).parent / name

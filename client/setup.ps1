@@ -18,7 +18,7 @@ if (-not $py -or -not (& python --version 2>$null)) {
 }
 
 # 2) App files
-foreach ($f in @("flow.py", "store.py", "llm.py", "commands.py", "supervisor.py", "flow.ico")) {
+foreach ($f in @("flow.py", "store.py", "llm.py", "commands.py", "supervisor.py", "workflows.py", "agents.py", "winctl.py", "speech.py", "hud.py", "live.py", "flow.ico")) {
     Invoke-WebRequest -Uri "$URL/client/file/$f" -OutFile "$DIR\$f" -UseBasicParsing
 }
 
