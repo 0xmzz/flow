@@ -144,7 +144,31 @@ KNOWN_SITES = {
 }
 
 ROUTER_VERBS = ("open", "reopen", "launch", "start", "close", "switch", "navigate", "search", "google",
-                "price", "type", "write", "help", "run", "put", "move", "place", "arrange")
+                "price", "type", "write", "help", "run", "put", "move", "place", "arrange",
+                "save", "remember")
+
+APP_EXE_NAMES = {
+    "chrome.exe": "chrome", "msedge.exe": "edge",
+    "code.exe": "visual studio code", "windowsterminal.exe": "terminal",
+    "explorer.exe": "file explorer",
+}
+
+
+def openable_app(exe, title="", apps=None):
+    """Map a process/window identity to a name accepted by ``open_app``."""
+    exe_key = os.path.basename(str(exe or "")).casefold()
+    if exe_key in APP_EXE_NAMES:
+        return APP_EXE_NAMES[exe_key]
+    apps = installed_apps() if apps is None else apps
+    stem = os.path.splitext(exe_key)[0]
+    match = _match(stem, apps) if stem else None
+    if match:
+        return match
+    suffix = re.search(r"\s[-–—]\s([^–—-]+)$", str(title or ""))
+    match = _match(suffix.group(1).strip(), apps) if suffix else None
+    return match
+
+
 _TAIL_RE = re.compile(
     r"\s+(?:right\s+now|at\s+the\s+moment|real\s+quick|for\s+me|currently|"
     r"quickly|today|please|now)\s*$")
@@ -236,7 +260,8 @@ def _workflow_slug(text):
 
 class Router:
     def __init__(self, cfg, *, workflow_store=None, workflow_runner=None,
-                 intent_parser=None, agent_runner=None, clock=None):
+                 intent_parser=None, agent_runner=None, clock=None,
+                 layout_supplier=None, apps_supplier=None):
         self.cfg = cfg
         self.workflows = workflow_store or RecipeStore()
         self.workflow_progress_fn = lambda _name, _i, _n, _text: None
@@ -247,6 +272,8 @@ class Router:
         self.agent_complete_fn = lambda _result: None
         self.agent_runner = agent_runner or AgentRunner()
         self.clock = clock or time.monotonic
+        self.layout_supplier = layout_supplier
+        self.apps_supplier = apps_supplier or installed_apps
         self._conversation = deque(maxlen=6)
         self._conversation_lock = threading.Lock()
         self._conversation_epoch = 0
@@ -373,6 +400,9 @@ class Router:
             return creation_dialog(
                 m.group(1).strip(), self.workflows, self.parse_action,
                 agent_runner=self.agent_runner)
+        m = re.match(r"^(?:save this (?:layout|setup)|remember this layout) as (.+)$", t)
+        if m:
+            return self._save_layout(m.group(1).strip())
 
         if re.search(r"^run .+\bthen\s+(?:ask\s+(?:codex|claude)\s+to|send\s+to\s+(?:codex|claude))\b", t):
             return "I can't split that into commands. Teach it as a workflow instead."
@@ -595,6 +625,70 @@ class Router:
         return (f"{placed['title'][:40]} on monitor {placed['monitor']}, "
                 f"{region_text}.")
 
+    def _place_rect_step(self, step):
+        from winctl import place_window_rect
+        try:
+            placed = place_window_rect(
+                step["arg"], step["monitor"], step["x"], step["y"],
+                step["w"], step["h"])
+        except (OSError, RuntimeError, ValueError) as exc:
+            return f"I couldn't place {step['arg']}: {exc}"
+        return (f"{placed['title'][:40]} on monitor {placed['monitor']}, custom position."
+                if placed else f"I couldn't find {step['arg']} to place.")
+
+    def _save_layout(self, name):
+        from winctl import snapshot_layout
+        snapshot = (self.layout_supplier or snapshot_layout)()
+        apps = self.apps_supplier()
+        grouped = {}
+        for item in snapshot:
+            grouped.setdefault(str(item.get("exe") or "").casefold(), []).append(item)
+        steps, summary, skipped = [], [], []
+        for items in grouped.values():
+            first = items[0]
+            app = openable_app(first["exe"], first["title"], apps)
+            if not app:
+                skipped.extend(item["title"] for item in items)
+                continue
+            titles = {normalize_workflow(item["title"]) for item in items}
+            query = first["title"] if len(titles) > 1 else app
+            steps.extend([{"do": "open", "arg": app},
+                          {"do": "wait_window", "arg": query, "timeout_s": 15}])
+            if first.get("do") == "place_rect":
+                steps.append({key: first[key] for key in
+                              ("do", "monitor", "x", "y", "w", "h")} |
+                             {"arg": query})
+                where = "custom position"
+            else:
+                steps.append({"do": "place", "arg": query,
+                              "monitor": first["monitor"], "region": first["region"]})
+                where = first["region"].replace("-", " ")
+            summary.append(f"{app} monitor {first['monitor']} {where}")
+        if not steps:
+            detail = f" Skipped: {', '.join(skipped)}." if skipped else ""
+            return "I couldn't find any openable windows to save." + detail
+        recipe = {"name": name, "triggers": [name], "steps": steps,
+                  "comment": "Captured from the current virtual desktop only."}
+
+        def save():
+            self.workflows.save(recipe)
+            result = f"Saved {len(summary)} windows: {', '.join(summary)}. Say '{name}' any time."
+            if skipped:
+                result += " Skipped: " + ", ".join(skipped) + "."
+            return result
+
+        if self.workflows.get(name):
+            def replace(answer):
+                heard = normalize_workflow(answer)
+                if heard in {"replace", "yes", "confirm"}:
+                    return save()
+                if heard in {"cancel", "no", "never mind", "nevermind"}:
+                    return "Layout save cancelled."
+                return Question("Please say replace or cancel.", replace)
+            return Question(f"A workflow named {name} already exists. Replace or cancel?",
+                            replace)
+        return save()
+
     @staticmethod
     def _desktop(direction):
         if direction not in {"next", "previous"}:
@@ -681,7 +775,7 @@ class Router:
         raw, _ = llm.chain(
             self.cfg["cleanup"],
             'Extract the voice-command intent. Reply with STRICT JSON only: '
-            '{"action":"open|close|switch|price|search|type|keys|workflow|agent|answer",'
+            '{"action":"open|close|switch|price|search|type|keys|workflow|save_layout|agent|answer",'
             '"arg":"<string>"}. Available workflows: '
             + json.dumps(workflow_context) + '. Use workflow for requests '
             'to run a named workflow or recipe. Never split a request that runs '
@@ -702,6 +796,8 @@ class Router:
                 return self._confirm_agent(arg.strip())
             if action == "workflow":
                 return self._run_workflow(arg.strip())
+            if action == "save_layout":
+                return self._save_layout(arg.strip())
             handlers = {"open": self._open, "close": self._close,
                         "switch": self._switch, "price": self._price,
                         "search": self._search, "type": self._type,
@@ -796,6 +892,6 @@ class Router:
                 continue
             action, arg = value.get("action"), value.get("arg")
             if (action in {"open", "close", "switch", "price", "search",
-                           "type", "keys", "workflow", "agent", "answer"} and isinstance(arg, str)):
+                           "type", "keys", "workflow", "save_layout", "agent", "answer"} and isinstance(arg, str)):
                 return action, arg
         return None

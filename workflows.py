@@ -20,7 +20,7 @@ import time
 
 PRIMITIVES = frozenset({
     "open", "close", "switch", "price", "search", "type", "keys",
-    "wait_s", "wait_window", "say", "ask", "place", "desktop",
+    "wait_s", "wait_window", "say", "ask", "place", "place_rect", "desktop",
     "agent", "run", "if_window",
 })
 
@@ -67,6 +67,14 @@ def _validate_step(step):
             return False
         monitor = step.get("monitor")
         if monitor is not None and (not isinstance(monitor, int) or monitor < 1):
+            return False
+    if step["do"] == "place_rect":
+        if not isinstance(step["arg"], str) or not step["arg"].strip():
+            return False
+        values = [step.get(key) for key in ("monitor", "x", "y", "w", "h")]
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in values):
+            return False
+        if step["monitor"] < 1 or step["w"] < 1 or step["h"] < 1:
             return False
     if step["do"] == "desktop" and step["arg"] not in {"next", "previous"}:
         return False
@@ -344,15 +352,15 @@ class WorkflowRunner:
         if action in {"open", "close", "switch", "price", "search", "type",
                       "desktop"}:
             self._router_call(action, arg)
-        elif action == "place":
+        elif action in {"place", "place_rect"}:
             if self.router is not None:
-                self.router._place_step(step)
+                getattr(self.router, "_" + action + "_step")(step)
             elif callable(self.primitives):
                 self.primitives(action, dict(step))
             else:
-                fn = self.primitives.get("place")
+                fn = self.primitives.get(action)
                 if fn is None:
-                    raise RuntimeError("workflow primitive unavailable: place")
+                    raise RuntimeError(f"workflow primitive unavailable: {action}")
                 fn(dict(step))
         elif action == "keys":
             self.key_sender(str(arg))
