@@ -338,7 +338,7 @@ class Recorder:
         except Exception:
             return None, None
 
-    def _open(self):
+    def _open(self, _reinit=True):
         self.device_index, self.device_name = self.resolve_device(self.device_spec)
         try:
             self._stream = sd.InputStream(
@@ -350,6 +350,19 @@ class Recorder:
         except Exception as e:
             self._stream = None
             print(f"[mic] open failed: {e}")
+            # PaErrorCode -9996 (Invalid device) means PortAudio's device
+            # table went stale — a mic was (un)plugged after init, so cached
+            # indices no longer line up. Reinitialize PortAudio so it
+            # re-enumerates, then retry ONCE with a fresh index.
+            if _reinit and "-9996" in str(e):
+                try:
+                    sd._terminate()
+                    sd._initialize()
+                    print("[mic] reinitialized audio backend after device change")
+                except Exception as re:
+                    print(f"[mic] backend reinit failed: {re}")
+                    return
+                self._open(_reinit=False)
 
     def retarget(self, spec):
         """Move to another input device, discarding the stale pre-roll."""
