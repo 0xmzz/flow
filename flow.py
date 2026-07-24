@@ -178,6 +178,16 @@ DEFAULTS = {
         "dir": "data",             # relative to this file
         "archive_audio": False,    # also keep paired audio for a fine-tuning corpus
     },
+    "export": {
+        "enabled": False,
+        "dest": "",
+        "mode": "folder",
+        "git_remote": "",
+        "include": {"history": True, "workflows": True, "intents": True,
+                    "audio": False},
+        "interval_min": 60,
+        "redact": [],
+    },
     "server": {
         "enabled": False,          # expose an ASR endpoint for phones over Tailscale
         "host": "0.0.0.0",         # bind all interfaces (reach via tailnet IP)
@@ -994,7 +1004,7 @@ class Flow:
         # Session transitions happen on two threads (hotkey ctrl-loop and HTTP
         # request threads); this lock makes each check-then-mutate atomic.
         self._session_lock = threading.Lock()
-        self.router = Router(self.cfg)
+        self.router = Router(self.cfg, export_fn=self._export_voice)
         threading.Thread(target=self._ctrl_loop, daemon=True,
                          name="hotkey-ctrl").start()
         self.started_at = time.time()
@@ -1045,6 +1055,9 @@ class Flow:
                 print(f"[live] disabled: model/VAD startup failed ({e})")
         if self.cfg["cleanup"]["enabled"] and self.cfg["cleanup"]["provider"] == "ollama":
             threading.Thread(target=self._warm_ollama, daemon=True).start()
+        if self.cfg.get("export", {}).get("enabled"):
+            threading.Thread(target=self._export_loop, daemon=True,
+                             name="flow-export").start()
         print(f"Model ready in {time.time() - t0:.1f}s. "
               f"Hold [{self.cfg['hotkey']}] to dictate, "
               f"[{self.cfg.get('command_hotkey')}] for a command; "
@@ -1068,6 +1081,27 @@ class Flow:
             except Exception as e:
                 print(f"[cleanup] warmup failed ({e}) — retrying in 60s")
                 time.sleep(60)
+
+    def _export_voice(self):
+        if not self.cfg.get("export", {}).get("enabled"):
+            raise RuntimeError("data export is off; enable it in config.json first")
+        from export import export_now
+        return export_now(self.cfg)
+
+    def _export_loop(self):
+        from export import export_now
+        event = threading.Event()
+        while True:
+            try:
+                minutes = max(
+                    1.0, float(self.cfg.get("export", {}).get(
+                        "interval_min", 60)))
+                event.wait(minutes * 60)
+                summary = export_now(self.cfg)
+                print(f"[export] scheduled: {summary['entries']} entries, "
+                      f"{summary['changed_days']} changed days")
+            except Exception as exc:
+                print(f"[export] scheduled run failed: {exc}")
 
     def mic_is_deaf(self, audio):
         """True when the captured audio is digital silence.
@@ -1327,7 +1361,7 @@ class Flow:
             # PRIVATE by default: transcript stored for their history page, but
             # no audio archive and the Hermes sweep skips it.
             dev = (window or "").split("|")[0].lower()
-            private = (source == "remote" and
+            private = (source.startswith("remote") and
                        not any(t in dev for t in self.cfg["trusted_devices"]))
             self.store.add(raw, source=source, window=window, duration_s=dur,
                            asr_s=asr_t, model=self.cfg["model"],
@@ -1688,6 +1722,12 @@ def cli_history(limit=30):
     print(f"\n{s['dictations']} dictations · {s['words']} words · {s['by_source']}")
 
 
+def cli_export():
+    from export import export_now
+    summary = export_now(load_config())
+    print(json.dumps(summary, ensure_ascii=False))
+
+
 def _setup_cuda_status():
     """Return (available, detail) without importing torch."""
     providers, count = [], 0
@@ -1759,6 +1799,7 @@ def setup_machine():
                     "parakeet").glob("**/*.onnx"))
     print(f"Kokoro cache: {'ready' if kokoro else 'missing'}")
     print(f"Parakeet cache: {'ready' if parakeet else 'missing'}")
+    print("Data export: available, off by default (set export.dest to opt in)")
 
     candidate = json.loads(json.dumps(DEFAULTS))
     candidate["input_device"] = input_name
@@ -1818,6 +1859,8 @@ if __name__ == "__main__":
         setup_machine()
     elif len(sys.argv) > 1 and sys.argv[1] in ("--history", "-H"):
         cli_history(int(sys.argv[2]) if len(sys.argv) > 2 else 30)
+    elif len(sys.argv) > 1 and sys.argv[1] == "--export":
+        cli_export()
     elif len(sys.argv) > 1 and sys.argv[1] in ("--devices", "-d"):
         cfg = load_config()
         index, name = Recorder.resolve_device(cfg.get("input_device"))

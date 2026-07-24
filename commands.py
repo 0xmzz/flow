@@ -374,7 +374,7 @@ class Router:
                  intent_parser=None, agent_runner=None, clock=None,
                  layout_supplier=None, apps_supplier=None, now_fn=None,
                  windows_supplier=None, monitors_supplier=None,
-                 state_path=None, intent_log_path=None):
+                 state_path=None, intent_log_path=None, export_fn=None):
         self.cfg = cfg
         custom_sites = cfg.get("sites") or {}
         if not isinstance(custom_sites, dict):
@@ -397,6 +397,7 @@ class Router:
         self.state_path = Path(state_path) if state_path else DATA_DIR / "live_state.json"
         self.intent_log_path = (Path(intent_log_path) if intent_log_path else
                                 DATA_DIR / "intent_log.jsonl")
+        self.export_fn = export_fn
         self._conversation = deque(maxlen=6)
         self._conversation_lock = threading.Lock()
         self._conversation_epoch = 0
@@ -479,6 +480,8 @@ class Router:
     def _log_intent(self, text, action, *, arg=None, source, context_chars=None):
         record = {"ts": self.now_fn().isoformat(), "text": str(text),
                   "action": str(action), "source": source}
+        if getattr(_intent_log_local, "private", False):
+            record["private"] = True
         if arg is not None:
             record["arg"] = str(arg)
         if context_chars is not None:
@@ -539,19 +542,24 @@ class Router:
             return Question(question(context), handle, cancel_text="Okay.")
         return None
 
-    def handle(self, text):
+    def handle(self, text, *, private=False):
         """Resolve one utterance and ensure the decision corpus gets one row."""
         before = getattr(_intent_log_local, "count", 0)
-        response = self._handle_impl(text)
-        if getattr(_intent_log_local, "count", 0) == before:
-            heard = normalize_workflow(text)
-            first = heard.split()[0] if heard else "unknown"
-            aliases = {"launch": "open", "start": "open", "navigate": "switch",
-                       "focus": "switch", "google": "search", "write": "type",
-                       "run": "workflow", "save": "save_layout", "remember": "save_layout",
-                       "what": "help"}
-            self._log_intent(text, aliases.get(first, first), source="fastpath")
-        return response
+        old_private = getattr(_intent_log_local, "private", False)
+        _intent_log_local.private = bool(private)
+        try:
+            response = self._handle_impl(text)
+            if getattr(_intent_log_local, "count", 0) == before:
+                heard = normalize_workflow(text)
+                first = heard.split()[0] if heard else "unknown"
+                aliases = {"launch": "open", "start": "open", "navigate": "switch",
+                           "focus": "switch", "google": "search", "write": "type",
+                           "run": "workflow", "save": "save_layout",
+                           "remember": "save_layout", "what": "help"}
+                self._log_intent(text, aliases.get(first, first), source="fastpath")
+            return response
+        finally:
+            _intent_log_local.private = old_private
 
     def _handle_impl(self, text):
         """Return a short spoken response for a command."""
@@ -581,6 +589,16 @@ class Router:
         if t in {"stop", "cancel"} and self.workflow_runner.running:
             self.workflow_runner.cancel()
             return "Cancelling workflow."
+        if re.fullmatch(r"(?:flow,?\s+)?export my data", t):
+            if self.export_fn is None:
+                return self._fast(text, "export", "Data export is not configured.")
+            try:
+                summary = self.export_fn()
+                name = Path(summary["dest"]).name or summary["dest"]
+                response = f"Exported {summary['entries']} entries to {name}."
+            except Exception as exc:
+                response = f"Export failed: {exc}"
+            return self._fast(text, "export", response)
 
         # Workflow management is explicit so recipe triggers cannot shadow it.
         if t == "list workflows":

@@ -166,6 +166,15 @@ Hourly cron on multivac: pull only new entries (`since=<cursor>`), summarize
 If beast is offline the sweep skips; the brief goes stale rather than falling
 back to a cloud API.
 
+## User-directed data export
+
+Export is off by default. When the user opts in and supplies an absolute folder
+or Git worktree, Flow maintains an agent-readable copy there: `CONTEXT.md`,
+local-day history shards, taught workflows, the intent corpus, and a manifest.
+Private entries are filtered before files or aggregate statistics are derived;
+audio requires a separate explicit opt-in. Git mode commits on the current
+branch and pushes only when `export.git_remote` is configured.
+
 ## Android app (`android/`)
 
 Zero-dependency Kotlin (one androidx artifact for FileProvider). Components:
@@ -190,7 +199,9 @@ Leaves your hardware, ever:
 2. **Open-Meteo** — only the configured or spoken location string is sent for
    geocoding; its derived coordinates are then sent to the forecast feed.
 
-That's the list. `local_only: true` (the default) makes `llm.chain` DROP any
+User-directed export is the one opt-in exception: its configured destination
+may be outside Flow's folder or in a Git worktree that the user chooses to push.
+`local_only: true` (the default) makes `llm.chain` DROP any
 lane whose endpoint isn't provably loopback before calling it — a cloud
 fallback that sneaks into config is skipped, not sanitized. (The old z.ai
 cleanup fallback is deactivated; re-enabling it requires both configuring it
