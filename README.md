@@ -1,92 +1,132 @@
 # Flow
 
-Local push-to-talk dictation for Windows. Hold a hotkey, speak, release — the
-transcription is pasted at your cursor. A self-hosted Wispr Flow: ASR runs
-entirely on your GPU, nothing leaves the machine unless you enable the optional
-LLM cleanup pass.
+**Voice control for Windows that runs entirely on your machine.**
 
-## Stack
+Hold a key to dictate anywhere. Press F9 to talk to your computer — open things,
+arrange windows, ask questions, hand hard jobs to a coding agent. Teach it a
+routine once by speaking it, and it replays forever.
 
-- **ASR**: [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
-  (`large-v3-turbo` by default) on CUDA
-- **Hotkey/paste**: `keyboard` global hook + clipboard paste (clipboard restored after)
-- **Cleanup (optional)**: any Anthropic or OpenAI-compatible endpoint strips
-  filler words and fixes punctuation without rephrasing
-- Tray icon: grey = idle, red = recording, amber = transcribing
+No account. No subscription. No audio leaves your PC.
 
-## Setup
+```
+you:  "flow, save this layout as start the day"
+flow: "Saved 4 windows: chrome monitor 1 right, code monitor 2 full.
+       Say 'start the day' any time."
+
+(next morning)
+you:  "hey flow"
+flow: "Morning. Want me to run start the day?"
+you:  "yes"
+```
+
+## What it does
+
+**Dictation.** Hold a hotkey, speak, release — text appears at your cursor in
+any app. Words commit *while you're still talking*, so a 30-second dictation
+lands ~0.8s after you let go. An optional local LLM pass adapts tone per app
+(casual in WhatsApp, precise in a terminal).
+
+**Live mode (F9).** Always-listening command mode. Say the wake word once and
+you're in a conversation — no repeating it every sentence. End-of-speech to
+action is ~0.4s.
+
+- *"open chrome"*, *"close the tab"*, *"navigate to github"*, *"next desktop"*
+- *"put chrome on the left half of monitor 2"*
+- *"what's the weather"*, *"price of bitcoin"*
+- *"type dear sir, thank you for your patience"*
+
+**Workflows it learns from you.** Two ways to teach it:
+
+- *Snapshot* — arrange your screen, then say *"save this layout as work mode"*.
+  It reads which windows are open and where each one sits, and writes a recipe
+  that rebuilds it.
+- *Dialog* — ask for something it doesn't know and it offers: *"I don't know how
+  to do that yet. Teach me the steps?"* Speak them one at a time. It saves the
+  result under the phrase you originally used.
+
+Workflows can call other workflows, branch on what's open, and end by handing a
+real task to a coding agent.
+
+**Agent hand-off.** *"flow, ask codex to add retry logic to the upload script"* —
+it confirms, dispatches to a CLI agent on your machine, streams progress into
+the panel, and speaks a summary when done. Works with whichever agent CLI you
+already use.
+
+## Privacy is the architecture, not a policy
+
+Speech recognition, the assistant brain, and the voice all run on your hardware.
+`local_only` is **enforced in code**, not promised in a README: the LLM chain
+drops any endpoint that isn't provably loopback before calling it, and tests
+fail the build if that stops being true.
+
+The only things that ever leave the machine are the ones you'd expect: a city
+name if you ask for weather, a coin name if you ask for a price, and whatever
+you explicitly hand to an agent.
+
+## Requirements
+
+| | Minimum | Recommended |
+|---|---|---|
+| OS | Windows 10/11 | — |
+| Dictation | CPU (slower) | NVIDIA GPU, 6GB+ |
+| Live mode | CPU (~0.6s) | NVIDIA GPU (~0.1s) |
+| Assistant brain | *optional* — skills and workflows work without it | [Ollama](https://ollama.com) + `qwen3:8b` |
+
+Everything degrades rather than breaks: no GPU falls back to CPU, no Ollama
+means the fast paths and workflows still work.
+
+## Install
 
 ```powershell
+git clone <repo> flow; cd flow
 python -m venv .venv
-.venv\Scripts\pip install faster-whisper sounddevice numpy keyboard pyperclip pystray pillow requests nvidia-cublas-cu12 nvidia-cudnn-cu12
-.venv\Scripts\python flow.py
+.venv\Scripts\pip install -r requirements.txt
+.venv\Scripts\python flow.py --setup
 ```
 
-First run downloads the model (~1.6 GB) and writes `config.json`.
+`--setup` checks your GPU, microphones, and Ollama, then writes a config that
+matches your machine. First run downloads the speech models (~2GB).
 
-## Usage
+Then run `.venv\Scripts\pythonw flow.py` — or put `flow.vbs` in your Startup
+folder to have it there every boot.
 
-Hold **F8**, speak, release. Text appears at your cursor.
+## Under the hood
 
-## Config (`config.json`)
-
-| key | meaning |
+| Layer | What runs |
 |---|---|
-| `hotkey` | hold-to-talk key (any `keyboard` lib name) |
-| `model` | faster-whisper model id (`large-v3-turbo`, `distil-large-v3`, ...) |
-| `language` | `null` = auto-detect, or e.g. `"en"` |
-| `cleanup.enabled` | LLM cleanup pass on/off |
-| `cleanup.provider` | `anthropic` or `openai` (any OpenAI-compatible `base_url`) |
-| `cleanup.api_key_env` | env var holding the API key (default `FLOW_API_KEY`) |
-| `paste_mode` | `clipboard` (fast) or `type` (simulated keystrokes) |
+| Dictation ASR | faster-whisper `large-v3` (CUDA fp16), streaming commit-at-pauses |
+| Live-mode ASR | NVIDIA Parakeet-TDT-0.6b (ONNX), Silero VAD endpointing |
+| Brain | Ollama `qwen3:8b` — fast paths first, model only when needed |
+| Voice | Kokoro neural TTS (ONNX), SAPI fallback |
+| Window control | Win32 via ctypes — no automation dependencies |
 
-## History / data collection
+The design rule throughout: **known things instantly, understood things in half
+a second, hard things handed off.** Every command you use pushes more of your
+traffic into the instant tier.
 
-Every dictation is appended to `data/history.jsonl` (id, timestamp, text, source,
-duration, model). Nothing leaves the machine.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for how the pieces fit and why each
+decision was made the way it was.
+
+## Beyond the desktop
+
+Flow can also run as a small server on your own network: phone dictation (an
+Android bubble app, or any Whisper-compatible keyboard), a Linux-VM bridge, and
+thin-client PCs that auto-update from the host. All optional, all off by
+default — see ARCHITECTURE.md.
+
+## Command reference
 
 ```powershell
-.venv\Scripts\python flow.py --history 30   # last 30 dictations
-.venv\Scripts\python flow.py --stats        # totals
+.venv\Scripts\python flow.py --setup      # check this machine, write a config
+.venv\Scripts\python flow.py --devices    # list microphones with live levels
+.venv\Scripts\python flow.py --history 30 # last 30 dictations
+.venv\Scripts\python flow.py --stats      # totals
 ```
 
-Set `history.archive_audio: true` to also keep the paired audio under
-`data/dataset/<date>/<id>.wav` — a fine-tuning-ready corpus of your own voice.
+Everything else lives in `config.json`: hotkeys, wake word, voice, conversation
+window, per-app tone profiles, personal vocabulary, and word replacements.
 
-## Server mode (dictate from your phone)
+## Status
 
-With `server.enabled: true`, Flow exposes an ASR endpoint on the local GPU.
-On first run it prints an auto-generated token (also saved to `config.json`).
-Reach it from any device on your Tailscale network:
-
-| route | purpose |
-|---|---|
-| `POST /transcribe` | wav body → `{"text": ...}` |
-| `POST /v1/audio/transcriptions` | OpenAI-Whisper-compatible (multipart `file`) — point any app that supports a custom Whisper endpoint here |
-| `GET /api/history` | recent dictations (JSON) |
-| `GET /` | browsable history page |
-| `GET /health` | liveness (no auth) |
-
-All routes except `/health` and `/` require `Authorization: Bearer <token>`.
-
-```bash
-# from the phone, over Tailscale (PC hostname "beast"):
-curl -X POST http://beast:8756/v1/audio/transcriptions \
-  -H "Authorization: Bearer <token>" -F file=@clip.wav
-```
-
-Windows Firewall: allow the port once (elevated PowerShell):
-
-```powershell
-New-NetFirewallRule -DisplayName "Flow ASR server" -Direction Inbound `
-  -Action Allow -Protocol TCP -LocalPort 8756 -Profile Any
-```
-
-## Autostart
-
-Create a shortcut to `.venv\Scripts\pythonw.exe flow.py` in `shell:startup`.
-
-## Roadmap
-
-- Android client (approach chosen via design pass — see below)
-- Streaming partials, per-app tone profiles
+Used daily by its author on Windows 11. Interfaces may still move.
+Issues and PRs welcome.

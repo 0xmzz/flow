@@ -6,10 +6,15 @@ TOKEN="$1"
 [ -z "$TOKEN" ] && { echo "usage: curl -s http://<host>:8756/vm/setup.sh | sudo bash -s -- <token>"; exit 1; }
 [ "$(id -u)" = 0 ] || { echo "run with sudo"; exit 1; }
 
-# Find the Flow host: the default gateway (the Hyper-V host), else known IPs.
+# Find the Flow host from FLOW_HOST or the current default gateway.
 GW=$(ip route | awk '/^default/ {print $3; exit}')
 HOST_URL=""
-for c in "$GW" 172.24.16.1 172.25.221.1; do
+OVERRIDE="${FLOW_HOST:-auto}"
+if [ "$OVERRIDE" != "auto" ]; then
+  HOST_URL="${OVERRIDE%/}"
+fi
+for c in "$GW"; do
+  [ -n "$HOST_URL" ] && break
   [ -z "$c" ] && continue
   if curl -s -m 3 "http://$c:8756/health" | grep -q '"ok"'; then
     HOST_URL="http://$c:8756"; break
@@ -26,7 +31,7 @@ mkdir -p /opt/vmflow
 curl -s "$HOST_URL/vm/daemon.py" -o /opt/vmflow/daemon.py
 
 cat > /etc/vmflow.env <<EOF
-FLOW_HOST=auto
+FLOW_HOST=$OVERRIDE
 FLOW_TOKEN=$TOKEN
 YDOTOOL_SOCKET=/run/ydotoold.sock
 EOF

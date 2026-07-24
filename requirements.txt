@@ -1,0 +1,38 @@
+# Flow — Windows voice control. Install into a venv:
+#   python -m venv .venv
+#   .venv\Scripts\pip install -r requirements.txt
+
+# --- core: hotkeys, audio capture, paste, tray ---
+keyboard==0.13.5
+sounddevice==0.5.5
+numpy>=2.0
+pyperclip==1.11.0
+pystray==0.19.5
+pillow>=11
+requests>=2.32
+comtypes==1.4.16          # SAPI voice fallback
+pycaw==20251023           # mute speakers while recording
+
+# --- dictation ASR ---
+faster-whisper==1.2.1
+av>=13                    # decode m4a/ogg uploads (phone clients)
+
+# --- live mode: streaming command ASR + endpointing ---
+onnx-asr==0.12.0          # NVIDIA Parakeet-TDT
+pysilero-vad==3.4.0
+
+# --- neural voice ---
+# NOTE: install with --no-deps. kokoro-onnx pins plain `onnxruntime`, which
+# overwrites the GPU build below and silently drops every model to CPU:
+#   .venv\Scripts\pip install --no-deps kokoro-onnx==0.5.0
+#   .venv\Scripts\pip install phonemizer-fork espeakng-loader
+kokoro-onnx==0.5.0
+
+# --- GPU runtime (skip on CPU-only machines; everything falls back) ---
+# onnxruntime-gpu must stay the CUDA 12 line: the current CUDA 13 builds have
+# no Windows DLL wheels, so the CUDA provider fails to load.
+onnxruntime-gpu==1.22.0
+nvidia-cublas-cu12
+nvidia-cudnn-cu12
+nvidia-cuda-runtime-cu12
+nvidia-cufft-cu12

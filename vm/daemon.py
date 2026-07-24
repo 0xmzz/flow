@@ -32,7 +32,7 @@ def host_url():
     for line in out.splitlines():
         if line.startswith("default"):
             return "http://" + line.split()[2] + ":8756"
-    return "http://172.24.16.1:8756"
+    raise RuntimeError("no default gateway found; set FLOW_HOST explicitly")
 
 
 def post(path, timeout=90):

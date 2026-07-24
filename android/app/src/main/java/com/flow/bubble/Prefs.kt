@@ -6,7 +6,7 @@ class Prefs(ctx: Context) {
     private val p = ctx.getSharedPreferences("flow", Context.MODE_PRIVATE)
 
     var serverUrl: String
-        get() = p.getString("url", "http://100.64.112.82:8756")!!
+        get() = p.getString("url", "")!!
         set(v) = p.edit().putString("url", v).apply()
 
     var token: String
@@ -14,7 +14,7 @@ class Prefs(ctx: Context) {
         set(v) = p.edit().putString("token", v).apply()
 
     var fallbackUrl: String
-        get() = p.getString("fallback_url", "http://100.108.50.120:8757")!!
+        get() = p.getString("fallback_url", "")!!
         set(v) = p.edit().putString("fallback_url", v).apply()
 
     var bubbleX: Int

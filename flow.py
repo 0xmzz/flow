@@ -87,13 +87,15 @@ _install_crash_logging()
 
 DEFAULTS = {
     "mode": "full",                # "full" = local GPU; "client" = thin client
-    "server_url": "",              # client mode: the full Flow server, e.g. http://100.64.112.82:8756
-    "fallback_server_url": "http://100.108.50.120:8757",  # multivac 4080 node (one-shot only)
+    "server_url": "",              # client mode: URL of a full Flow server
+    "fallback_server_url": "",     # optional one-shot fallback ASR node
     "client_name": "",             # client mode: device tag (defaults to hostname)
     # Devices whose dictations join YOUR corpus/Hermes context. Anything else
     # is stored private: no audio archive, excluded from the Hermes sweep.
     "trusted_devices": ["android-bubble", "phone", "work-vm"],
-    "weather_location": "Dubai",
+    "weather_location": "",
+    "sites": {},                   # custom voice names/URLs merged over built-ins
+    "integrations": {"hermes": False},
     # Mic selection. None = follow the Windows default input. A string matches
     # a device NAME (case-insensitive substring) because indices churn.
     "input_device": None,
@@ -1017,15 +1019,8 @@ class Flow:
         ) if h["enabled"] else None
         import speech
         speech.configure(self.cfg.get("tts"))
-        print(f"Loading {self.cfg['model']} on {self.cfg['device']}...")
         t0 = time.time()
-        from faster_whisper import WhisperModel
-        self.model = WhisperModel(
-            self.cfg["model"], device=self.cfg["device"],
-            compute_type=self.cfg["compute_type"],
-        )
-        # Warm up so the first real dictation isn't slow.
-        self.model.transcribe(np.zeros(self.cfg["sample_rate"], dtype=np.float32))
+        self.model = self._load_model()
         if self.cfg.get("live", {}).get("enabled", True):
             try:
                 from live import LiveWorker
@@ -1642,6 +1637,31 @@ class Flow:
             print(f"[tray] unavailable ({e}); running headless. Ctrl+C to quit.")
             keyboard.wait()
 
+    def _downgrade_cuda_if_unavailable(self):
+        """Use the portable Whisper CPU lane when CUDA is not usable."""
+        if str(self.cfg.get("device", "")).lower() != "cuda":
+            return
+        try:
+            import ctranslate2
+            available = ctranslate2.get_cuda_device_count() > 0
+        except Exception:
+            available = False
+        if not available:
+            print("[asr] CUDA unavailable; falling back to CPU int8")
+            self.cfg["device"] = "cpu"
+            self.cfg["compute_type"] = "int8"
+
+    def _load_model(self):
+        self._downgrade_cuda_if_unavailable()
+        print(f"Loading {self.cfg['model']} on {self.cfg['device']}...")
+        from faster_whisper import WhisperModel
+        model = WhisperModel(
+            self.cfg["model"], device=self.cfg["device"],
+            compute_type=self.cfg["compute_type"],
+        )
+        model.transcribe(np.zeros(self.cfg["sample_rate"], dtype=np.float32))
+        return model
+
 
 def make_icon(state):
     from PIL import Image, ImageDraw
@@ -1668,6 +1688,120 @@ def cli_history(limit=30):
     print(f"\n{s['dictations']} dictations · {s['words']} words · {s['by_source']}")
 
 
+def _setup_cuda_status():
+    """Return (available, detail) without importing torch."""
+    providers, count = [], 0
+    try:
+        import onnxruntime as ort
+        providers = ort.get_available_providers()
+    except Exception:
+        pass
+    try:
+        import ctranslate2
+        count = ctranslate2.get_cuda_device_count()
+    except Exception:
+        pass
+    available = count > 0 or "CUDAExecutionProvider" in providers
+    name = ""
+    if available:
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=3)
+            name = next((line.strip() for line in result.stdout.splitlines()
+                         if line.strip()), "")
+        except Exception:
+            pass
+    return available, name or ("available (name unavailable)"
+                               if available else "not available")
+
+
+def _setup_ollama():
+    """Return (reachable, model names) from Ollama's local tags endpoint."""
+    try:
+        import urllib.request
+        with urllib.request.urlopen("http://127.0.0.1:11434/api/tags",
+                                    timeout=2) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        names = [m.get("name", "") for m in payload.get("models", [])
+                 if isinstance(m, dict) and m.get("name")]
+        return True, names
+    except Exception:
+        return False, []
+
+
+def setup_machine():
+    """Diagnose a machine and create its initial config without app side effects."""
+    print("Flow setup")
+    print(f"Python: {sys.version.split()[0]}")
+    cuda, gpu = _setup_cuda_status()
+    print(f"CUDA: {'yes' if cuda else 'no'} ({gpu})")
+
+    scored = []
+    print("Input devices:")
+    for index, name in live_input_devices():
+        level = probe_input(index, DEFAULTS["sample_rate"], 0.4)
+        state = "SILENT" if level < SILENCE_PEAK else "live"
+        print(f"  [{index:>3}] {state:<6} peak {level:.5f}  {name}")
+        if level >= SILENCE_PEAK:
+            scored.append((level, name))
+    if not scored:
+        print("  no live input detected")
+    input_name = max(scored)[1] if scored else None
+
+    ollama, models = _setup_ollama()
+    print("Ollama: " + (f"reachable ({', '.join(models) or 'no models'})"
+                        if ollama else "not reachable"))
+    kokoro = (APP_DIR / "data" / "models" / "kokoro" /
+              "kokoro-v1.0.onnx").is_file()
+    parakeet = any((APP_DIR / "data" / "models" /
+                    "parakeet").glob("**/*.onnx"))
+    print(f"Kokoro cache: {'ready' if kokoro else 'missing'}")
+    print(f"Parakeet cache: {'ready' if parakeet else 'missing'}")
+
+    candidate = json.loads(json.dumps(DEFAULTS))
+    candidate["input_device"] = input_name
+    candidate["cleanup"].update(
+        {"enabled": ollama, "provider": "ollama", "model": "qwen3:8b",
+         "base_url": "http://127.0.0.1:11434"})
+    candidate["server"]["enabled"] = False
+    candidate["tts"]["engine"] = "kokoro"
+    if CONFIG_PATH.exists():
+        print("\nconfig.json exists; changed nothing. A new config would use:")
+        print(f"  input_device={input_name!r}, cleanup.enabled={ollama}, "
+              "server.enabled=False, tts.engine='kokoro'")
+        summary = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
+    else:
+        CONFIG_PATH.write_text(json.dumps(candidate, indent=2), encoding="utf-8")
+        print("\nWrote config.json.")
+        summary = candidate
+
+    missing = []
+    if not scored:
+        missing.append("No live microphone -> connect or enable a microphone; "
+                       "python flow.py --setup")
+    if not ollama:
+        missing.append("Ollama not found -> winget install Ollama.Ollama; "
+                       "ollama pull qwen3:8b")
+    elif not any(name.split(":")[0] == "qwen3" for name in models):
+        missing.append("Cleanup model missing -> ollama pull qwen3:8b")
+    if not kokoro:
+        missing.append("Kokoro cache missing -> .venv\\Scripts\\python.exe "
+                       "flow.py (downloads it automatically)")
+    if not parakeet:
+        missing.append("Parakeet cache missing -> .venv\\Scripts\\python.exe "
+                       "flow.py (downloads it when live mode starts)")
+    print()
+    if missing:
+        print("Still needed:")
+        for number, item in enumerate(missing, 1):
+            print(f"  {number}. {item}")
+    else:
+        print(f"You're ready: hold {summary.get('hotkey', 'f8')} to dictate, "
+              f"press {summary.get('live_hotkey', 'f9')} for live mode.")
+
+
 def acquire_single_instance():
     import socket
     s = socket.socket()
@@ -1680,7 +1814,9 @@ def acquire_single_instance():
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] in ("--history", "-H"):
+    if len(sys.argv) > 1 and sys.argv[1] == "--setup":
+        setup_machine()
+    elif len(sys.argv) > 1 and sys.argv[1] in ("--history", "-H"):
         cli_history(int(sys.argv[2]) if len(sys.argv) > 2 else 30)
     elif len(sys.argv) > 1 and sys.argv[1] in ("--devices", "-d"):
         cfg = load_config()

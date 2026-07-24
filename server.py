@@ -239,7 +239,8 @@ def make_server(flow, host, port, token):
         def do_GET(self):
             path = self.path.split("?")[0].rstrip("/")
             if path == "":
-                return self._html(200, _history_page())
+                hermes = bool(flow.cfg.get("integrations", {}).get("hermes"))
+                return self._html(200, _history_page(hermes=hermes))
             if path == "/health":
                 return self._json(200, {"ok": True, "model": flow.cfg["model"]})
             if path == "/client/setup.ps1":
@@ -409,9 +410,9 @@ def make_server(flow, host, port, token):
     return httpd
 
 
-def _history_page():
+def _history_page(hermes=False):
     # Self-contained dashboard; all data via the token-gated API.
-    return """<!doctype html><meta charset=utf-8>
+    page = """<!doctype html><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>Flow</title>
 <style>
@@ -514,3 +515,19 @@ def _history_page():
  }
  tokEl.addEventListener('change',load);load();setInterval(load,30000);
 </script>"""
+    if hermes:
+        return page
+    page = re.sub(
+        r"\s*<h2>Daily brief .*?</h2>\s*<div class=kv id=brief .*?</div>",
+        "", page, flags=re.DOTALL)
+    page = page.replace(
+        "fetch('/api/brief',{headers:h}).then(r=>r.json()).catch(()=>({}))",
+        "Promise.resolve({})")
+    page = re.sub(
+        r"\s*document\.getElementById\('brief'\)\.textContent=.*?;"
+        r"(?=\s*const es=)",
+        "", page, flags=re.DOTALL)
+    page = re.sub(
+        r"\s*'<div><b>Hermes sync</b>.*?</span></div>'\+",
+        "", page, flags=re.DOTALL)
+    return page

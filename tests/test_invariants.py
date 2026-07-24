@@ -1019,3 +1019,57 @@ def test_resolve_device_matches_name_substring(monkeypatch):
     # No match and None both fall back to the Windows default (index None).
     assert flow.Recorder.resolve_device("nonexistent")[0] is None
     assert flow.Recorder.resolve_device(None)[0] is None
+
+
+def test_custom_sites_merge_over_builtins(monkeypatch):
+    import commands
+    opened = []
+    router = commands.Router(
+        {"cleanup": {}, "local_only": True,
+         "sites": {"google": "https://example.test/search",
+                   "personal": "https://personal.test"}})
+    monkeypatch.setattr(commands, "switch_to", lambda _name: None)
+    monkeypatch.setattr(commands, "open_app", lambda _name: None)
+    monkeypatch.setattr(commands.webbrowser, "open", opened.append)
+    assert router._open("google") == "Opening google."
+    assert router._open("personal") == "Opening personal."
+    assert router.sites["github"] == commands.KNOWN_SITES["github"]
+    assert opened == ["https://example.test/search", "https://personal.test"]
+
+
+def test_dashboard_hermes_integration_gate():
+    from server import _history_page
+    disabled = _history_page(hermes=False)
+    enabled = _history_page(hermes=True)
+    assert "Daily brief" not in disabled
+    assert "/api/brief" not in disabled
+    assert "Hermes sync" not in disabled
+    assert "Daily brief" in enabled
+    assert "/api/brief" in enabled
+    assert "Hermes sync" in enabled
+
+
+def test_cuda_absent_downgrades_whisper_config(monkeypatch):
+    import types
+    import flow
+    monkeypatch.setitem(sys.modules, "ctranslate2", types.SimpleNamespace(
+        get_cuda_device_count=lambda: 0))
+    instance = flow.Flow.__new__(flow.Flow)
+    instance.cfg = {"device": "cuda", "compute_type": "float16"}
+    instance._downgrade_cuda_if_unavailable()
+    assert instance.cfg == {"device": "cpu", "compute_type": "int8"}
+
+
+def test_setup_does_not_write_existing_config(tmp_path, monkeypatch):
+    import flow
+    path = tmp_path / "config.json"
+    original = b'{"hotkey":"custom","personal":"keep"}\n'
+    path.write_bytes(original)
+    monkeypatch.setattr(flow, "CONFIG_PATH", path)
+    monkeypatch.setattr(flow, "APP_DIR", tmp_path)
+    monkeypatch.setattr(flow, "_setup_cuda_status",
+                        lambda: (False, "not available"))
+    monkeypatch.setattr(flow, "_setup_ollama", lambda: (False, []))
+    monkeypatch.setattr(flow, "live_input_devices", lambda: [])
+    flow.setup_machine()
+    assert path.read_bytes() == original

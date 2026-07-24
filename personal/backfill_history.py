@@ -7,11 +7,13 @@ step scp's them to Hermes's imports/ and the vault. No audio, text only.
 
 import collections
 import json
+import sys
 from pathlib import Path
 
+APP = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(APP))
 import llm
 
-APP = Path(__file__).parent
 cfg = json.loads((APP / "config.json").read_text(encoding="utf-8-sig"))
 SRC = APP / "data" / "imported-wispr" / "history.jsonl"
 OUT = APP / "data" / "imported-wispr" / "briefs"

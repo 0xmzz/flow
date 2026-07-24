@@ -251,7 +251,6 @@ KNOWN_SITES = {
     "x": "https://x.com",
     "coingecko": "https://coingecko.com",
     "github": "https://github.com",
-    "hyperliquid": "https://app.hyperliquid.xyz",
     "google": "https://google.com",
 }
 
@@ -377,6 +376,10 @@ class Router:
                  windows_supplier=None, monitors_supplier=None,
                  state_path=None, intent_log_path=None):
         self.cfg = cfg
+        custom_sites = cfg.get("sites") or {}
+        if not isinstance(custom_sites, dict):
+            custom_sites = {}
+        self.sites = {**KNOWN_SITES, **custom_sites}
         self.workflows = workflow_store or RecipeStore()
         self.workflow_progress_fn = lambda _name, _i, _n, _text: None
         self.workflow_complete_fn = lambda _text: None
@@ -961,8 +964,8 @@ class Router:
             return f"Opening {app}."
         # 3) known sites / domains
         key = n.replace(" ", "").replace("dot", ".")
-        if key in KNOWN_SITES:
-            webbrowser.open(KNOWN_SITES[key])
+        if key in self.sites:
+            webbrowser.open(self.sites[key])
             return f"Opening {name}."
         if "." in key or key.startswith("http"):
             webbrowser.open(key if key.startswith("http") else "https://" + key)
@@ -972,9 +975,9 @@ class Router:
             return f"Opening {name}."
         except Exception:
             words = set(re.findall(r"\b[\w]+\b", n))
-            for site in sorted(KNOWN_SITES, key=len, reverse=True):
+            for site in sorted(self.sites, key=len, reverse=True):
                 if set(site.split()) <= words:
-                    webbrowser.open(KNOWN_SITES[site])
+                    webbrowser.open(self.sites[site])
                     return f"Opening {site}."
             apps = installed_apps()
             for app in sorted(apps, key=len, reverse=True):

@@ -18,7 +18,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-APP_DIR = Path(__file__).parent
+APP_DIR = Path(__file__).resolve().parent.parent
 CONFIG_PATH = APP_DIR / "config.json"
 WISPR_DIR = Path(os.environ["APPDATA"]) / "Wispr Flow"
 OUT_DIR = APP_DIR / "data" / "imported-wispr"
