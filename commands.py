@@ -20,9 +20,64 @@ import webbrowser
 from collections import deque
 from pathlib import Path
 
-from agents import AgentError, AgentRunner, select_lane
-from workflows import (Question, RecipeStore, WorkflowRunner, creation_dialog,
-                       normalize as normalize_workflow)
+try:
+    from agents import AgentError, AgentRunner, select_lane
+    from workflows import (Question, RecipeStore, WorkflowRunner, creation_dialog,
+                           normalize as normalize_workflow)
+    HOST_FEATURES = True
+except ImportError as _missing:  # pragma: no cover - exercised on thin clients
+    # Thin clients ship the dictation core only. Workflows and agent lanes are
+    # host features; a client that lacks those modules must still dictate
+    # rather than crash-loop on import. (It did: a client pulled a commands.py
+    # that hard-imported these and was dead for five days.)
+    HOST_FEATURES = False
+    print(f"[commands] host features unavailable ({_missing}); dictation only")
+
+    class AgentError(RuntimeError):
+        outcome = "error"
+
+    class Question:  # only ever type-checked in this mode, never constructed
+        def __init__(self, text, handler=None, cancel=None, cancel_text="Cancelled."):
+            self.text, self.handler = text, handler
+            self.cancel, self.cancel_text = cancel, cancel_text
+
+    class RecipeStore:
+        def names(self):
+            return []
+
+        def match(self, _text):
+            return None
+
+        def get(self, _name):
+            return None
+
+        def delete(self, _name):
+            return False
+
+    class _InertRunner:
+        running = False
+        lanes = ()
+
+        def __init__(self, *_a, **_kw):
+            pass
+
+        def start(self, *_a, **_kw):
+            return False
+
+        def cancel(self):
+            return None
+
+    AgentRunner = WorkflowRunner = _InertRunner
+
+    def select_lane(*_a, **_kw):
+        raise AgentError("Agent lanes are not available on this client.")
+
+    def creation_dialog(*_a, **_kw):
+        return "Workflows aren't available on this client."
+
+    def normalize_workflow(text):
+        cleaned = re.sub(r"[^\w\s]", " ", str(text or "").lower())
+        return re.sub(r"\s+", " ", cleaned).strip()
 
 
 DATA_DIR = Path(__file__).parent / "data"

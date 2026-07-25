@@ -685,6 +685,33 @@ def describe_target(window):
     return f"→ {w}"[:60]
 
 
+def stop_speech():
+    """Interrupt any spoken response. No-op where speech isn't installed.
+
+    Called on every hotkey press, so a thin client missing speech.py must not
+    raise here — that would break dictation itself."""
+    try:
+        import speech
+        speech.stop()
+    except Exception:
+        pass
+
+
+class _NoHud:
+    """Stand-in when hud.py isn't present (thin clients)."""
+
+    class _State:
+        enabled = False
+
+    state = _State()
+
+    def handle(self, _event):
+        return None
+
+    def update(self):
+        return False
+
+
 class Overlay:
     """Always-on-top listening pill: a live mic waveform + a status line +
     a 'where the text is going' context line, at the bottom of the active
@@ -729,8 +756,15 @@ class Overlay:
         except Exception:
             pass
         root.configure(bg=bg)
-        from hud import HudView
-        hud = HudView(root, tk)
+        try:
+            from hud import HudView
+            hud = HudView(root, tk)
+        except Exception as e:
+            # Thin clients ship the dictation core without the HUD module; the
+            # overlay pill must still work, so fall back to an inert panel
+            # rather than killing this Tk thread.
+            print(f"[hud] panel unavailable ({e}); overlay pill only")
+            hud = _NoHud()
 
         BW, GAP, WH = 3, 2, 22
         wave_w = self.N_BARS * (BW + GAP)
@@ -1254,8 +1288,7 @@ class Flow:
             self.overlay.set(("hud", "agent_result", full))
 
     def on_press(self, mode="dictate"):
-        import speech
-        speech.stop()
+        stop_speech()
         with self._session_lock:
             if self.recording or self.busy.locked():
                 return

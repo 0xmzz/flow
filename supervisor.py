@@ -51,12 +51,18 @@ def client_self_update():
             url + "/client/version", timeout=6).read())["version"]
     except Exception:
         return  # server down / offline — keep running the current files
+    files = ("flow.py", "store.py", "llm.py", "commands.py", "supervisor.py",
+             "workflows.py", "agents.py", "winctl.py", "speech.py", "hud.py",
+             "live.py", "flow.ico")
     vfile = APP / ".client_version"
-    if vfile.exists() and vfile.read_text().strip() == ver:
+    # The stamp alone is not proof of a complete install: an older supervisor
+    # fetched a shorter file list, stamped the new version, and then skipped
+    # every later update — leaving a client permanently missing modules that
+    # the newer commands.py imports. Re-fetch whenever anything is absent.
+    complete = all((APP / f).exists() for f in files)
+    if complete and vfile.exists() and vfile.read_text().strip() == ver:
         return
-    for f in ("flow.py", "store.py", "llm.py", "commands.py", "supervisor.py",
-              "workflows.py", "agents.py", "winctl.py", "speech.py", "hud.py",
-              "live.py", "flow.ico"):
+    for f in files:
         try:
             data = urllib.request.urlopen(url + "/client/file/" + f, timeout=20).read()
             (APP / f).write_bytes(data)
