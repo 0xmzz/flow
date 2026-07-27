@@ -17,6 +17,22 @@ from pathlib import Path
 ERROR = "Hermes is unavailable right now."
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow redirects on an authenticated call.
+
+    urllib's default redirect handler strips only content-length and
+    content-type, so it would resend the Bearer key to whatever host the
+    redirect names. Hermes never legitimately redirects; returning None here
+    makes urllib raise instead, which the callers already treat as a failure.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect())
+
+
 class HermesClient:
     def __init__(self, cfg):
         cfg = cfg or {}
@@ -42,7 +58,7 @@ class HermesClient:
                                      method=method)
         timeout = self.quick_timeout if quick else self.timeout
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as response:
+            with _OPENER.open(req, timeout=timeout) as response:
                 raw = response.read().decode("utf-8")
                 if response.status not in expected:
                     return {"ok": False, "error": ERROR}
@@ -91,7 +107,7 @@ class HermesClient:
                      "Accept": "text/event-stream",
                      "Content-Type": "application/json; charset=utf-8"})
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as response:
+            with _OPENER.open(req, timeout=self.timeout) as response:
                 event = []
                 for raw in response:
                     line = raw.decode("utf-8").rstrip("\r\n")

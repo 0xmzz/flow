@@ -35,7 +35,7 @@ def test_client_utf8_and_bearer(monkeypatch):
         seen["body"] = request.data.decode("utf-8")
         return Response({"message": {"content": "Smart “quote” — yes"}})
 
-    monkeypatch.setattr(hermes.urllib.request, "urlopen", open_)
+    monkeypatch.setattr(hermes, "_OPENER", SimpleNamespace(open=open_))
     client = hermes.HermesClient(
         {"url": "http://hermes", "key": "secret", "timeout_s": 5})
     out = client.chat("abc", "hello — world")
@@ -48,7 +48,7 @@ def test_client_fails_soft_without_leaking(monkeypatch):
     def open_(*args, **kwargs):
         raise OSError("secret internal detail")
 
-    monkeypatch.setattr(hermes.urllib.request, "urlopen", open_)
+    monkeypatch.setattr(hermes, "_OPENER", SimpleNamespace(open=open_))
     out = hermes.HermesClient(
         {"url": "http://x", "key": "do-not-print"}).health()
     assert out == {"ok": False, "error": hermes.ERROR}
@@ -63,8 +63,8 @@ def test_sse_utf8(monkeypatch):
         b"\n",
     ]
     monkeypatch.setattr(
-        hermes.urllib.request, "urlopen",
-        lambda *a, **k: Response({}, lines=lines))
+        hermes, "_OPENER",
+        SimpleNamespace(open=lambda *a, **k: Response({}, lines=lines)))
     client = hermes.HermesClient({"url": "http://x", "key": "k"})
     assert list(client.chat_stream("s", "m")) == [{"text": "one —"}]
 
@@ -244,3 +244,13 @@ def test_cheap_lookups_use_the_short_timeout():
     client = hermes.HermesClient({"url": "http://x", "key": "k", "timeout_s": 240})
     assert client.timeout == 240
     assert client.quick_timeout <= 8
+
+
+def test_authenticated_calls_never_follow_redirects():
+    """A 302 must not resend the Bearer key to the host the redirect names."""
+    handler = hermes._NoRedirect()
+    assert handler.redirect_request(
+        SimpleNamespace(full_url="http://h/api/sessions"), None, 302, "Found",
+        {}, "http://evil.example/api/sessions") is None
+    assert any(isinstance(h, hermes._NoRedirect)
+               for h in hermes._OPENER.handlers)
