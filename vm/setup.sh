@@ -29,6 +29,8 @@ apt-get install -y -q python3-evdev ydotool curl >/dev/null
 
 mkdir -p /opt/vmflow
 curl -s "$HOST_URL/vm/daemon.py" -o /opt/vmflow/daemon.py
+curl -s "$HOST_URL/vm/netwatch.sh" -o /opt/vmflow/netwatch.sh
+chmod +x /opt/vmflow/netwatch.sh
 
 cat > /etc/vmflow.env <<EOF
 FLOW_HOST=$OVERRIDE
@@ -62,8 +64,28 @@ RestartSec=2
 WantedBy=multi-user.target
 EOF
 
+cat > /etc/systemd/system/flow-netwatch.service <<'EOF'
+[Unit]
+Description=Heal guest DHCP after the Hyper-V Default Switch renumbers
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/vmflow.env
+ExecStart=/opt/vmflow/netwatch.sh
+EOF
+
+cat > /etc/systemd/system/flow-netwatch.timer <<'EOF'
+[Unit]
+Description=Check the guest can still reach the Hyper-V host
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+[Install]
+WantedBy=timers.target
+EOF
+
 systemctl daemon-reload
 systemctl enable --now ydotoold.service vmflow.service >/dev/null 2>&1
+systemctl enable --now flow-netwatch.timer >/dev/null 2>&1
 sleep 1
 systemctl --no-pager -l status vmflow.service | tail -4
 echo ""

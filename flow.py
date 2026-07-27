@@ -121,6 +121,13 @@ DEFAULTS = {
         "api_key_env": "FLOW_API_KEY",
         "api_key": "",             # inline key (config.json is gitignored); wins over env
         "extra_body": {},          # merged into the API request (e.g. z.ai thinking off)
+        # Ollama only: how long the model stays resident in VRAM after a call,
+        # and the context it allocates. -1 pins it forever (~10GB for qwen3:8b
+        # at 32k); "10m" lets it unload when idle at the cost of a reload on
+        # first use. Cleanup/command prompts are a sentence or two, so 4k ctx
+        # is plenty and saves ~4.5GB of KV cache.
+        "keep_alive": "10m",
+        "num_ctx": 4096,
         # Same-shape block tried when the local model fails (Ollama down, etc.):
         # {"provider": "anthropic", "base_url": ..., "model": ..., "api_key": ...}
         "fallback": {},
@@ -1106,7 +1113,8 @@ class Flow:
                 requests.post(
                     (c["base_url"] or "http://127.0.0.1:11434") + "/api/chat",
                     json={"model": c["model"], "stream": False, "think": False,
-                          "keep_alive": -1,
+                          "keep_alive": c.get("keep_alive", "10m"),
+                          "options": {"num_ctx": c.get("num_ctx", 4096)},
                           "messages": [{"role": "user", "content": "hi"}]},
                     timeout=300,
                 ).raise_for_status()

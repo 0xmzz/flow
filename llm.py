@@ -41,7 +41,8 @@ def call_provider(p, system, text, max_tokens=2048):
     if provider == "ollama":
         url = (p.get("base_url") or "http://127.0.0.1:11434") + "/api/chat"
         body = {"model": p["model"], "stream": False, "think": False,
-                "keep_alive": -1,
+                "keep_alive": p.get("keep_alive", "10m"),
+                "options": {"num_ctx": p.get("num_ctx", 4096)},
                 "messages": [{"role": "system", "content": system},
                              {"role": "user", "content": text}],
                 **p.get("extra_body", {})}

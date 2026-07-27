@@ -293,7 +293,7 @@ def make_server(flow, host, port, token):
                 self.end_headers()
                 self.wfile.write(data)
                 return
-            if path in ("/vm/setup.sh", "/vm/daemon.py"):
+            if path in ("/vm/setup.sh", "/vm/daemon.py", "/vm/netwatch.sh"):
                 from pathlib import Path
                 f = Path(__file__).parent / "vm" / path.split("/")[-1]
                 if not f.exists():
