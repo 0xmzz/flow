@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import threading
 import time
+import urllib.request
 
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -104,9 +105,43 @@ class Lane:
 
 
 class HermesLane(Lane):
+    _health_cache = None
+
+    def __init__(self, *args, config=None, health_ttl_s=30, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.config = config
+        self.health_ttl_s = health_ttl_s
+
+    def _config(self):
+        if self.config is not None:
+            return self.config
+        try:
+            cfg = json.loads((Path(__file__).parent / "config.json").read_text(
+                encoding="utf-8-sig"))
+            return cfg.get("hermes") or {}
+        except (OSError, ValueError):
+            return {}
+
     def available(self):
-        # TODO: replace with a cheap Tailscale endpoint health check.
-        return False
+        now = time.monotonic()
+        cached = type(self)._health_cache
+        if cached and now - cached[0] < self.health_ttl_s:
+            return cached[1]
+        cfg = self._config()
+        ok = False
+        if cfg.get("enabled") and cfg.get("url") and cfg.get("key"):
+            request = urllib.request.Request(
+                str(cfg["url"]).rstrip("/") + "/health",
+                headers={"Authorization": "Bearer " + str(cfg["key"])})
+            try:
+                with urllib.request.urlopen(request, timeout=2) as response:
+                    body = json.loads(response.read().decode("utf-8"))
+                    ok = response.status == 200 and body.get("status") in (
+                        "ok", "healthy", "ready")
+            except (OSError, ValueError):
+                ok = False
+        type(self)._health_cache = (now, ok)
+        return ok
 
 
 LANES = [

@@ -120,6 +120,24 @@ def make_server(flow, host, port, token):
             if not self._authed():
                 return self._json(401, {"error": "unauthorized"})
             device = self.headers.get("X-Device", "phone")
+            if path == "/hermes":
+                if not getattr(flow, "hermes", None):
+                    return self._json(503, {"error": "Hermes is unavailable"})
+                try:
+                    audio, sr = decode_any(self._body())
+                    if sr != flow.cfg["sample_rate"]:
+                        from store import resample_linear
+                        audio = resample_linear(audio, sr, flow.cfg["sample_rate"])
+                    segs = flow.decode(audio, prompt=flow.bias_prompt())
+                    text = " ".join(s.text.strip() for s in segs).strip()
+                    picked = flow.hermes.resolve("", allow_current=False)
+                    result = flow.hermes.converse(picked, text) if text else {}
+                    return self._json(200, {
+                        "text": text, "reply": result.get("reply", ""),
+                        "thread": (picked or {}).get("title", ""),
+                        "session_id": (picked or {}).get("id", "")})
+                except Exception:
+                    return self._json(502, {"error": "Hermes is unavailable"})
             if path.startswith("/stream/"):
                 parts = path.split("/")  # /stream/start | /stream/<sid>/<op>
                 if parts[2] == "start":
@@ -353,6 +371,27 @@ def make_server(flow, host, port, token):
                 entries = flow.store.read(limit=limit, since=since)
                 cursor = entries[-1]["ts"] if entries else since
                 return self._json(200, {"entries": entries, "cursor": cursor})
+            if path == "/api/hermes/turns":
+                from hermes import read_turns
+                m = re.search(r"limit=(\d+)", self.path)
+                limit = int(m.group(1)) if m else 50
+                base = getattr(getattr(flow, "store", None), "base", None)
+                if base is None:
+                    base = (getattr(flow, "hermes", None) or object())
+                    turns_path = getattr(base, "turns_path", "")
+                else:
+                    from pathlib import Path
+                    turns_path = Path(base) / "hermes_turns.jsonl"
+                turns = read_turns(turns_path, limit)
+                current = ""
+                mouth = getattr(flow, "hermes", None)
+                if mouth:
+                    state = mouth.threads.load()
+                    current = state.get("active") or state.get("current") or ""
+                if not current and turns:
+                    current = turns[-1].get("thread", "")
+                return self._json(200, {"current_thread": current,
+                                        "turns": turns})
             if path == "/api/brief":
                 if not self._authed():
                     return self._json(401, {"error": "unauthorized"})
@@ -460,6 +499,8 @@ def _history_page(hermes=False):
  <h2>Daily brief <span style="text-transform:none;letter-spacing:0;color:var(--mut)">(distilled from your voice, on your GPU)</span></h2>
  <div class=kv id=brief style="white-space:pre-wrap;font-size:13px;padding:12px 14px">—</div>
  <h2>Pipeline &amp; data</h2><div class=kv id=kv></div>
+ <section id=hermesSec><h2>Hermes mouthpiece</h2>
+ <div class=rows id=hermesTurns></div></section>
  <h2>Recent dictations</h2><div class=rows id=list></div>
 </div>
 <script>
@@ -474,10 +515,11 @@ def _history_page(hermes=False):
  async function load(){
   const t=tokEl.value;localStorage.setItem('flow_tok',t);
   const h={Authorization:'Bearer '+t};
-  const [meta,d,br]=await Promise.all([
+  const [meta,d,br,ht]=await Promise.all([
     fetch('/api/meta',{headers:h}).then(r=>r.json()).catch(()=>({})),
     fetch('/api/history?limit=2000',{headers:h}).then(r=>r.json()).catch(()=>({entries:[]})),
-    fetch('/api/brief',{headers:h}).then(r=>r.json()).catch(()=>({}))]);
+    fetch('/api/brief',{headers:h}).then(r=>r.json()).catch(()=>({})),
+    fetch('/api/hermes/turns?limit=30',{headers:h}).then(r=>r.json()).catch(()=>({turns:[]}))]);
   document.getElementById('brief').textContent=
     br.brief?(br.day?br.day+'\n':'')+br.brief:'— no brief yet (hourly sweep populates this)';
   const es=d.entries||[];
@@ -516,6 +558,12 @@ def _history_page(hermes=False):
    '<div class=row><div>'+esc(e.text)+'</div><div class=meta><span class=src>'+
    esc(e.source||'')+'</span> '+esc((e.ts||'').replace('T',' ').slice(0,16))+
    ' · '+(e.duration_s||'?')+'s'+(e.asr_s!=null?' · asr '+e.asr_s+'s':'')+'</div></div>').join('');
+  document.getElementById('hermesTurns').innerHTML=
+    '<div class=row><b>Current thread: '+esc(ht.current_thread||'—')+'</b></div>'+
+    (ht.turns||[]).slice().reverse().map(e=>'<div class=row><div>'+esc(e.text)+
+      '</div><div class=meta><span class=src>'+esc(e.role||'')+'</span> '+
+      esc(e.thread||'')+' · '+esc((e.ts||'').replace('T',' ').slice(0,16))+
+      '</div></div>').join('');
  }
  tokEl.addEventListener('change',load);load();setInterval(load,30000);
 </script>"""
@@ -527,6 +575,14 @@ def _history_page(hermes=False):
     page = page.replace(
         "fetch('/api/brief',{headers:h}).then(r=>r.json()).catch(()=>({}))",
         "Promise.resolve({})")
+    page = re.sub(r"\s*<section id=hermesSec>.*?</section>", "",
+                  page, flags=re.DOTALL)
+    page = page.replace(
+        "fetch('/api/hermes/turns?limit=30',{headers:h}).then(r=>r.json()).catch(()=>({turns:[]}))",
+        "Promise.resolve({turns:[]})")
+    page = re.sub(
+        r"\s*document\.getElementById\('hermesTurns'\)\.innerHTML=.*?;"
+        r"(?=\s*})", "", page, flags=re.DOTALL)
     page = re.sub(
         r"\s*document\.getElementById\('brief'\)\.textContent=.*?;"
         r"(?=\s*const es=)",

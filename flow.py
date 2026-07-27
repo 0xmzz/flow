@@ -96,6 +96,17 @@ DEFAULTS = {
     "weather_location": "",
     "sites": {},                   # custom voice names/URLs merged over built-ins
     "integrations": {"hermes": False},
+    "hermes": {
+        "enabled": False,
+        "url": "http://100.108.50.120:8642",
+        "key": "",
+        "hotkey": "right shift",
+        "speak": True,
+        "timeout_s": 30,
+        "default_thread_title": "Flow",
+        "thread_rules": [],
+        "run_intent_prefixes": ["go build", "kick off", "background task"],
+    },
     # Mic selection. None = follow the Windows default input. A string matches
     # a device NAME (case-insensitive substring) because indices churn.
     "input_device": None,
@@ -1033,6 +1044,7 @@ class Flow:
         self.muter.ensure_unmuted()
         self.recording = False
         self.active_mode = "dictate"
+        self.hermes_context = None
         self.streamer = None
         self._pressed_keys = set()
         self._active_ptt_key = None
@@ -1046,6 +1058,12 @@ class Flow:
         # request threads); this lock makes each check-then-mutate atomic.
         self._session_lock = threading.Lock()
         self.router = Router(self.cfg, export_fn=self._export_voice)
+        self.hermes = None
+        if self.cfg.get("hermes", {}).get("enabled"):
+            from hermes import Mouthpiece
+            history_dir = self.cfg.get("history", {}).get("dir", "data")
+            self.hermes = Mouthpiece(
+                self.cfg["hermes"], APP_DIR / history_dir)
         threading.Thread(target=self._ctrl_loop, daemon=True,
                          name="hotkey-ctrl").start()
         self.started_at = time.time()
@@ -1300,12 +1318,32 @@ class Flow:
         with self._session_lock:
             if self.recording or self.busy.locked():
                 return
+            context = None
+            if mode == "hermes":
+                if not self.hermes:
+                    return
+                # LOCAL ONLY on this path. on_press runs on the keyboard-hook
+                # thread while holding _session_lock, which dictation also
+                # needs — so a network call here would let a slow or hung
+                # Hermes freeze right ctrl too, and an exception would strand
+                # self.recording=True and wedge every hotkey until restart.
+                # The thread NAME comes from local rules; the session id is
+                # resolved later on the worker thread in process_hermes.
+                try:
+                    window = foreground_window()
+                    context = {"window": window,
+                               "title": self.hermes.predict_title(window)}
+                except Exception as exc:                     # never wedge
+                    print(f"[pc-hermes] thread predict failed: {exc}")
+                    context = {"window": "", "title": "Hermes"}
+                self.hermes_context = dict(context)
             self.active_mode = mode
             self.recording = True
             if self.live_worker:
                 self.live_worker.pause("recorder-owner")
             self.recorder.start()  # first — capture must not wait on mute/icon
-            self.set_icon("rec")
+            self.set_icon("rec", (f"Hermes · {context['title']}"
+                                  if context else None))
             if self.cfg.get("mute_output_while_recording"):
                 self.muter.mute()
             if mode == "dictate" and self.cfg["streaming"]["enabled"]:
@@ -1336,9 +1374,15 @@ class Flow:
             audio = self.recorder.stop()
             self.muter.restore()
             mode = self.active_mode
-            if self.live_worker and mode != "command":
+            hermes_context = self.hermes_context
+            self.hermes_context = None
+            if self.live_worker and mode not in ("command", "hermes"):
                 self.live_worker.resume("recorder-owner")
-        if mode == "command":
+        if mode == "hermes":
+            threading.Thread(target=self.process_hermes,
+                             args=(audio, hermes_context),
+                             daemon=True, name="flow-hermes").start()
+        elif mode == "command":
             threading.Thread(target=self.process_command, args=(audio,),
                              daemon=True).start()
         else:
@@ -1493,6 +1537,58 @@ class Flow:
                     self.live_worker.resume("recorder-owner")
                 self.restore_base_state()
 
+    def process_hermes(self, audio, pending):
+        """Local ASR -> Hermes, deliberately bypassing history and llm.chain.
+
+        Runs on its own thread: the session lookup is a network call, so it
+        must never sit on the hotkey thread (see on_press).
+        """
+        with self.busy:
+            self.set_icon("work")
+            try:
+                dur = len(audio) / self.cfg["sample_rate"]
+                if dur < self.cfg["min_duration_s"] or self.mic_is_deaf(audio):
+                    return
+                if self.cfg["mode"] == "client":
+                    response = self.client_transcribe(
+                        audio, "/hermes", field="reply")
+                else:
+                    t0 = time.time()
+                    segs = self.decode(audio, prompt=self.bias_prompt())
+                    text = " ".join(s.text.strip() for s in segs).strip()
+                    print(f"[pc-hermes] [{dur:.1f}s audio -> "
+                          f"{time.time() - t0:.2f}s asr]")
+                    if not text:
+                        return
+                    picked = self.hermes.resolve((pending or {}).get("window", ""))
+                    if not picked:
+                        response = "Hermes is unavailable right now."
+                        if self.overlay:
+                            self.overlay.set(("say", response))
+                        if self.cfg["hermes"].get("speak", True):
+                            speak(response)
+                        return
+                    result = self.hermes.converse(picked, text)
+                    response = (result.get("reply")
+                                or "Hermes is unavailable right now.")
+                    # "switch to X" persists through ThreadStore(current=True),
+                    # so predict_title picks it up on the next press; nothing
+                    # to stash on self here.
+                if self.overlay:
+                    self.overlay.set(("say", response))
+                if self.cfg["hermes"].get("speak", True):
+                    speak(response)
+            except Exception:
+                response = "Hermes is unavailable right now."
+                if self.overlay:
+                    self.overlay.set(("say", response))
+                if self.cfg["hermes"].get("speak", True):
+                    speak(response)
+            finally:
+                if self.live_worker:
+                    self.live_worker.resume("recorder-owner")
+                self.restore_base_state()
+
     def client_transcribe(self, audio, route, field="text"):
         """Thin client: ship audio to the main server; on failure fall back to
         the always-on multivac node (plain transcription, /transcribe only)."""
@@ -1622,6 +1718,9 @@ class Flow:
             mode = "dictate"
         elif name == self.cfg.get("command_hotkey"):
             mode = "command"
+        elif (self.cfg.get("hermes", {}).get("enabled")
+              and name == self.cfg.get("hermes", {}).get("hotkey")):
+            mode = "hermes"
         else:
             return
         if event.event_type == keyboard.KEY_DOWN:

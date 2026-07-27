@@ -1044,9 +1044,13 @@ def test_dashboard_hermes_integration_gate():
     assert "Daily brief" not in disabled
     assert "/api/brief" not in disabled
     assert "Hermes sync" not in disabled
+    assert "Hermes mouthpiece" not in disabled
+    assert "/api/hermes/turns" not in disabled
     assert "Daily brief" in enabled
     assert "/api/brief" in enabled
     assert "Hermes sync" in enabled
+    assert "Hermes mouthpiece" in enabled
+    assert "/api/hermes/turns" in enabled
 
 
 def test_cuda_absent_downgrades_whisper_config(monkeypatch):

@@ -11,7 +11,7 @@ non-loopback endpoint (see [Privacy](#privacy-boundaries)).
 flowchart LR
   subgraph beast[beast — Windows PC, RTX 5090 — the brain]
     subgraph app[flow.py]
-      HK[keyboard hook<br/>right ctrl = dictate<br/>right shift = command] --> REC[Recorder<br/>always-open + pre-roll ring]
+      HK[keyboard hook<br/>right ctrl = dictate<br/>right alt = command<br/>right shift = Hermes] --> REC[Recorder<br/>always-open + pre-roll ring]
       REC --> SW[StreamWorker<br/>commit-at-pauses while held]
       SW --> ASR[faster-whisper large-v3<br/>fp16 CUDA]
       ASR --> CL[llm.py chain<br/>qwen3:8b via Ollama<br/>local-only enforced]
@@ -20,6 +20,9 @@ flowchart LR
       OV[Overlay: waveform pill +<br/>'→ where the text goes']
     end
     ASR --> ST[(store.py history.jsonl<br/>+ audio corpus · private flags)]
+    ASR --> HM[hermes.py mouthpiece<br/>session selection + turns]
+    HM -->|explicit Bearer cloud path| HAPI[Hermes API :8642]
+    HM --> HT[(hermes_turns.jsonl)]
     SRV[server.py :8756<br/>token-gated] --> ASR
     SRV --> STREAMS[streaming.py sessions<br/>partials while clients talk]
   end
@@ -72,10 +75,27 @@ Key decisions baked into this path:
 
 ## Command mode
 
-Right shift routes the transcript to `commands.py` instead of pasting:
+Right alt routes the transcript to `commands.py` instead of pasting:
 regex skills first (crypto price via CoinGecko, `open <site/app>`, `search`),
 otherwise the local LLM answers. Responses are spoken (SAPI) **and** shown in
 the overlay pill. `POST /command` exposes the same router to remote devices.
+
+## Hermes mouthpiece
+
+Right shift is a separate push-to-talk lane. It reuses local Whisper ASR, then
+sends only that mouthpiece utterance to the explicitly configured Hermes API;
+it never passes through `llm.chain`, `commands.py`, or `store.py`. On press,
+the foreground title selects the first case-insensitive `thread_rules` match.
+Without a match, Flow continues the explicitly selected thread or Hermes's
+most-recent session across all sources, preserving phone/Telegram continuity.
+The selected title is captured and shown in the HUD before recording.
+
+`new thread <name>`, `switch to <name>`, and `what threads` are handled
+locally. Configured builder prefixes submit `/v1/runs` asynchronously and rely
+on Telegram for completion delivery. Conversational turns live exclusively in
+`data/hermes_turns.jsonl`; `GET /api/hermes/turns` powers the feature-gated
+dashboard transcript. They never enter `history.jsonl`, preventing the hourly
+Hermes memory sweep from feeding Hermes summaries of its own conversation.
 
 ## Live mode (`live.py`) — always-listening commands
 
@@ -111,6 +131,7 @@ drops `think:false` and Qwen3 then burns ~7s on hidden reasoning.
 | `GET /health` | none | liveness `{ok, model}` |
 | `GET /apk`, `GET /apk/version` | none (tailnet-only) | Android self-update channel |
 | `POST /transcribe` | Bearer | raw audio body → `{text, asr_s, duration_s}` |
+| `POST /hermes` | Bearer | audio → local ASR → current Hermes session |
 | `POST /v1/audio/transcriptions` | Bearer | OpenAI-Whisper-compatible (multipart, m4a/ogg/wav via PyAV); strict `{text}` response |
 | `POST /command` | Bearer | audio → transcript → command router → `{text, response}` |
 | `POST /llm` | Bearer | `{system,text}` → local model only (never fallback) — used by the multivac sweep |
@@ -121,6 +142,7 @@ drops `think:false` and Qwen3 then burns ~7s on hidden reasoning.
 | `GET /client/setup.ps1`, `/client/file/*`, `/client/version` | none (tailnet) | thin-client installer + self-update channel |
 | `GET /vm/setup.sh`, `/vm/daemon.py` | none (tailnet) | VM bridge installer + daemon self-update |
 | `GET /api/history?limit&since` | Bearer | entries + cursor; `since` marks a delta sync |
+| `GET /api/hermes/turns?limit` | Bearer | recent mouthpiece turns and current thread |
 | `GET /api/stats`, `GET /api/meta` | Bearer | totals; model/storage/uptime/last-pull/fallback-node health |
 
 A `threading.Lock` serializes the GPU between hotkey and server calls.
@@ -128,9 +150,11 @@ A `threading.Lock` serializes the GPU between hotkey and server calls.
 ## Fallback ASR node (multivac RTX 4080)
 
 `multivac/asr_node.py` runs as systemd `flow-asr` on multivac (port 8757, same
-token): always-on, one-shot `/transcribe` only — no streaming, no cleanup,
+token): always-on, one-shot `/transcribe` and `/hermes` only — no streaming or cleanup,
 degraded on purpose. Phone and thin clients try beast first and fall back here,
-so dictation survives beast sleeping. The dashboard shows its health.
+so dictation survives beast sleeping. `/hermes` transcribes on the node GPU,
+then continues Hermes's most-recent session through loopback `:8642`; its
+outgoing key comes from `~/.hermes/.env`. The dashboard shows node health.
 
 ## Invariant tests (`tests/`)
 
@@ -152,6 +176,8 @@ caught a real defense-in-depth gap on first run.
   signal (tone, pace) and a future fine-tuning corpus of your own voice.
 - Everything under `data/` is gitignored, as are `config.json` (holds the
   server token + fallback API key) and logs.
+- `data/hermes_threads.json` caches session IDs and the explicit selection;
+  `data/hermes_turns.jsonl` stores mouthpiece turns outside the dictation corpus.
 
 ## Hermes integration (context sweep)
 
@@ -208,6 +234,11 @@ cleanup fallback is deactivated; re-enabling it requires both configuring it
 AND flipping local_only off.) Unknown remote devices (e.g. a family member's
 thin client) are stored `private`: no audio archive, excluded from the Hermes
 sweep — enforced inside `store.add`, tested in `tests/`.
+
+The Hermes mouthpiece is a second explicit exception: only right-shift
+utterances are sent to the configured authenticated Hermes URL. Right-control
+dictation cannot enter that path, and mouthpiece turns cannot enter
+`history.jsonl`; both boundaries are covered by invariants.
 
 Everything else — audio, transcripts, briefs, the corpus — stays on beast and
 multivac. Phone traffic rides Tailscale (WireGuard, E2E). Note: once Hermes
