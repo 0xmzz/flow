@@ -1335,6 +1335,10 @@ def test_client_transcribe_gives_up_fast_on_a_black_hole_host(monkeypatch):
 
     import requests
     monkeypatch.setattr(requests, "post", fake_post)
+    # No real sockets: the /health probe would otherwise burn its full budget
+    # against TEST-NET-3. resolve_lane returning None is the dead-host case.
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("down")))
     f = flow.Flow.__new__(flow.Flow)
     f.cfg = {"sample_rate": 16000, "server_url": "http://198.51.100.7:8756",
              "fallback_server_url": "http://198.51.100.8:8757",
@@ -1347,3 +1351,91 @@ def test_client_transcribe_gives_up_fast_on_a_black_hole_host(monkeypatch):
     assert len(seen) == 2, "both lanes must be tried"
     for url, timeout in seen:
         assert timeout == (5, 60), f"{url} got {timeout}; connect must be short"
+
+
+# ---------- thin-client lane discovery: survive the host moving ----------
+
+def _client(monkeypatch, tmp_path, **cfg):
+    import flow
+    f = flow.Flow.__new__(flow.Flow)
+    f.cfg = {"sample_rate": 16000, "server": {"token": "t"},
+             "client_name": "test", **cfg}
+    f.overlay = None
+    monkeypatch.setattr(flow, "APP_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(flow, "foreground_window", lambda: "w")
+    return f
+
+
+def test_client_lanes_are_ordered_best_first_and_deduped(monkeypatch, tmp_path):
+    f = _client(monkeypatch, tmp_path,
+                server_url="http://tailnet:8756/",
+                server_urls=["http://lan:8756", "http://tailnet:8756"],
+                fallback_server_url="http://node:8757")
+    assert f.client_lanes() == ["http://tailnet:8756", "http://lan:8756",
+                                "http://node:8757"]
+    # A remembered lane jumps the queue on the next call.
+    f._save_lane_state("http://lan:8756", ["http://learned:8756"])
+    assert f.client_lanes() == ["http://lan:8756", "http://tailnet:8756",
+                                "http://learned:8756", "http://node:8757"]
+
+
+def test_resolve_lane_probes_in_parallel_not_serially(monkeypatch, tmp_path):
+    """Five dead lanes must cost ONE timeout, not five. This is the whole
+    reason the host can advertise addresses the client cannot reach."""
+    import time
+    import flow
+    f = _client(monkeypatch, tmp_path, server_url="http://a:8756",
+                server_urls=[f"http://dead{i}:8756" for i in range(4)])
+
+    def slow_urlopen(url, timeout=None):
+        time.sleep(0.4)                       # every lane is a black hole
+        raise OSError("unreachable")
+
+    # resolve_lane imports urllib.request inside the function, so the module
+    # attribute is the only patch point.
+    monkeypatch.setattr(urllib.request, "urlopen", slow_urlopen)
+    t0 = time.time()
+    assert f.resolve_lane(timeout=2.0) is None
+    elapsed = time.time() - t0
+    assert elapsed < 1.2, f"5 lanes took {elapsed:.2f}s — probing is serial"
+
+
+def test_resolve_lane_learns_the_hosts_other_addresses(monkeypatch, tmp_path):
+    """Connect once by any route; never hand-edit a config again."""
+    import io
+    import json as _json
+    import urllib.request
+    import flow
+    f = _client(monkeypatch, tmp_path, server_url="http://lan:8756")
+
+    class Resp(io.BytesIO):
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def fake_urlopen(url, timeout=None):
+        if not url.startswith("http://lan:8756"):
+            raise OSError("unreachable")
+        return Resp(_json.dumps({
+            "ok": True, "model": "large-v3",
+            "addresses": ["http://beast:8756", "http://192.168.68.77:8756",
+                          "http://100.64.112.82:8756"]}).encode())
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    assert f.resolve_lane(timeout=1.0) == "http://lan:8756"
+    last, known = f._load_lane_state()
+    assert last == "http://lan:8756"
+    assert "http://100.64.112.82:8756" in known, "tailnet address must be learned"
+    # Those learned addresses are now candidates for the next move.
+    f._lane_cache = None
+    assert "http://beast:8756" in f.client_lanes()
+
+
+def test_local_base_urls_advertises_hostname_and_real_ips():
+    import socket
+    from server import _local_base_urls
+    urls = _local_base_urls(8756)
+    assert urls, "a host must advertise at least its own name"
+    assert urls[0] == f"http://{socket.gethostname()}:8756"
+    assert all(u.endswith(":8756") for u in urls)
+    assert not any("127.0.0.1" in u for u in urls), "loopback helps no client"
+    assert len(urls) == len(set(urls))

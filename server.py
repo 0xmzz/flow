@@ -48,6 +48,35 @@ def _parse_multipart(body, content_type):
     return file_bytes, fields
 
 
+def _local_base_urls(port):
+    """Every base URL this host plausibly answers on, hostname first.
+
+    Includes interfaces a given client cannot reach (Hyper-V vSwitch, VPN) —
+    that is fine and deliberate: the client probes candidates rather than
+    trusting them, so an unreachable entry costs one parallel 2s probe and
+    including it costs nothing. Filtering here would mean guessing which
+    network the client is on, which is exactly what we cannot know."""
+    import socket
+    urls, seen = [], set()
+
+    def add(hostpart):
+        url = f"http://{hostpart}:{port}"
+        if hostpart and url not in seen:
+            seen.add(url)
+            urls.append(url)
+
+    try:
+        name = socket.gethostname()
+        add(name)
+        for info in socket.getaddrinfo(name, None, socket.AF_INET):
+            ip = info[4][0]
+            if not ip.startswith("127."):
+                add(ip)
+    except OSError:
+        pass
+    return urls
+
+
 def make_server(flow, host, port, token):
     from streaming import SessionManager
     streams = SessionManager(flow)
@@ -268,7 +297,15 @@ def make_server(flow, host, port, token):
                 hermes = bool(flow.cfg.get("integrations", {}).get("hermes"))
                 return self._html(200, _history_page(hermes=hermes))
             if path == "/health":
-                return self._json(200, {"ok": True, "model": flow.cfg["model"]})
+                # Advertise every address this host answers on. A thin client
+                # caches these and re-probes them later, so the host moving
+                # (DHCP lease, tailnet expiry, new subnet) costs one failed
+                # dictation instead of a manual config edit on someone else's
+                # machine. Deliberately unauthenticated, like the rest of
+                # /health — it leaks only addresses the client can already
+                # reach, and gating it would defeat the discovery it exists for.
+                return self._json(200, {"ok": True, "model": flow.cfg["model"],
+                                        "addresses": _local_base_urls(port)})
             if path == "/client/setup.ps1":
                 from pathlib import Path
                 f = Path(__file__).parent / "client" / "setup.ps1"

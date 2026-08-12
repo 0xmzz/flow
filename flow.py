@@ -88,6 +88,8 @@ _install_crash_logging()
 DEFAULTS = {
     "mode": "full",                # "full" = local GPU; "client" = thin client
     "server_url": "",              # client mode: URL of a full Flow server
+    "server_urls": [],             # extra candidates (LAN ip, tailnet ip, hostname);
+                                   # probed in parallel, best one remembered
     "fallback_server_url": "",     # optional one-shot fallback ASR node
     "client_name": "",             # client mode: device tag (defaults to hostname)
     # Devices whose dictations join YOUR corpus/Hermes context. Anything else
@@ -621,7 +623,11 @@ class ClientStreamer:
         self._thread = None
 
     def _url(self, path):
-        return self.flow.cfg["server_url"].rstrip("/") + path
+        # Same lane the one-shot path picked, or streaming would keep aiming at
+        # a configured URL that stopped answering while /transcribe worked.
+        # resolve_lane() is TTL-cached, so this is free after the first call.
+        base = self.flow.resolve_lane() or self.flow.cfg.get("server_url", "")
+        return base.rstrip("/") + path
 
     def _hdr(self):
         name = (self.flow.cfg.get("client_name")
@@ -1632,6 +1638,86 @@ class Flow:
                     self.live_worker.resume("recorder-owner")
                 self.restore_base_state()
 
+    def _lane_state_path(self):
+        return APP_DIR / "data" / "known_servers.json"
+
+    def _load_lane_state(self):
+        try:
+            d = json.loads(self._lane_state_path().read_text(encoding="utf-8"))
+            return (d.get("last") or None), list(d.get("known") or [])
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None, []
+
+    def _save_lane_state(self, last, known):
+        try:
+            p = self._lane_state_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps({"last": last, "known": known}, indent=2),
+                         encoding="utf-8")
+        except OSError:
+            pass
+
+    def client_lanes(self):
+        """Base URLs to try, best-known first, de-duplicated.
+
+        A thin client has to survive three independent moves it cannot be told
+        about: the host's DHCP lease changing, the tailnet expiring, and the
+        host's own hostname resolving to interfaces the client cannot reach.
+        So the list is last-known-good, then whatever is configured, then
+        everything the host has previously advertised via /health."""
+        last, known = self._load_lane_state()
+        out = []
+        for u in (last, self.cfg.get("server_url"),
+                  *(self.cfg.get("server_urls") or []),
+                  *known, self.cfg.get("fallback_server_url")):
+            u = (u or "").strip().rstrip("/")
+            if u and u not in out:
+                out.append(u)
+        return out
+
+    def resolve_lane(self, timeout=2.0, ttl=60.0):
+        """First candidate whose /health answers, probed in PARALLEL.
+
+        Serial probing costs timeout x dead-lanes before the first byte of
+        audio moves; in parallel the whole decision is one timeout. /health is
+        unauthenticated by design, so this is cheap. Learns the host's other
+        addresses from the response so the next move needs no config edit."""
+        import concurrent.futures
+        import urllib.request
+        now = time.time()
+        cached = getattr(self, "_lane_cache", None)
+        if cached and now - cached[1] < ttl:
+            return cached[0]
+        lanes = self.client_lanes()
+        if not lanes:
+            return None
+
+        def probe(base):
+            with urllib.request.urlopen(base + "/health", timeout=timeout) as r:
+                return base, json.loads(r.read(4096).decode("utf-8", "replace"))
+
+        winner = advertised = None
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(probe, b): b for b in lanes}
+            for fut in concurrent.futures.as_completed(futures, timeout=timeout + 3):
+                try:
+                    base, body = fut.result()
+                except Exception:
+                    continue
+                if body.get("ok"):
+                    winner, advertised = base, body.get("addresses") or []
+                    break
+        if winner is None:
+            self._lane_cache = None
+            return None
+        _, known = self._load_lane_state()
+        merged = list(dict.fromkeys([*known, *(a.rstrip("/") for a in advertised)]))
+        self._save_lane_state(winner, merged)
+        self._lane_cache = (winner, now)
+        print(f"[client] server lane: {winner}"
+              + (f" (+{len(merged)} known)" if merged else ""))
+        return winner
+
     def client_transcribe(self, audio, route, field="text"):
         """Thin client: ship audio to the main server; on failure fall back to
         the always-on multivac node (plain transcription, /transcribe only)."""
@@ -1639,9 +1725,15 @@ class Flow:
 
         from store import wav_bytes
         name = self.cfg.get("client_name") or os.environ.get("COMPUTERNAME", "client")
-        lanes = [self.cfg["server_url"]]
-        if route == "/transcribe" and self.cfg.get("fallback_server_url"):
-            lanes.append(self.cfg["fallback_server_url"])
+        # Probe first: betting a whole audio upload on a guess costs a connect
+        # timeout per wrong lane, and a dead host is the common case.
+        lanes = self.client_lanes()
+        best = self.resolve_lane()
+        if best:
+            lanes = [best] + [u for u in lanes if u != best]
+        if route != "/transcribe":
+            fb = (self.cfg.get("fallback_server_url") or "").rstrip("/")
+            lanes = [u for u in lanes if u != fb]  # node is /transcribe-only
         last_err = None
         for i, base in enumerate(lanes):
             try:
@@ -1663,14 +1755,21 @@ class Flow:
                 )
                 r.raise_for_status()
                 out = r.json().get(field, "")
-                lane = "primary" if i == 0 else "fallback"
-                print(f"[client] {route} via {lane} -> {out[:80]!r}")
+                if i:  # a later lane won — remember it so the next one is direct
+                    _, known = self._load_lane_state()
+                    self._save_lane_state(base.rstrip("/"), known)
+                    self._lane_cache = (base.rstrip("/"), time.time())
+                print(f"[client] {route} via {base} -> {out[:80]!r}")
                 return out
             except Exception as e:
                 last_err = e
-                print(f"[client] {route} lane {i} failed: {e}")
+                print(f"[client] {route} lane {base} failed: {e}")
+        self._lane_cache = None  # stop trusting a lane that just failed
+        msg = (f"Flow server unreachable. Tried {len(lanes)}: "
+               + ", ".join(lanes[:4]) + (" ..." if len(lanes) > 4 else ""))
+        print(f"[client] {msg} last error: {last_err}")
         if self.overlay:
-            self.overlay.set(("say", f"Flow unreachable: {last_err}"))
+            self.overlay.set(("say", msg))
         return ""
 
     def remote_start(self):

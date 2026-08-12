@@ -43,6 +43,13 @@ def _isolate_user_data(tmp_path, monkeypatch):
         original_agent_init(self, *args, **kwargs)
 
     monkeypatch.setattr(agents.AgentRunner, "__init__", agent_init)
+
+    # flow.APP_DIR is the other write root: last.wav, the transcript store, and
+    # known_servers.json all hang off it. Same rule as the intent log — a test
+    # must never be able to land a file in the running app's data directory.
+    # Tests that genuinely need the real tree re-patch this themselves.
+    import flow
+    monkeypatch.setattr(flow, "APP_DIR", tmp_path, raising=False)
     yield
 
 
