@@ -220,8 +220,12 @@ def make_server(flow, host, port, token):
                     audio, sr = decode_any(self._body())
                 except Exception as e:
                     return self._json(400, {"error": f"bad audio: {e}"})
+                # NEVER styled, on any lane — the router matches literal
+                # phrases, so a skill that rewords the utterance breaks every
+                # command. Mirrors process_command on the host path.
                 text, _ = flow.transcribe_and_store(
-                    audio, sample_rate=sr, source="remote-command", window=device)
+                    audio, sample_rate=sr, source="remote-command",
+                    window=device, skip_cleanup=True)
                 dev = (device or "").split("|")[0].lower()
                 private = not any(
                     trusted in dev

@@ -441,15 +441,23 @@ def test_open_strips_venue_and_rescues_site_in_phrase(monkeypatch):
     router = _router()
     seen, opened = [], []
     monkeypatch.setattr(commands, "switch_to", lambda _name: None)
+    # Patched BEFORE the first _open, not between the two halves. The old order
+    # left the first call's fallthrough pointing at the real webbrowser.open,
+    # and it took it: every run of this file opened a real YouTube tab, green.
+    monkeypatch.setattr(commands.webbrowser, "open", opened.append)
+    # _open passes the user's own casing through ("YouTube"), so this mock has
+    # to fold case — comparing to "youtube" made it return None and the app
+    # lane silently lost to the browser fallback.
     monkeypatch.setattr(commands, "open_app", lambda name:
-                        seen.append(name) or ("YouTube" if name == "youtube" else None))
+                        seen.append(name) or
+                        ("YouTube" if name.lower() == "youtube" else None))
     assert router._open("YouTube in the browser") == "Opening YouTube."
     assert seen == ["YouTube"]
+    assert opened == [], "the app lane handled it; nothing should reach a browser"
     monkeypatch.setattr(commands, "open_app", lambda _name: None)
     monkeypatch.setattr(commands, "installed_apps", lambda: {})
     monkeypatch.setattr(commands.os, "startfile", lambda _name:
                         (_ for _ in ()).throw(OSError()))
-    monkeypatch.setattr(commands.webbrowser, "open", opened.append)
     assert router._open("to YouTube in the browser") == "Opening youtube."
     assert opened == [commands.KNOWN_SITES["youtube"]]
 
@@ -1077,3 +1085,265 @@ def test_setup_does_not_write_existing_config(tmp_path, monkeypatch):
     monkeypatch.setattr(flow, "live_input_devices", lambda: [])
     flow.setup_machine()
     assert path.read_bytes() == original
+
+
+# ---------- writing skills: styling is scoped, and never costs live typing ----------
+
+SKILL_CFG = {
+    "cleanup": {
+        "enabled": True,
+        "profiles": [
+            {"match": ["whatsapp"], "style": "casual"},
+            {"match": ["claude", "code"], "style": "AI prompt",
+             "feedback": "live"},
+        ],
+    },
+}
+
+
+def test_resolve_profile_returns_the_whole_skill_not_just_the_style():
+    import flow
+    p = flow.resolve_profile(SKILL_CFG, "WhatsApp")
+    assert p["style"] == "casual"
+    assert flow.match_profile(SKILL_CFG, "WhatsApp") == "casual"
+    assert flow.resolve_profile(SKILL_CFG, "Spotify") is None
+    assert flow.match_profile(SKILL_CFG, "Spotify") is None
+
+
+def test_matched_skill_defaults_to_ghost_not_a_silent_live_type_regression():
+    """Adding a skill must not be how live typing gets switched off."""
+    import flow
+    # Unmatched window: live typing, exactly as before skills existed.
+    assert flow.feedback_mode(SKILL_CFG, "Spotify") == "live"
+    # Matched with no opinion: ghost (styled text isn't known until the end).
+    assert flow.feedback_mode(SKILL_CFG, "WhatsApp") == "ghost"
+    # Matched and opted back in: live.
+    assert flow.feedback_mode(SKILL_CFG, "Claude") == "live"
+    # Cleanup off: always live, whatever the profiles say.
+    off = {"cleanup": dict(SKILL_CFG["cleanup"], enabled=False)}
+    assert flow.feedback_mode(off, "WhatsApp") == "live"
+
+
+def test_a_matched_profile_with_no_style_keeps_live_typing():
+    """Parity with the pre-skills predicate, which tested the STYLE's
+    truthiness, not the profile's existence. A profile with no style is a text
+    no-op (llm_cleanup early-returns on style None under mode "matched"), so it
+    must not cost live typing — that is the exact regression this split
+    exists to prevent, one layer down."""
+    import flow
+    for falsy in ({}, {"style": ""}, {"style": None}, {"style": 0}):
+        cfg = {"cleanup": {"enabled": True,
+                           "profiles": [dict({"match": ["slack"]}, **falsy)]}}
+        assert flow.feedback_mode(cfg, "dannis (DM) - Slack") == "live", falsy
+    # An explicit opinion still wins over the derived default.
+    cfg = {"cleanup": {"enabled": True,
+                       "profiles": [{"match": ["slack"], "feedback": "ghost"}]}}
+    assert flow.feedback_mode(cfg, "Slack") == "ghost"
+
+
+def test_on_press_wires_feedback_mode_into_the_streamer(monkeypatch):
+    """The helper being right is worthless if the call site ignores it."""
+    import threading
+    import types
+    import flow
+    made = []
+
+    cfg = json.loads(json.dumps(flow.DEFAULTS))
+    cfg["mode"] = "host"
+    cfg["streaming"]["enabled"] = True
+    cfg["cleanup"]["enabled"] = True
+    cfg["cleanup"]["profiles"] = [{"match": ["whatsapp"], "style": "casual"}]
+
+    def press(window):
+        made.clear()
+        f = flow.Flow.__new__(flow.Flow)
+        f.cfg = cfg
+        f._session_lock = threading.RLock()
+        f.busy = threading.Lock()
+        f.recording = False
+        f.streamer = None
+        f.live_worker = None
+        f.hermes_context = None
+        f.muter = types.SimpleNamespace(mute=lambda: None)
+        f.recorder = types.SimpleNamespace(start=lambda: None)
+        monkeypatch.setattr(flow.Flow, "set_icon", lambda self, *a, **k: None)
+        monkeypatch.setattr(flow, "stop_speech", lambda: None)
+        monkeypatch.setattr(flow, "foreground_window", lambda: window)
+        monkeypatch.setattr(flow, "StreamWorker",
+                            lambda fl, live=False, source=None:
+                            made.append(live) or types.SimpleNamespace(
+                                start=lambda: None))
+        f.on_press("dictate")
+        return made[0]
+
+    assert press("Spotify") is True, "unmatched window must still live-type"
+    assert press("WhatsApp") is False, "a styled window must go ghost"
+
+
+def _bare_flow(monkeypatch, cfg):
+    """A Flow with no __init__: enough surface to drive transcribe_and_store."""
+    import flow
+    f = flow.Flow.__new__(flow.Flow)
+    f.cfg = cfg
+    f.store = None
+    f.model_lock = threading.Lock()
+    monkeypatch.setattr(flow, "resample_linear", lambda a, s, t: a)
+    return f
+
+
+def _cleanup_spy(monkeypatch):
+    import flow
+    calls = []
+    monkeypatch.setattr(flow, "llm_cleanup",
+                        lambda text, cfg, window=None: calls.append(window) or "STYLED")
+    return calls
+
+
+def test_untrusted_remote_speech_is_never_restyled(monkeypatch):
+    """Another person's words must not be rewritten in your voice."""
+    import types
+    import numpy as np
+    import flow
+    cfg = {"sample_rate": 16000, "model": "m", "device": "cpu",
+           "trusted_devices": ["work-vm"], "cleanup": {"enabled": True}}
+    f = _bare_flow(monkeypatch, cfg)
+    monkeypatch.setattr(flow.Flow, "decode",
+                        lambda self, a, **k: [types.SimpleNamespace(text="hello")])
+    calls = _cleanup_spy(monkeypatch)
+
+    text, _ = f.transcribe_and_store(
+        np.zeros(1600, dtype=np.float32), source="remote",
+        window="BAREERA|Chrome")
+    assert calls == [], "an unknown remote device must bypass cleanup entirely"
+    assert text == "hello", "her words come back verbatim"
+
+    # A trusted device is still styled.
+    text, _ = f.transcribe_and_store(
+        np.zeros(1600, dtype=np.float32), source="remote",
+        window="work-vm|Terminal")
+    assert calls == ["work-vm|Terminal"]
+    assert text == "STYLED"
+
+
+def test_command_mode_is_never_styled(monkeypatch):
+    """commands.py matches literal phrases; a compress skill would break them."""
+    import types
+    import numpy as np
+    import flow
+    seen = {}
+
+    f = flow.Flow.__new__(flow.Flow)
+    f.cfg = {"sample_rate": 16000, "min_duration_s": 0.0, "mode": "host",
+             "cleanup": {"enabled": True}}
+    f.busy = threading.Lock()
+    f.overlay = None
+    f.live_worker = None
+    f.router = types.SimpleNamespace(handle=lambda t: "done")
+    monkeypatch.setattr(flow.Flow, "set_icon", lambda self, *a, **k: None)
+    monkeypatch.setattr(flow.Flow, "mic_is_deaf", lambda self, a: False)
+    monkeypatch.setattr(flow.Flow, "restore_base_state", lambda self: None)
+    monkeypatch.setattr(flow, "foreground_window", lambda: "Claude")
+    monkeypatch.setattr(flow, "speak", lambda *a, **k: None)
+
+    def fake_tas(self, audio, **kw):
+        seen.update(kw)
+        return "open github", {}
+
+    monkeypatch.setattr(flow.Flow, "transcribe_and_store", fake_tas)
+    f.process_command(np.zeros(1600, dtype=np.float32))
+    assert seen.get("skip_cleanup") is True
+    assert seen.get("source") == "pc-command"
+
+
+def test_skip_cleanup_actually_suppresses_the_llm_pass(monkeypatch):
+    """The caller passing the kwarg is only half of it — the callee must obey."""
+    import types
+    import numpy as np
+    import flow
+    called = []
+    cfg = {"sample_rate": 16000, "model": "m", "device": "cpu",
+           "trusted_devices": [], "cleanup": {"enabled": True}}
+    f = _bare_flow(monkeypatch, cfg)
+    monkeypatch.setattr(flow.Flow, "decode",
+                        lambda self, a, **k: [types.SimpleNamespace(text="open github")])
+    monkeypatch.setattr(flow, "llm_cleanup",
+                        lambda t, c, window=None: called.append(t) or "STYLED")
+
+    text, _ = f.transcribe_and_store(np.zeros(1600, dtype=np.float32),
+                                     source="pc-command", skip_cleanup=True)
+    assert called == [] and text == "open github"
+    # ...and without the flag the same input IS styled, so the test can fail.
+    text, _ = f.transcribe_and_store(np.zeros(1600, dtype=np.float32),
+                                     source="pc-hotkey")
+    assert called and text == "STYLED"
+
+
+def test_untrusted_remote_is_not_primed_with_your_vocabulary(monkeypatch):
+    """Vocab bias makes Whisper hear YOUR words in someone else's mumble."""
+    import types
+    import numpy as np
+    import flow
+    prompts = []
+    cfg = {"sample_rate": 16000, "model": "m", "device": "cpu",
+           "vocab": ["Folionomics", "Zubair Zia", "veNFT"],
+           "trusted_devices": ["work-vm"], "cleanup": {"enabled": False}}
+    f = _bare_flow(monkeypatch, cfg)
+    monkeypatch.setattr(flow.Flow, "decode",
+                        lambda self, a, **k: prompts.append(k.get("prompt"))
+                        or [types.SimpleNamespace(text="hi")])
+
+    f.transcribe_and_store(np.zeros(1600, dtype=np.float32),
+                           source="remote", window="BAREERA|Chrome")
+    assert prompts[-1] is None, "her audio must not be primed with your vocab"
+
+    f.transcribe_and_store(np.zeros(1600, dtype=np.float32),
+                           source="remote", window="work-vm|Terminal")
+    assert "Folionomics" in (prompts[-1] or ""), "trusted devices keep the bias"
+
+    f.transcribe_and_store(np.zeros(1600, dtype=np.float32), source="pc-hotkey")
+    assert "Folionomics" in (prompts[-1] or ""), "your own dictation keeps it"
+
+
+def test_trusted_devices_matching_is_case_insensitive_both_ways(monkeypatch):
+    import types
+    import numpy as np
+    import flow
+    cfg = {"sample_rate": 16000, "model": "m", "device": "cpu",
+           "trusted_devices": ["Work-VM"], "cleanup": {"enabled": True}}
+    f = _bare_flow(monkeypatch, cfg)
+    monkeypatch.setattr(flow.Flow, "decode",
+                        lambda self, a, **k: [types.SimpleNamespace(text="hi")])
+    calls = _cleanup_spy(monkeypatch)
+    f.transcribe_and_store(np.zeros(1600, dtype=np.float32),
+                           source="remote", window="work-vm|Terminal")
+    assert calls, "a configured device must match whatever case it was typed in"
+
+
+def test_client_transcribe_gives_up_fast_on_a_black_hole_host(monkeypatch):
+    """A dead host must not look like a hung transcription. Asserts the real
+    timeout reaches requests on EVERY lane, including the fallback."""
+    import numpy as np
+    import flow
+    seen = []
+
+    class Boom(Exception):
+        pass
+
+    def fake_post(url, **kw):
+        seen.append((url, kw.get("timeout")))
+        raise Boom("unreachable")
+
+    import requests
+    monkeypatch.setattr(requests, "post", fake_post)
+    f = flow.Flow.__new__(flow.Flow)
+    f.cfg = {"sample_rate": 16000, "server_url": "http://198.51.100.7:8756",
+             "fallback_server_url": "http://198.51.100.8:8757",
+             "server": {"token": "t"}, "client_name": "test"}
+    f.overlay = None
+    monkeypatch.setattr(flow, "foreground_window", lambda: "w")
+
+    out = f.client_transcribe(np.zeros(1600, dtype=np.float32), "/transcribe")
+    assert out == ""
+    assert len(seen) == 2, "both lanes must be tried"
+    for url, timeout in seen:
+        assert timeout == (5, 60), f"{url} got {timeout}; connect must be short"

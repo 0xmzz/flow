@@ -231,12 +231,41 @@ def apply_replacements(text, cfg):
     return text
 
 
-def match_profile(cfg, window):
+def resolve_profile(cfg, window):
+    """The first profile whose match list hits the window title, or None.
+
+    Callers need the whole profile, not just its style: feedback mode (live vs
+    ghost typing) is a property of the skill, and deriving it from "does a
+    style exist" is what coupled styling to a live-typing regression."""
     w = (window or "").lower()
     for p in cfg["cleanup"].get("profiles", []):
         if any(m in w for m in p.get("match", [])):
-            return p.get("style")
+            return p
     return None
+
+
+def match_profile(cfg, window):
+    p = resolve_profile(cfg, window)
+    return p.get("style") if p else None
+
+
+def feedback_mode(cfg, window):
+    """"live" (paste words as you speak) or "ghost" (rolling decode, no paste).
+
+    Styled text cannot be live-typed — it is not known until the utterance
+    ends — so a matched skill defaults to ghost. A skill whose transform
+    preserves word order can opt back in with "feedback": "live". Ghost still
+    runs the rolling decode, so release-to-paste stays fast either way."""
+    if not cfg["cleanup"]["enabled"]:
+        return "live"
+    p = resolve_profile(cfg, window)
+    if p is None:
+        return "live"
+    # Default mirrors the OLD predicate exactly, which tested the truthiness of
+    # the STYLE, not the existence of the profile: a matched profile with no
+    # style is a text no-op (llm_cleanup early-returns on style None under
+    # mode "matched"), so it must not cost live typing.
+    return p.get("feedback", "ghost" if p.get("style") else "live")
 
 
 def load_config():
@@ -1352,11 +1381,11 @@ class Flow:
                         self.streamer = ClientStreamer(self)
                         self.streamer.start()
                     return
-                # Live typing only where no style profile applies — styled text
-                # must wait for the whole utterance.
+                # Feedback mode belongs to the skill, not to "does a style
+                # exist" — see feedback_mode(). Defaults reproduce today's
+                # behaviour exactly: matched -> ghost, unmatched -> live.
                 live = (self.cfg["streaming"].get("live_type", True)
-                        and not (self.cfg["cleanup"]["enabled"]
-                                 and match_profile(self.cfg, foreground_window())))
+                        and feedback_mode(self.cfg, foreground_window()) == "live")
                 self.streamer = StreamWorker(self, live=live)
                 self.streamer.start()
 
@@ -1431,23 +1460,33 @@ class Flow:
             peak = float(np.abs(audio).max()) or 1.0
             audio = (audio / peak * 0.95).astype(np.float32)
         committed_text, committed_samples = committed
+        # Unknown remote devices (e.g. a family member's thin client) are
+        # PRIVATE by default: transcript stored for their history page, but no
+        # audio archive and the Hermes sweep skips it. Decided FIRST, before
+        # anything personal touches the audio, because trust gates BOTH
+        # personalisation channels: the vocab bias below and the LLM restyle
+        # further down. Case-folded on both sides — dev is lowercased, the
+        # configured entries are whatever the user typed.
+        dev = (window or "").split("|")[0].lower()
+        private = (source.startswith("remote") and
+                   not any(t.lower() in dev for t in self.cfg["trusted_devices"]))
         t0 = time.time()
         tail = audio[committed_samples:]
-        segs = self.decode(tail, prompt=self.bias_prompt(committed_text)) \
-            if len(tail) > 0 else []
+        # The vocab list is personal: priming Whisper with "Folionomics",
+        # "Zubair Zia", "veNFT" makes it hear those words in someone else's
+        # mumble — an active corruption of their transcript, not just a style
+        # leak. Untrusted speech is primed with its own committed prefix only.
+        prompt = ((committed_text[-200:] or None) if private
+                  else self.bias_prompt(committed_text))
+        segs = self.decode(tail, prompt=prompt) if len(tail) > 0 else []
         raw = (committed_text + " "
                + " ".join(s.text.strip() for s in segs)).strip()
         asr_t = time.time() - t0
         text = raw
-        if raw and self.cfg["cleanup"]["enabled"] and not skip_cleanup:
+        if (raw and self.cfg["cleanup"]["enabled"] and not skip_cleanup
+                and not private):
             text = llm_cleanup(raw, self.cfg, window=window)
         if self.store and raw:
-            # Unknown remote devices (e.g. a family member's thin client) are
-            # PRIVATE by default: transcript stored for their history page, but
-            # no audio archive and the Hermes sweep skips it.
-            dev = (window or "").split("|")[0].lower()
-            private = (source.startswith("remote") and
-                       not any(t in dev for t in self.cfg["trusted_devices"]))
             self.store.add(raw, source=source, window=window, duration_s=dur,
                            asr_s=asr_t, model=self.cfg["model"],
                            device=self.cfg["device"],
@@ -1517,8 +1556,12 @@ class Flow:
                     response = self.client_transcribe(audio, "/command",
                                                       field="response")
                 else:
+                    # NEVER styled: the router matches literal phrases
+                    # (commands.py), so a skill that compresses or rewords the
+                    # utterance silently breaks every voice command.
                     text, _ = self.transcribe_and_store(
-                        audio, source="pc-command", window=foreground_window())
+                        audio, source="pc-command", window=foreground_window(),
+                        skip_cleanup=True)
                     if not text:
                         return
                     print(f"[command] heard: {text}")
@@ -1610,7 +1653,13 @@ class Flow:
                         "Content-Type": "audio/wav",
                         "X-Device": f"{name}|{foreground_window()}"[:200],
                     },
-                    timeout=60,
+                    # (connect, read). An unreachable host must fail in
+                    # seconds, not a minute: with a dead primary AND a dead
+                    # fallback a single 60s connect timeout per lane left the
+                    # client sitting on "transcribing" for two full minutes
+                    # with no explanation. Reads still get the full budget —
+                    # a long dictation legitimately takes a while to decode.
+                    timeout=(5, 60),
                 )
                 r.raise_for_status()
                 out = r.json().get(field, "")
