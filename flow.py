@@ -1308,9 +1308,10 @@ def paste_text(text, mode, restore=True):
             pass
     if not _copy_clipboard(text):
         # The transcript still has to land at the cursor. Typing is slower
-        # but it does not depend on the clipboard.
+        # but it does not depend on the clipboard. keyboard.write turns a
+        # newline into Enter, which would send the message.
         print("[paste] clipboard unavailable; typing the dictation instead")
-        keyboard.write(text)
+        keyboard.write(text.replace("\r\n", " ").replace("\n", " ").replace("\r", " "))
         return
     time.sleep(0.02)
     keyboard.press("ctrl")

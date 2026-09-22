@@ -357,6 +357,29 @@ def test_clipboard_failure_types_the_dictation(monkeypatch):
     assert sum(slept) == pytest.approx(0.30)
 
 
+def test_typed_fallback_replaces_newlines_with_spaces(monkeypatch):
+    """A typed fallback must not press Enter in the middle of a dictation."""
+    import pyperclip
+    import flow
+    writes = []
+
+    def copy(_text):
+        raise pyperclip.PyperclipException("Error calling OpenClipboard")
+
+    monkeypatch.setattr(pyperclip, "copy", copy)
+    monkeypatch.setattr(flow.keyboard, "press", lambda key: None)
+    monkeypatch.setattr(flow.keyboard, "release", lambda key: None)
+    monkeypatch.setattr(flow.keyboard, "write", lambda text: writes.append(text))
+    monkeypatch.setattr(flow.time, "sleep", lambda _s: None)
+    flow.paste_text("line one\nline two\r\nline three", "clipboard", restore=False)
+    assert writes == ["line one line two line three"]
+    assert "\n" not in writes[0]
+
+    writes.clear()
+    flow.paste_text("line one\nline two", "type")
+    assert writes == ["line one\nline two"]
+
+
 def test_clipboard_restore_retries(monkeypatch):
     import pyperclip
     import flow
