@@ -909,10 +909,14 @@ class Overlay:
                         show("live")
                         place()
                     elif kind == "work":
-                        status.config(text="Transcribing…")
+                        label = "Transcribing…"
+                        if isinstance(s, tuple) and len(s) > 1 and s[1]:
+                            label = str(s[1])[:200]
+                        status.config(text=label)
                         context.config(text="")
                         hide_at[0] = None
                         show("work")
+                        place()
                     elif kind == "say":
                         status.config(text=s[1][:200])
                         context.config(text="")
@@ -1052,6 +1056,17 @@ _KEY_POLL_S = 0.15          # ctrl-loop idle poll; two polls confirm a lost KEY_
 _KEY_UP_POLLS = 2           # one GetAsyncKeyState flicker must not cut a dictation
 _REPEAT_MAX_GAP_S = 1.0     # Windows auto-repeat is ~30–50ms; a longer gap is a new press
 _MIC_WAIT_S = 1.0           # a press waits this long for a probe, then says so
+_WAIT_HINT_S = 1.5          # after this long, the overlay counts the seconds
+_WAIT_BUSY_S = 8.0          # after this long, say the machine is busy
+_WAIT_TICK_S = 1.0
+
+
+def _transcribing_label(elapsed):
+    """Overlay line for a decode that has already run past _WAIT_HINT_S."""
+    whole = max(1, int(elapsed))
+    if elapsed >= _WAIT_BUSY_S:
+        return f"Still transcribing ({whole}s) — the PC is busy"
+    return f"Transcribing… ({whole}s)"
 
 
 def _vk_for_hotkey(name):
@@ -1447,14 +1462,15 @@ class Flow:
                 "say",
                 "Microphone is still being checked. Release and try again."))
 
-    def _submit_job(self, mode, audio, streamer, hermes_context):
+    def _submit_job(self, mode, audio, streamer, hermes_context,
+                    released_at=None):
         """Hand a finished take to the single worker. Press order is paste order."""
         if mode == "hermes":
             self._job_q.put(("hermes", (audio, hermes_context)))
         elif mode == "command":
             self._job_q.put(("command", (audio,)))
         else:
-            self._job_q.put(("dictate", (audio, streamer)))
+            self._job_q.put(("dictate", (audio, streamer, released_at)))
 
     def _job_loop(self):
         while True:
@@ -1554,7 +1570,8 @@ class Flow:
         # The audio array is already detached. Free the mic before the
         # (possibly slow) decode so the next press can record immediately.
         self._release_mic()
-        self._submit_job(mode, audio, streamer, hermes_context)
+        self._submit_job(mode, audio, streamer, hermes_context,
+                         time.monotonic())
 
     def bias_prompt(self, committed=""):
         """initial_prompt = personal vocabulary + committed text so far."""
@@ -1665,7 +1682,31 @@ class Flow:
         elif self.overlay:
             self.overlay.set(("say", "Couldn't copy the last dictation"))
 
-    def process(self, audio, streamer=None):
+    def _announce_wait(self, started, stop):
+        """Enqueue a ticking 'still transcribing' line. Never touches Tk."""
+        next_at = started + _WAIT_HINT_S
+        while True:
+            now = time.monotonic()
+            if now < next_at:
+                if stop.wait(next_at - now):
+                    return
+                continue
+            if stop.is_set():
+                return
+            elapsed = time.monotonic() - started
+            if self.overlay:
+                self.overlay.set(("work", _transcribing_label(elapsed)))
+            next_at += _WAIT_TICK_S
+            if next_at <= time.monotonic():
+                next_at = time.monotonic() + _WAIT_TICK_S
+
+    def process(self, audio, streamer=None, released_at=None):
+        stop = threading.Event()
+        started = time.monotonic() if released_at is None else released_at
+        watcher = threading.Thread(
+            target=self._announce_wait, args=(started, stop),
+            daemon=True, name="flow-wait")
+        watcher.start()
         with self.busy:
             self.set_icon("work")
             try:
@@ -1709,6 +1750,8 @@ class Flow:
                     self._safe_paste(apply_replacements(text, self.cfg),
                                      self.cfg["paste_mode"])
             finally:
+                stop.set()
+                watcher.join(timeout=1.0)
                 if streamer:
                     time.sleep(0.3)
                     streamer.restore_clipboard()

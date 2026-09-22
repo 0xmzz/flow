@@ -26,6 +26,7 @@ def _bare(monkeypatch):
         "mute_output_while_recording": False,
         "sample_rate": 16000,
         "min_duration_s": 0.6,
+        "paste_mode": "clipboard",
     }
     f._pressed_keys = set()
     f._active_ptt_key = None
@@ -48,6 +49,7 @@ def _bare(monkeypatch):
     f._last_mic_probe = 0.0
     f._session_lock = threading.Lock()
     f.overlay = None
+    f.tray = None
     f.muter = types.SimpleNamespace(mute=lambda: None, restore=lambda: None)
     f.recorder = types.SimpleNamespace(start=lambda: None, stop=lambda: None,
                                        level=0.0)
@@ -442,7 +444,7 @@ def test_press_while_busy_records_and_pastes_in_order(monkeypatch):
     entered = threading.Event()
     release_first = threading.Event()
 
-    def fake_process(self, audio, streamer=None):
+    def fake_process(self, audio, streamer=None, released_at=None):
         self.busy.acquire()
         try:
             if audio == "first":
@@ -578,3 +580,59 @@ def test_remote_start_still_refuses_while_a_local_recording_is_active(monkeypatc
     f._mic_lock.acquire()
     assert f.remote_start() is False
     assert f.active_mode == "dictate"
+
+
+def test_transcribing_label_names_a_busy_pc_after_eight_seconds():
+    import flow
+    assert flow._transcribing_label(2.4) == "Transcribing… (2s)"
+    assert flow._transcribing_label(7.9) == "Transcribing… (7s)"
+    assert flow._transcribing_label(8.0) == "Still transcribing (8s) — the PC is busy"
+    assert flow._transcribing_label(12.2) == "Still transcribing (12s) — the PC is busy"
+
+
+def test_slow_process_emits_overlay_progress_and_stops(monkeypatch):
+    import numpy as np
+    import flow
+    f = _bare(monkeypatch)
+    f.cfg["min_duration_s"] = 0
+    messages = []
+    f.overlay = types.SimpleNamespace(set=messages.append)
+    monkeypatch.setattr(flow.Flow, "mic_is_deaf", lambda self, audio: False)
+    monkeypatch.setattr(flow, "_WAIT_HINT_S", 0.05)
+    monkeypatch.setattr(flow, "_WAIT_TICK_S", 0.05)
+    monkeypatch.setattr(flow, "_WAIT_BUSY_S", 0.12)
+
+    def slow(self, audio, **kw):
+        time.sleep(0.28)
+        return "hello", {}
+
+    monkeypatch.setattr(flow.Flow, "transcribe_and_store", slow)
+    monkeypatch.setattr(flow, "paste_text", lambda *a, **k: None)
+    f.process(np.zeros(1600, dtype=np.float32),
+              released_at=time.monotonic() - 0.01)
+    texts = [m[1] for m in messages
+             if isinstance(m, tuple) and m and m[0] == "work"]
+    assert any(t.startswith("Transcribing") for t in texts)
+    assert any("the PC is busy" in t for t in texts)
+    marked = len(messages)
+    time.sleep(0.12)
+    late = [m for m in messages[marked:]
+            if isinstance(m, tuple) and m and m[0] == "work"]
+    assert late == []
+
+
+def test_fast_process_does_not_announce_a_wait(monkeypatch):
+    import numpy as np
+    import flow
+    f = _bare(monkeypatch)
+    f.cfg["min_duration_s"] = 0
+    messages = []
+    f.overlay = types.SimpleNamespace(set=messages.append)
+    monkeypatch.setattr(flow.Flow, "mic_is_deaf", lambda self, audio: False)
+    monkeypatch.setattr(flow.Flow, "transcribe_and_store",
+                        lambda self, audio, **kw: ("hi", {}))
+    monkeypatch.setattr(flow, "paste_text", lambda *a, **k: None)
+    f.process(np.zeros(1600, dtype=np.float32))
+    texts = [m[1] for m in messages
+             if isinstance(m, tuple) and m and m[0] == "work"]
+    assert texts == []
