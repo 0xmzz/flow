@@ -524,6 +524,10 @@ class StreamWorker:
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
+    def halt(self):
+        """Stop committing. Join happens later, off the ctrl-loop thread."""
+        self._active = False
+
     def stop(self):
         self._active = False
         if self._thread:
@@ -686,9 +690,13 @@ class ClientStreamer:
         except Exception as e:
             print(f"[client-stream] live type failed: {e}")
 
+    def halt(self):
+        """Stop uploading. finish() joins the thread off the ctrl loop."""
+        self._active = False
+
     def stop(self):
         """on_release calls this like a StreamWorker; the real work is finish()."""
-        self._active = False
+        self.halt()
         if self._thread:
             self._thread.join(2.0)
         return self.committed, 0
@@ -1558,8 +1566,11 @@ class Flow:
             self._record_started_at = None
             streamer = self.streamer
             self.streamer = None
+            # Signal only. stop() joins the stream thread for up to 2s and
+            # must not run here — this is the ctrl loop, and the next press
+            # is waiting behind it. process() joins before it reads the commit.
             if streamer:
-                streamer.stop()
+                streamer.halt()
             audio = self.recorder.stop()
             self.muter.restore()
             mode = self.active_mode
@@ -1603,10 +1614,49 @@ class Flow:
             )
             return list(segments)
 
+    def _store_transcript(self, raw, source, window, dur, asr_t, audio,
+                          sample_rate, cleaned, private, e2e_s=None,
+                          stages=None):
+        if not (self.store and raw):
+            return None
+        return self.store.add(
+            raw, source=source, window=window, duration_s=dur, asr_s=asr_t,
+            model=self.cfg["model"], device=self.cfg["device"],
+            audio=None if private else audio, sample_rate=sample_rate,
+            cleaned=cleaned, private=private, e2e_s=e2e_s, stages=stages)
+
+    def _flush_pending(self, meta, e2e_s=None, stages=None):
+        pending = (meta or {}).get("pending")
+        if not pending:
+            return None
+        return self._store_transcript(
+            pending["raw"], pending["source"], pending["window"], pending["dur"],
+            pending["asr_t"], pending["audio"], pending["sample_rate"],
+            pending["cleaned"], pending["private"], e2e_s=e2e_s, stages=stages)
+
+    def _note_e2e(self, released_at, stages, audio_s):
+        """e2e is release → paste. Log a breakdown when that exceeds 3s."""
+        if released_at is None:
+            return None
+        e2e = round(max(0.0, time.monotonic() - released_at), 3)
+        if e2e > 3.0:
+            print(f"[slow] e2e {e2e:.1f}s: "
+                  f"queue {stages['queue_wait']:.1f} "
+                  f"join {stages['stream_join']:.1f} "
+                  f"decode {stages['decode']:.1f} "
+                  f"paste {stages['paste']:.1f} "
+                  f"({audio_s:.1f}s audio)")
+        return e2e
+
     def transcribe_and_store(self, audio, sample_rate=None, source="pc-hotkey",
-                             window=None, committed=("", 0), skip_cleanup=False):
+                             window=None, committed=("", 0), skip_cleanup=False,
+                             persist=True):
         """Shared pipeline: resample -> ASR (tail only if streaming committed a
-        prefix) -> cleanup -> store. Returns (text, meta)."""
+        prefix) -> cleanup -> store. Returns (text, meta).
+
+        persist=False leaves the row in meta["pending"] so the dictate path
+        can paste first and write history after.
+        """
         target_sr = self.cfg["sample_rate"]
         if sample_rate and sample_rate != target_sr:
             audio = resample_linear(audio, sample_rate, target_sr)
@@ -1638,17 +1688,27 @@ class Flow:
                + " ".join(s.text.strip() for s in segs)).strip()
         asr_t = time.time() - t0
         text = raw
+        cleanup_s = 0.0
         if (raw and self.cfg["cleanup"]["enabled"] and not skip_cleanup
                 and not private):
+            c0 = time.monotonic()
             text = llm_cleanup(raw, self.cfg, window=window)
-        if self.store and raw:
-            self.store.add(raw, source=source, window=window, duration_s=dur,
-                           asr_s=asr_t, model=self.cfg["model"],
-                           device=self.cfg["device"],
-                           audio=None if private else audio,
-                           sample_rate=target_sr, cleaned=text, private=private)
+            cleanup_s = time.monotonic() - c0
+        meta = {"asr_s": round(asr_t, 2), "duration_s": round(dur, 2),
+                "cleanup_s": round(cleanup_s, 3)}
+        if raw:
+            meta["pending"] = {
+                "raw": raw, "source": source, "window": window, "dur": dur,
+                "asr_t": asr_t, "audio": None if private else audio,
+                "sample_rate": target_sr, "cleaned": text, "private": private,
+            }
+        if persist:
+            self._store_transcript(
+                raw, source, window, dur, asr_t,
+                None if private else audio, target_sr, text, private)
+            meta.pop("pending", None)
         print(f"[{source}] [{dur:.1f}s audio -> {asr_t:.2f}s asr] {text}")
-        return text, {"asr_s": round(asr_t, 2), "duration_s": round(dur, 2)}
+        return text, meta
 
     def _remember(self, text):
         """Keep the transcript before any paste attempt, so a failed paste
@@ -1710,6 +1770,9 @@ class Flow:
         with self.busy:
             self.set_icon("work")
             try:
+                work_started = time.monotonic()
+                queue_s = (0.0 if released_at is None
+                           else max(0.0, work_started - released_at))
                 dur = len(audio) / self.cfg["sample_rate"]
                 if dur < self.cfg["min_duration_s"]:
                     return
@@ -1733,15 +1796,23 @@ class Flow:
                         self._remember(text)
                         self._safe_paste(text, self.cfg["paste_mode"])
                     return
-                if self.cfg.get("save_last_audio"):
-                    save_wav(APP_DIR / "last.wav", audio, self.cfg["sample_rate"])
-                committed = ((streamer.committed_text, streamer.committed_samples)
-                             if streamer else ("", 0))
-                live_typed = streamer.typed_len if streamer else 0
-                text, _ = self.transcribe_and_store(
+                join_s = 0.0
+                if streamer:
+                    # Join only after the rolling pass has been halted, so
+                    # committed_text cannot move under the final decode.
+                    j0 = time.monotonic()
+                    committed = streamer.stop()
+                    join_s = time.monotonic() - j0
+                    live_typed = streamer.typed_len
+                else:
+                    committed = ("", 0)
+                    live_typed = 0
+                text, meta = self.transcribe_and_store(
                     audio, source="pc-hotkey", window=foreground_window(),
-                    committed=committed, skip_cleanup=live_typed > 0)
+                    committed=committed, skip_cleanup=live_typed > 0,
+                    persist=False)
                 self._remember(text)
+                p0 = time.monotonic()
                 if text and live_typed:
                     # Part of the text is already on screen — flush the rest.
                     remainder = apply_replacements(text[live_typed:], self.cfg)
@@ -1749,6 +1820,21 @@ class Flow:
                 elif text:
                     self._safe_paste(apply_replacements(text, self.cfg),
                                      self.cfg["paste_mode"])
+                paste_s = time.monotonic() - p0
+                stages = {
+                    "queue_wait": round(queue_s, 3),
+                    "stream_join": round(join_s, 3),
+                    "decode": meta.get("asr_s") or 0,
+                    "cleanup": meta.get("cleanup_s") or 0,
+                    "paste": round(paste_s, 3),
+                }
+                e2e = self._note_e2e(released_at, stages,
+                                     meta.get("duration_s") or 0)
+                # Disk waits until the paste has been attempted.
+                self._flush_pending(meta, e2e_s=e2e, stages=stages)
+                if self.cfg.get("save_last_audio"):
+                    save_wav(APP_DIR / "last.wav", audio,
+                             self.cfg["sample_rate"])
             finally:
                 stop.set()
                 watcher.join(timeout=1.0)

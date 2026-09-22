@@ -582,6 +582,72 @@ def test_remote_start_still_refuses_while_a_local_recording_is_active(monkeypatc
     assert f.active_mode == "dictate"
 
 
+def test_on_release_does_not_join_the_streamer(monkeypatch):
+    """The ctrl loop must not wait out the streamer's up-to-2s join."""
+    f = _bare(monkeypatch)
+    f.recording = True
+    joined = []
+
+    class _Streamer:
+        def halt(self):
+            joined.append("halt")
+
+        def stop(self):
+            joined.append("stop")
+            return "", 0
+
+    f.streamer = _Streamer()
+    f.on_release()
+    assert joined == ["halt"]
+    assert f._job_q.get_nowait()[0] == "dictate"
+
+
+def test_paste_lands_before_history_and_the_final_decode_joins_first(monkeypatch):
+    import types
+    import numpy as np
+    import flow
+    f = _bare(monkeypatch)
+    f.recording = True
+    f.cfg["min_duration_s"] = 0
+    f.cfg["cleanup"] = {"enabled": False}
+    f.cfg["model"] = "m"
+    f.cfg["device"] = "cpu"
+    f.cfg["save_last_audio"] = True
+    f.model_lock = threading.Lock()
+    order = []
+
+    class _Streamer:
+        typed_len = 0
+
+        def halt(self):
+            order.append("halt")
+
+        def stop(self):
+            order.append("stop")
+            return "hello", 0
+
+        def restore_clipboard(self):
+            return None
+
+    f.streamer = _Streamer()
+    f.recorder = types.SimpleNamespace(
+        stop=lambda: np.zeros(1600, dtype=np.float32), level=0.0)
+    f.store = types.SimpleNamespace(
+        add=lambda *a, **k: order.append("store") or {})
+    monkeypatch.setattr(flow.Flow, "mic_is_deaf", lambda self, audio: False)
+    monkeypatch.setattr(flow.Flow, "decode",
+                        lambda self, audio, **k: order.append("decode")
+                        or [types.SimpleNamespace(text="there")])
+    monkeypatch.setattr(flow, "paste_text", lambda *a, **k: order.append("paste"))
+    monkeypatch.setattr(flow, "save_wav", lambda *a, **k: order.append("wav"))
+    f.on_release()
+    assert order == ["halt"]
+    kind, args = f._job_q.get_nowait()
+    assert kind == "dictate"
+    f.process(*args)
+    assert order == ["halt", "stop", "decode", "paste", "store", "wav"]
+
+
 def test_transcribing_label_names_a_busy_pc_after_eight_seconds():
     import flow
     assert flow._transcribing_label(2.4) == "Transcribing… (2s)"
@@ -636,3 +702,60 @@ def test_fast_process_does_not_announce_a_wait(monkeypatch):
     texts = [m[1] for m in messages
              if isinstance(m, tuple) and m and m[0] == "work"]
     assert texts == []
+
+
+def _dictate(monkeypatch, f, released_at=None):
+    """Run one local take through process() with the ASR stubbed out."""
+    import types
+    import numpy as np
+    import flow
+    f.cfg["min_duration_s"] = 0
+    f.cfg["cleanup"] = {"enabled": False}
+    f.cfg["model"] = "m"
+    f.cfg["device"] = "cpu"
+    f.model_lock = threading.Lock()
+    monkeypatch.setattr(flow.Flow, "mic_is_deaf", lambda self, audio: False)
+    def _decode(self, audio, **k):
+        time.sleep(0.02)
+        return [types.SimpleNamespace(text="hello")]
+
+    monkeypatch.setattr(flow.Flow, "decode", _decode)
+    monkeypatch.setattr(flow, "paste_text", lambda *a, **k: None)
+    f.process(np.zeros(1600, dtype=np.float32), released_at=released_at)
+
+
+def test_store_add_timing_fields_are_optional(tmp_path):
+    from store import TranscriptStore
+    st = TranscriptStore(tmp_path)
+    plain = st.add("older line", source="pc-hotkey")
+    assert "e2e_s" not in plain
+    assert "stages" not in plain
+    timed = st.add("newer", source="pc-hotkey", e2e_s=1.25,
+                   stages={"decode": 1.0, "paste": 0.1})
+    assert timed["e2e_s"] == 1.25
+    assert timed["stages"]["decode"] == 1.0
+    assert "e2e_s" not in st.read()[0]
+
+
+def test_history_row_carries_e2e_and_stages(monkeypatch, tmp_path):
+    from store import TranscriptStore
+    f = _bare(monkeypatch)
+    f.store = TranscriptStore(tmp_path)
+    _dictate(monkeypatch, f, released_at=time.monotonic() - 0.25)
+    row = f.store.read()[-1]
+    assert row["e2e_s"] >= 0.25
+    for key in ("queue_wait", "stream_join", "decode", "cleanup", "paste"):
+        assert key in row["stages"]
+    assert row["stages"]["decode"] == row["asr_s"]
+    assert row["text"] == "hello"
+
+
+def test_slow_e2e_prints_the_stage_breakdown(monkeypatch, capsys):
+    f = _bare(monkeypatch)
+    f.store = None
+    _dictate(monkeypatch, f, released_at=time.monotonic() - 3.4)
+    out = capsys.readouterr().out
+    assert "[slow] e2e" in out
+    assert "queue" in out and "join" in out
+    assert "decode" in out and "paste" in out
+    assert "s audio)" in out

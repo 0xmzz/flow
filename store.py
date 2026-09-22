@@ -92,7 +92,7 @@ class TranscriptStore:
 
     def add(self, text, *, source, window=None, duration_s=None, asr_s=None,
             model=None, device=None, audio=None, sample_rate=16000,
-            cleaned=None, private=False):
+            cleaned=None, private=False, e2e_s=None, stages=None):
         entry = {
             "id": uuid.uuid4().hex[:12],
             "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -109,6 +109,12 @@ class TranscriptStore:
             "model": model,
             "device": device,
         }
+        # Optional. Older rows (and callers that don't time the hot path)
+        # simply omit these.
+        if e2e_s is not None:
+            entry["e2e_s"] = e2e_s
+        if stages:
+            entry["stages"] = stages
         if private:
             audio = None  # enforced HERE, not just at call sites: private entries never archive audio
         if self.archive_audio and audio is not None and len(audio):
