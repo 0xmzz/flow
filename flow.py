@@ -1159,6 +1159,17 @@ _KEY_POLL_S = 0.15          # ctrl-loop idle poll; two polls confirm a lost KEY_
 _KEY_UP_POLLS = 2           # one GetAsyncKeyState flicker must not cut a dictation
 _REPEAT_MAX_GAP_S = 1.0     # Windows auto-repeat is ~30–50ms; a longer gap is a new press
 _MIC_WAIT_S = 1.0           # a press waits this long for a probe, then says so
+_PINNED_REPROBES = 3        # silent pinned mic, rechecked before a device sweep
+_PINNED_REPROBE_S = 2.0
+_STACK_RECHECK_S = 15.0     # all-silent boot: the audio stack may not be up yet
+
+
+def _speech_enabled(cfg):
+    """Kokoro is warmed only when something in this config will speak."""
+    live = cfg.get("live") or {}
+    hermes = cfg.get("hermes") or {}
+    return bool(live.get("enabled") or cfg.get("command_hotkey")
+                or hermes.get("enabled"))
 _WAIT_HINT_S = 1.5          # after this long, the overlay counts the seconds
 _WAIT_BUSY_S = 8.0          # after this long, say the machine is busy
 _WAIT_TICK_S = 1.0
@@ -1309,8 +1320,7 @@ class Flow:
         self.store = TranscriptStore(
             APP_DIR / h["dir"], archive_audio=h["archive_audio"]
         ) if h["enabled"] else None
-        import speech
-        speech.configure(self.cfg.get("tts"))
+        self._configure_speech()
         t0 = time.time()
         self.model = self._load_model()
         if self.cfg.get("live", {}).get("enabled", True):
@@ -1408,17 +1418,17 @@ class Flow:
         speak(msg)
         return True
 
-    def recover_mic(self, min_gap_s=20.0):
+    def recover_mic(self, min_gap_s=20.0, when_silent="no live input found"):
         """Switch to the input device carrying the strongest signal.
 
         Holds _mic_lock for the whole sweep so a retarget cannot land in the
         middle of a recording. startup_mic_check calls this on the same thread
-        and already holds the lock; it is an RLock.
+        and may already hold the lock; it is an RLock.
         """
         with self._mic_lock:
-            return self._recover_mic(min_gap_s)
+            return self._recover_mic(min_gap_s, when_silent)
 
-    def _recover_mic(self, min_gap_s=20.0):
+    def _recover_mic(self, min_gap_s=20.0, when_silent="no live input found"):
         now = time.time()
         if now - self._last_mic_probe < min_gap_s:
             return None
@@ -1433,7 +1443,7 @@ class Flow:
             if level >= SILENCE_PEAK:
                 scored.append((index, name, level))
         if not scored:
-            print("[mic] no live input found")
+            print(f"[mic] {when_silent}")
             return None
         # One physical mic appears once per host API (MME, WASAPI, WDM-KS) with
         # slightly different levels. Among comparable candidates take the
@@ -1452,29 +1462,56 @@ class Flow:
         print(f"[mic] switched to {name} (peak {level:.5f})")
         return name
 
+    def _configure_speech(self):
+        """Warm Kokoro only when a speaking feature is actually on.
+
+        Dictation-only (no live, no command hotkey, no Hermes) still speaks
+        the rare mic warning through SAPI on the first speak() call.
+        """
+        import speech
+        speech.configure(self.cfg.get("tts"), start=_speech_enabled(self.cfg))
+
     def startup_mic_check(self):
         """Log — and quietly fix — a dead default input before first use.
 
-        Holds _mic_lock, not `busy`. A press during the probe waits up to
-        _MIC_WAIT_S and then records; past that it gets an overlay message
-        instead of a silent drop. Processing a previous dictation does not
-        block the probe or the press.
+        A silent pinned mic is re-probed a few times before any device sweep:
+        at boot every endpoint reads as silence because the audio stack is
+        not up yet. The waits happen without `busy` or the mic lock held, so
+        a press is not stuck behind them. An all-silent sweep is "audio stack
+        not ready", checked once more later, not a dead mic.
         """
         if self.cfg["mode"] == "client" or not self.cfg.get("mic_silence_guard", True):
             return
-        with self._mic_lock:
-            with self._session_lock:
-                if self.recording:
-                    return  # a session beat us to the mic; leave it alone
-            level = probe_input(self.recorder.device_index,
-                                self.cfg["sample_rate"], 0.3)
-            name = self.recorder.device_name or "default input"
+        self._startup_mic_pass(followup=False)
+
+    def _startup_mic_pass(self, followup):
+        attempts = 1 if followup else _PINNED_REPROBES
+        index = self.recorder.device_index
+        name = self.recorder.device_name or "default input"
+        for i in range(attempts):
+            if i:
+                time.sleep(_PINNED_REPROBE_S)
+            with self._mic_lock:
+                with self._session_lock:
+                    if self.recording:
+                        return
+                level = probe_input(index, self.cfg["sample_rate"], 0.3)
             if level >= SILENCE_PEAK / 4:  # room tone clears this; silence doesn't
                 print(f"[mic] {name} live at startup (peak {level:.5f})")
                 return
             print(f"[mic] {name} is silent at startup (peak {level:.5f})")
-            if self.cfg.get("mic_autoswitch", True):
-                self.recover_mic(min_gap_s=0.0)
+        if not self.cfg.get("mic_autoswitch", True):
+            return
+        if self.recover_mic(min_gap_s=0.0, when_silent="audio stack not ready"):
+            return
+        if followup:
+            return
+        print(f"[mic] audio stack not ready; checking again in "
+              f"{_STACK_RECHECK_S:.0f}s")
+        t = threading.Timer(
+            _STACK_RECHECK_S, lambda: self._startup_mic_pass(followup=True))
+        t.daemon = True
+        t.start()
 
     def set_icon(self, state, context=None):
         if self.tray:

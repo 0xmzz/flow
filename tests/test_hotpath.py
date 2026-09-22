@@ -811,3 +811,111 @@ def test_slow_e2e_prints_the_stage_breakdown(monkeypatch, capsys):
     assert "queue" in out and "join" in out
     assert "decode" in out and "paste" in out
     assert "s audio)" in out
+
+
+def test_kokoro_not_warmed_in_dictation_only_config(monkeypatch):
+    import inspect
+    import speech
+    import flow
+    seen = []
+    monkeypatch.setattr(speech, "configure",
+                        lambda cfg, start=True: seen.append((cfg, start)))
+    f = _bare(monkeypatch)
+    f.cfg["tts"] = {"engine": "kokoro", "voice": "af_heart"}
+    f.cfg["live"] = {"enabled": False}
+    f.cfg["command_hotkey"] = None
+    f.cfg["hermes"] = {"enabled": False}
+    f._configure_speech()
+    assert seen == [(f.cfg["tts"], False)]
+    assert "_configure_speech" in inspect.getsource(flow.Flow.__init__)
+
+    f.cfg["live"] = {"enabled": True}
+    f._configure_speech()
+    assert seen[-1][1] is True
+
+    f.cfg["live"] = {"enabled": False}
+    f.cfg["command_hotkey"] = "right alt"
+    f._configure_speech()
+    assert seen[-1][1] is True
+
+    f.cfg["command_hotkey"] = ""
+    f.cfg["hermes"] = {"enabled": True}
+    f._configure_speech()
+    assert seen[-1][1] is True
+
+
+def test_silent_boot_reprobes_then_rechecks_once(monkeypatch):
+    import flow
+    f = _bare(monkeypatch)
+    f.recorder.device_index = 3
+    f.recorder.device_name = "Headset"
+    f.cfg["mic_autoswitch"] = True
+    probes = []
+    sleeps = []
+    sweeps = []
+    timers = []
+
+    def probe(index, sample_rate, seconds=0.4):
+        probes.append(index)
+        return 0.0
+
+    def recover(self, min_gap_s=20.0, when_silent="no live input found"):
+        sweeps.append(when_silent)
+        return None
+
+    class _Timer:
+        def __init__(self, interval, func):
+            timers.append((interval, func))
+            self._func = func
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(flow, "probe_input", probe)
+    monkeypatch.setattr(flow.Flow, "recover_mic", recover)
+    monkeypatch.setattr(flow.time, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(flow.threading, "Timer", _Timer)
+    f.startup_mic_check()
+    assert probes == [3, 3, 3]
+    assert sleeps == [flow._PINNED_REPROBE_S, flow._PINNED_REPROBE_S]
+    assert sweeps == ["audio stack not ready"]
+    assert len(timers) == 1 and timers[0][0] == flow._STACK_RECHECK_S
+    timers[0][1]()
+    assert probes == [3, 3, 3, 3]
+    assert sweeps == ["audio stack not ready", "audio stack not ready"]
+    assert len(timers) == 1, "the follow-up must not schedule another recheck"
+
+
+def test_pinned_mic_that_wakes_on_the_second_probe_skips_the_sweep(monkeypatch):
+    import flow
+    f = _bare(monkeypatch)
+    f.recorder.device_index = 1
+    f.recorder.device_name = "Headset"
+    levels = iter([0.0, 1.0])
+    monkeypatch.setattr(flow, "probe_input",
+                        lambda *a, **k: next(levels))
+    monkeypatch.setattr(flow.time, "sleep", lambda s: None)
+    monkeypatch.setattr(flow.Flow, "recover_mic",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("a live pinned mic must not sweep")))
+    f.startup_mic_check()
+
+
+def test_startup_retry_gap_does_not_hold_the_mic_lock(monkeypatch):
+    import flow
+    f = _bare(monkeypatch)
+    f.recorder.device_index = 1
+    f.recorder.device_name = "Headset"
+    monkeypatch.setattr(flow, "probe_input", lambda *a, **k: 0.0)
+
+    def gap(seconds):
+        assert f.busy.locked() is False
+        assert f._mic_lock.acquire(blocking=False)
+        f._mic_lock.release()
+
+    monkeypatch.setattr(flow.time, "sleep", gap)
+    monkeypatch.setattr(flow.Flow, "recover_mic", lambda *a, **k: "Other")
+    monkeypatch.setattr(flow.threading, "Timer",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("a sweep that finds a mic does not recheck")))
+    f.startup_mic_check()
