@@ -1072,6 +1072,27 @@ def _os_key_down(vk):
         return None
 
 
+# OpenClipboard fails when another app holds it for a moment. Ten tries
+# over ~300ms covers that blip; the dictation is never dropped on the floor.
+_CLIP_RETRY_DELAYS = (0.02, 0.02, 0.03, 0.03, 0.04, 0.04, 0.04, 0.04, 0.04)
+
+
+def _copy_clipboard(text):
+    """Copy `text`, retrying on any failure. True on success, never raises."""
+    last = None
+    for delay in (0.0,) + _CLIP_RETRY_DELAYS:
+        if delay:
+            time.sleep(delay)
+        try:
+            pyperclip.copy(text)
+            return True
+        except Exception as e:
+            last = e
+    print(f"[paste] clipboard copy failed after "
+          f"{1 + len(_CLIP_RETRY_DELAYS)} tries: {last}")
+    return False
+
+
 def paste_text(text, mode, restore=True):
     print(f"[paste] mode={mode} target window: {foreground_window()!r}")
     if mode == "type":
@@ -1083,7 +1104,12 @@ def paste_text(text, mode, restore=True):
             old = pyperclip.paste()
         except Exception:
             pass
-    pyperclip.copy(text)
+    if not _copy_clipboard(text):
+        # The transcript still has to land at the cursor. Typing is slower
+        # but it does not depend on the clipboard.
+        print("[paste] clipboard unavailable; typing the dictation instead")
+        keyboard.write(text)
+        return
     time.sleep(0.02)
     keyboard.press("ctrl")
     keyboard.press("v")
@@ -1094,10 +1120,8 @@ def paste_text(text, mode, restore=True):
     if old is not None:
         def restore():
             time.sleep(0.6)
-            try:
-                pyperclip.copy(old)
-            except Exception:
-                pass
+            if not _copy_clipboard(old):
+                print("[paste] could not restore the previous clipboard")
         threading.Thread(target=restore, daemon=True).start()
 
 
@@ -1111,6 +1135,7 @@ class Flow:
         self.muter = OutputMuter()
         self.muter.ensure_unmuted()
         self.recording = False
+        self.last_text = ""
         self.active_mode = "dictate"
         self.hermes_context = None
         self.streamer = None
@@ -1542,6 +1567,38 @@ class Flow:
         print(f"[{source}] [{dur:.1f}s audio -> {asr_t:.2f}s asr] {text}")
         return text, {"asr_s": round(asr_t, 2), "duration_s": round(dur, 2)}
 
+    def _remember(self, text):
+        """Keep the transcript before any paste attempt, so a failed paste
+        can still be copied from the tray."""
+        if text:
+            self.last_text = text
+
+    def _safe_paste(self, text, mode, restore=True):
+        """Paste, but never let a clipboard/typing error kill this thread."""
+        if not text:
+            return
+        try:
+            paste_text(text, mode, restore=restore)
+        except Exception as e:
+            print(f"[paste] failed, dictation kept in memory: {e}")
+            if self.overlay:
+                self.overlay.set((
+                    "say",
+                    "Couldn't paste that dictation. "
+                    "Tray menu: Copy last dictation."))
+
+    def _copy_last_dictation(self):
+        text = getattr(self, "last_text", "") or ""
+        if not text:
+            print("[paste] no dictation to copy")
+            if self.overlay:
+                self.overlay.set(("say", "No dictation to copy yet"))
+            return
+        if _copy_clipboard(text):
+            print("[paste] copied last dictation")
+        elif self.overlay:
+            self.overlay.set(("say", "Couldn't copy the last dictation"))
+
     def process(self, audio, streamer=None):
         with self.busy:
             self.set_icon("work")
@@ -1556,17 +1613,18 @@ class Flow:
                         text, typed = streamer.finish()
                         if text is None:  # server lost the session mid-flight
                             text, typed = self.client_transcribe(audio, "/transcribe"), 0
+                        self._remember(text)
                         remainder = (text or "")[typed:]
                         if remainder:
-                            paste_text(remainder, "clipboard",
-                                       restore=typed == 0)
+                            self._safe_paste(remainder, "clipboard",
+                                             restore=typed == 0)
                         if typed:
                             time.sleep(0.3)
                             streamer.restore_clipboard()
                     else:
                         text = self.client_transcribe(audio, "/transcribe")
-                        if text:
-                            paste_text(text, self.cfg["paste_mode"])
+                        self._remember(text)
+                        self._safe_paste(text, self.cfg["paste_mode"])
                     return
                 if self.cfg.get("save_last_audio"):
                     save_wav(APP_DIR / "last.wav", audio, self.cfg["sample_rate"])
@@ -1576,14 +1634,14 @@ class Flow:
                 text, _ = self.transcribe_and_store(
                     audio, source="pc-hotkey", window=foreground_window(),
                     committed=committed, skip_cleanup=live_typed > 0)
+                self._remember(text)
                 if text and live_typed:
                     # Part of the text is already on screen — flush the rest.
                     remainder = apply_replacements(text[live_typed:], self.cfg)
-                    if remainder:
-                        paste_text(remainder, "clipboard", restore=False)
+                    self._safe_paste(remainder, "clipboard", restore=False)
                 elif text:
-                    paste_text(apply_replacements(text, self.cfg),
-                               self.cfg["paste_mode"])
+                    self._safe_paste(apply_replacements(text, self.cfg),
+                                     self.cfg["paste_mode"])
             finally:
                 if streamer:
                     time.sleep(0.3)
@@ -2097,6 +2155,20 @@ class Flow:
         print(f"[server] listening on {s['host']}:{s['port']} "
               f"(token required; history page at /)")
 
+    def _tray_menu_items(self):
+        """(label, callback) pairs. Callbacks take no arguments."""
+        import webbrowser
+        port = self.cfg["server"]["port"]
+        return (
+            ("Open history page", lambda: webbrowser.open(
+                f"http://127.0.0.1:{port}/#tok=" + self.cfg["server"]["token"])),
+            ("Copy last dictation", lambda: self._copy_last_dictation()),
+            ("Edit config (restart to apply)",
+             lambda: os.startfile(str(CONFIG_PATH))),
+            ("Open data folder", lambda: os.startfile(str(APP_DIR / "data"))),
+            ("Quit", lambda: self.tray.stop()),
+        )
+
     def run(self):
         self.maybe_start_server()
         # Raw hook (never suppresses) so we can distinguish left vs right ctrl
@@ -2107,26 +2179,14 @@ class Flow:
         threading.Thread(target=self.startup_mic_check, daemon=True,
                          name="mic-startup-check").start()
         try:
-            import webbrowser
-
             import pystray
             from pystray import MenuItem
-            port = self.cfg["server"]["port"]
             self.tray = pystray.Icon(
                 "flow", make_icon("idle"),
                 "Flow — hold %s to dictate; %s toggles live" %
                 (self.cfg["hotkey"], self.cfg.get("live_hotkey")),
-                menu=pystray.Menu(
-                    MenuItem("Open history page",
-                             lambda: webbrowser.open(
-                                 f"http://127.0.0.1:{port}/#tok="
-                                 + self.cfg["server"]["token"])),
-                    MenuItem("Edit config (restart to apply)",
-                             lambda: os.startfile(str(CONFIG_PATH))),
-                    MenuItem("Open data folder",
-                             lambda: os.startfile(str(APP_DIR / "data"))),
-                    MenuItem("Quit", lambda: self.tray.stop()),
-                ),
+                menu=pystray.Menu(*(MenuItem(label, action)
+                                    for label, action in self._tray_menu_items())),
             )
             self.tray.run()  # blocks until Quit
         except Exception as e:

@@ -311,3 +311,129 @@ def test_ctrl_loop_force_releases_a_local_recording_past_the_cap(monkeypatch):
     t.join(1.0)
     assert released, "max_record_s must be enforced from the ctrl loop"
     assert not t.is_alive()
+
+
+def _busy_clipboard(monkeypatch):
+    """A PyperclipWindowsException, including where ctypes has no WinError."""
+    import ctypes
+    import pyperclip
+    if not hasattr(ctypes, "WinError"):
+        monkeypatch.setattr(ctypes, "WinError",
+                            lambda *a, **k: OSError("clipboard busy"),
+                            raising=False)
+    return pyperclip.PyperclipWindowsException("Error calling OpenClipboard")
+
+
+def test_clipboard_copy_succeeds_on_the_third_try(monkeypatch):
+    import pyperclip
+    import flow
+    copies = []
+    presses = []
+    writes = []
+
+    def copy(text):
+        copies.append(text)
+        if len(copies) < 3:
+            raise _busy_clipboard(monkeypatch)
+
+    monkeypatch.setattr(pyperclip, "copy", copy)
+    monkeypatch.setattr(flow.keyboard, "press", lambda key: presses.append(key))
+    monkeypatch.setattr(flow.keyboard, "release", lambda key: None)
+    monkeypatch.setattr(flow.keyboard, "write", lambda text: writes.append(text))
+    monkeypatch.setattr(flow.time, "sleep", lambda _s: None)
+    flow.paste_text("hello", "clipboard", restore=False)
+    assert copies == ["hello", "hello", "hello"]
+    assert writes == [], "a retry that lands must still paste, not retype"
+    assert presses == ["ctrl", "v"]
+
+
+def test_clipboard_failure_types_the_dictation(monkeypatch):
+    import pyperclip
+    import flow
+    copies = []
+    presses = []
+    writes = []
+    slept = []
+
+    def copy(_text):
+        copies.append(_text)
+        raise pyperclip.PyperclipException("Error calling OpenClipboard")
+
+    monkeypatch.setattr(pyperclip, "copy", copy)
+    monkeypatch.setattr(flow.keyboard, "press", lambda key: presses.append(key))
+    monkeypatch.setattr(flow.keyboard, "release", lambda key: None)
+    monkeypatch.setattr(flow.keyboard, "write", lambda text: writes.append(text))
+    monkeypatch.setattr(flow.time, "sleep", lambda s: slept.append(s))
+    flow.paste_text("hello", "clipboard", restore=False)
+    assert len(copies) == 10
+    assert writes == ["hello"]
+    assert presses == [], "a failed copy must not ctrl+v whatever is already there"
+    assert sum(slept) == pytest.approx(0.30)
+
+
+def test_clipboard_restore_retries(monkeypatch):
+    import pyperclip
+    import flow
+    calls = []
+
+    def copy(text):
+        calls.append(text)
+        if text == "OLD" and calls.count("OLD") < 3:
+            raise RuntimeError("Error calling OpenClipboard")
+
+    monkeypatch.setattr(pyperclip, "copy", copy)
+    monkeypatch.setattr(pyperclip, "paste", lambda: "OLD")
+    monkeypatch.setattr(flow.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(flow.keyboard, "press", lambda _k: None)
+    monkeypatch.setattr(flow.keyboard, "release", lambda _k: None)
+
+    class _Inline:
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None,
+                     name=None):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr(flow.threading, "Thread", _Inline)
+    flow.paste_text("NEW", "clipboard", restore=True)
+    assert calls.count("NEW") == 1
+    assert calls.count("OLD") == 3
+
+
+def test_paste_exception_keeps_last_text_and_the_thread(monkeypatch):
+    import numpy as np
+    import flow
+    f = _bare(monkeypatch)
+    f.cfg["min_duration_s"] = 0
+    f.cfg["paste_mode"] = "clipboard"
+    says = []
+    f.overlay = types.SimpleNamespace(set=lambda msg: says.append(msg))
+    monkeypatch.setattr(flow.Flow, "mic_is_deaf", lambda self, audio: False)
+    monkeypatch.setattr(flow.Flow, "restore_base_state", lambda self: None)
+    monkeypatch.setattr(flow.Flow, "transcribe_and_store",
+                        lambda self, audio, **kw: ("hello world", {}))
+
+    def boom(text, mode, restore=True):
+        assert f.last_text == "hello world", "remember the text before pasting"
+        raise RuntimeError("Error calling OpenClipboard")
+
+    monkeypatch.setattr(flow, "paste_text", boom)
+    f.process(np.zeros(1600, dtype=np.float32))
+    assert f.last_text == "hello world"
+    assert says and says[0][0] == "say"
+    assert "Copy last dictation" in says[0][1]
+
+
+def test_tray_copies_the_last_dictation(monkeypatch):
+    import flow
+    f = _bare(monkeypatch)
+    f.cfg["server"] = {"port": 8756, "token": "t"}
+    f.last_text = "kept sentence"
+    copied = []
+    monkeypatch.setattr(flow, "_copy_clipboard",
+                        lambda text: copied.append(text) or True)
+    items = dict(f._tray_menu_items())
+    assert "Copy last dictation" in items
+    items["Copy last dictation"]()
+    assert copied == ["kept sentence"]
