@@ -145,6 +145,9 @@ def test_right_ctrl_dispatch_never_queues_hermes(monkeypatch):
                "hermes": {"enabled": True, "hotkey": "right shift"}}
     obj._pressed_keys = set()
     obj._active_ptt_key = None
+    obj._key_lock = __import__("threading").Lock()
+    obj._key_seen_at = {}
+    obj._os_up_streak = 0
     queued = []
     obj._ctrl_q = SimpleNamespace(put=queued.append)
     obj._on_key(SimpleNamespace(name="right ctrl",
