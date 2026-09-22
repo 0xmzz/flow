@@ -239,11 +239,57 @@ _OUTRO_PHRASES = (
     "please subscribe",
     "subscribe to my channel",
 )
+_OUTRO_TRAIL = re.compile(
+    r"[\s,]*(?:\band\b\s+)?(?:"
+    + "|".join(re.escape(p) for p in _OUTRO_PHRASES)
+    + r")\b[^\w]*$",
+    re.IGNORECASE,
+)
+# Known Whisper credit line. It shows up mid-transcript, not only as an outro.
+_AMARA_RE = re.compile(
+    r"subtitles by the amara\.org community", re.IGNORECASE)
+# A sentence ends at . ! ? only when that mark is followed by whitespace or
+# the end of the text. A dot inside 5.5, an IP, or a domain is not a boundary.
+_SENT_BOUNDARY = re.compile(r"[.!?](?=\s|$)")
+_GAP_CHARS = " \t\r\n"
+
+
+def _cut_spans(text, spans):
+    """Drop [start, end) slices. Every other character stays as it was."""
+    merged = []
+    for a, b in sorted(spans):
+        if b <= a:
+            continue
+        if merged and a <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    if not merged:
+        return text
+    parts = []
+    i = 0
+    for a, b in merged:
+        parts.append(text[i:a])
+        i = b
+    parts.append(text[i:])
+    return "".join(parts)
 
 
 def _sentence_spans(text):
-    """Sentences with their original spacing, split on . ! ?"""
-    return re.findall(r"[^.!?]*[.!?]+|[^.!?]+$", text)
+    """(start, end) of each sentence. The gap before a sentence is part of it.
+
+    Deleting a later sentence therefore deletes the whitespace in front of
+    it, and the kept characters are a literal slice of `text`.
+    """
+    spans = []
+    start = 0
+    for m in _SENT_BOUNDARY.finditer(text):
+        if m.end() > start:
+            spans.append((start, m.end()))
+        start = m.end()
+    if start < len(text):
+        spans.append((start, len(text)))
+    return [(a, b) for a, b in spans if text[a:b].strip()]
 
 
 def _norm_sentence(sentence):
@@ -252,59 +298,72 @@ def _norm_sentence(sentence):
     return re.sub(r"\s+", " ", folded).strip()
 
 
-def _strip_trailing_outros(text):
-    phrases = "|".join(re.escape(p) for p in _OUTRO_PHRASES)
-    trail = re.compile(
-        rf"[\s,]*(?:\band\b\s+)?(?:{phrases})\b[^\w]*$",
-        re.IGNORECASE,
-    )
-    whole = re.compile(rf"^(?:{phrases})\b[^\w]*$", re.IGNORECASE)
-    current = text.strip()
-    while current:
-        nxt = trail.sub("", current).strip()
-        if nxt == current:
-            nxt = whole.sub("", current).strip()
-        if nxt == current:
-            return current
-        current = nxt
-    return current
+def _amara_spans(text):
+    """Cut the Amara credit wherever it sits, plus one side of the gap around it."""
+    spans = []
+    for m in _AMARA_RE.finditer(text):
+        a, b = m.start(), m.end()
+        while b < len(text) and text[b] in ".,!?;:":
+            b += 1
+        left = a > 0 and text[a - 1] in _GAP_CHARS
+        if b < len(text) and text[b] in _GAP_CHARS:
+            while b < len(text) and text[b] in _GAP_CHARS:
+                b += 1
+            # The credit ended the text: drop the gap in front of it too.
+            if b == len(text):
+                left = True
+        if left and b == len(text):
+            while a > 0 and text[a - 1] in _GAP_CHARS:
+                a -= 1
+        spans.append((a, b))
+    return spans
 
 
-def _collapse_repeated_sentences(text):
-    """A sentence said ≥3 times in a row keeps one copy."""
-    parts = [p for p in _sentence_spans(text) if p.strip()]
+def _trailing_outro_spans(text):
+    spans = []
+    end = len(text)
+    while end > 0:
+        m = _OUTRO_TRAIL.search(text, 0, end)
+        if not m or m.end() != end or m.start() >= end:
+            break
+        spans.append((m.start(), end))
+        end = m.start()
+    return spans
+
+
+def _repeat_spans(text):
+    """A sentence said ≥3 times in a row keeps the first copy."""
+    parts = _sentence_spans(text)
     if len(parts) < 3:
-        return text.strip()
-    norms = [_norm_sentence(p) for p in parts]
-    kept = []
+        return []
+    norms = [_norm_sentence(text[a:b]) for a, b in parts]
+    spans = []
     i = 0
     while i < len(parts):
         j = i + 1
         while j < len(parts) and norms[j] and norms[j] == norms[i]:
             j += 1
         if j - i >= 3:
-            kept.append(parts[i].strip())
-        else:
-            kept.extend(p.strip() for p in parts[i:j])
+            spans.append((parts[i + 1][0], parts[j - 1][1]))
         i = j
-    return " ".join(kept).strip()
+    return spans
 
 
-def _drop_trailing_short_run(text):
+def _short_run_spans(text):
     """Drop a trailing run of ≥3 identical sentences of ≤3 words each."""
-    parts = [p for p in _sentence_spans(text) if p.strip()]
+    parts = _sentence_spans(text)
     if len(parts) < 3:
-        return text.strip()
-    norms = [_norm_sentence(p) for p in parts]
+        return []
+    norms = [_norm_sentence(text[a:b]) for a, b in parts]
     last = norms[-1]
     if not last or len(last.split()) > 3:
-        return text.strip()
+        return []
     i = len(parts) - 1
     while i >= 0 and norms[i] == last:
         i -= 1
     if len(parts) - 1 - i >= 3:
-        return " ".join(p.strip() for p in parts[:i + 1]).strip()
-    return text.strip()
+        return [(parts[i + 1][0], parts[-1][1])]
+    return []
 
 
 def strip_hallucinations(text):
@@ -312,13 +371,16 @@ def strip_hallucinations(text):
 
     Applied to the newly decoded tail only. Committed (already typed) text
     is not passed in, so a live prefix on screen is left alone.
+
+    Nothing removed means the same string back, byte for byte. A removal
+    cuts that span and does not re-split or re-join the rest.
     """
     if not text:
         return text or ""
-    cleaned = _strip_trailing_outros(text)
-    cleaned = _drop_trailing_short_run(cleaned)
-    cleaned = _collapse_repeated_sentences(cleaned)
-    return cleaned.strip()
+    cut = _cut_spans(text, _amara_spans(text))
+    cut = _cut_spans(cut, _trailing_outro_spans(cut))
+    cut = _cut_spans(cut, _short_run_spans(cut) + _repeat_spans(cut))
+    return text if cut == text else cut
 
 
 def apply_replacements(text, cfg):

@@ -855,6 +855,55 @@ def test_strip_hallucinations(heard, kept):
     assert flow.strip_hallucinations(heard) == kept
 
 
+@pytest.mark.parametrize("text", [
+    "Also Hermes uses GPT 5.5 right now with 272K context.",
+    "It looks like 1.7 million worth of liquidity.",
+    "It is ending in .67, so 192.168.68.67. Do you need the Mac?",
+    "people are going to dev.folionomics, we should end it",
+    "Snapshot, TimeSnap, MintSizing, etc., etc. How do we handle those?",
+    "Can you re-look at the... ...consultation summary?",
+    "Doesn't even look like it's... ...aligned.",
+    "Opus 4.8 and GPT-5.6 on high thinking",
+    "set to 25.5. The bedrooms can be 28",
+    "https://app.hyperliquid.xyz is the site",
+    "email me at a.b@c.com or atio.",
+    "Thank you.",
+    "Bye. Bye. Thank you.",
+])
+def test_strip_hallucinations_is_identity_when_nothing_is_removed(text):
+    import flow
+    assert flow.strip_hallucinations(text) == text
+
+
+def test_strip_hallucinations_keeps_decimals_when_it_cuts_an_outro():
+    import flow
+    assert flow.strip_hallucinations(
+        "Upgrade to GPT 5.5 please. Thanks for watching!"
+    ) == "Upgrade to GPT 5.5 please."
+    assert flow.strip_hallucinations(
+        "people are going to dev.folionomics. Thanks for watching!"
+    ) == "people are going to dev.folionomics."
+    # Three or more dots in the kept sentence: the old splitter rejoined
+    # those even after a real outro was removed.
+    assert flow.strip_hallucinations(
+        "It is ending in .67, so 192.168.68.67. Thanks for watching!"
+    ) == "It is ending in .67, so 192.168.68.67."
+
+
+def test_strip_hallucinations_removes_amara_credit_anywhere():
+    import flow
+    assert flow.strip_hallucinations(
+        "a little bit more. Subtitles by the Amara.org community "
+        "Messy as a strategy"
+    ) == "a little bit more. Messy as a strategy"
+    assert flow.strip_hallucinations(
+        "Upgrade to GPT 5.5 please. Subtitles by the Amara.org community"
+    ) == "Upgrade to GPT 5.5 please."
+    assert flow.strip_hallucinations(
+        "Subtitles by the Amara.org community"
+    ) == ""
+
+
 def test_filter_keeps_raw_history_and_does_not_touch_committed(monkeypatch, tmp_path):
     import types
     import numpy as np
