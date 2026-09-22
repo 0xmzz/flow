@@ -42,6 +42,10 @@ def _bare(monkeypatch):
     f.hermes = None
     f.hermes_context = None
     f.busy = threading.Lock()
+    f._mic_lock = threading.RLock()
+    f._mic_held = False
+    f._job_q = queue.Queue()
+    f._last_mic_probe = 0.0
     f._session_lock = threading.Lock()
     f.overlay = None
     f.muter = types.SimpleNamespace(mute=lambda: None, restore=lambda: None)
@@ -208,25 +212,16 @@ def test_repress_after_a_missed_up_starts_a_new_recording(monkeypatch):
     f = _bare(monkeypatch)
     _hold(f)
     starts = []
-    processed = []
     f.recorder = types.SimpleNamespace(start=lambda: starts.append(1),
                                        stop=lambda: "audio", level=0.0)
-
-    class _Thread:
-        def __init__(self, target=None, args=(), kwargs=None, daemon=None,
-                     name=None):
-            self.target = target
-        def start(self):
-            processed.append(getattr(self.target, "__name__", self.target))
-
-    monkeypatch.setattr(flow.threading, "Thread", _Thread)
     clock = {"t": 5000.0}
     monkeypatch.setattr(flow.time, "monotonic", lambda: clock["t"])
     f._key_seen_at["right ctrl"] = 5000.0
     clock["t"] = 5001.2
     f._on_key(_event("right ctrl", flow.keyboard.KEY_DOWN))
     _drain(f)
-    assert processed == ["process"], "the stuck dictation must be transcribed"
+    job = f._job_q.get_nowait()
+    assert job[0] == "dictate", "the stuck dictation must be transcribed"
     assert starts == [1], "the new press must open a new recording"
     assert f.recording is True
     assert f._active_ptt_key == "right ctrl"
@@ -261,20 +256,9 @@ def test_max_record_s_processes_and_stops_the_mic(monkeypatch):
         start=lambda: None,
         stop=lambda: stopped.append(1) or b"audio",
         level=0.0)
-    processed = []
-
-    class _Thread:
-        def __init__(self, target=None, args=(), kwargs=None, daemon=None,
-                     name=None):
-            self.target = target
-            self.args = args
-        def start(self):
-            processed.append(getattr(self.target, "__name__", ""))
-
-    monkeypatch.setattr(flow.threading, "Thread", _Thread)
     f._poll_record_cap()
     assert stopped == [1]
-    assert processed == ["process"]
+    assert f._job_q.get_nowait()[0] == "dictate"
     assert f.recording is False
     assert f._active_ptt_key is None
     assert "right ctrl" not in f._pressed_keys
@@ -437,3 +421,160 @@ def test_tray_copies_the_last_dictation(monkeypatch):
     assert "Copy last dictation" in items
     items["Copy last dictation"]()
     assert copied == ["kept sentence"]
+
+
+def test_mic_wait_is_one_second():
+    import flow
+    assert flow._MIC_WAIT_S == 1.0
+
+
+def test_press_while_busy_records_and_pastes_in_order(monkeypatch):
+    """A press during decode must record, and the two takes paste in order."""
+    import flow
+    f = _bare(monkeypatch)
+    takes = iter(["first", "second"])
+    starts = []
+    f.recorder = types.SimpleNamespace(
+        start=lambda: starts.append(1),
+        stop=lambda: next(takes),
+        level=0.0)
+    pasted = []
+    entered = threading.Event()
+    release_first = threading.Event()
+
+    def fake_process(self, audio, streamer=None):
+        self.busy.acquire()
+        try:
+            if audio == "first":
+                entered.set()
+                assert release_first.wait(3), "first take was never released"
+            pasted.append(audio)
+        finally:
+            self.busy.release()
+
+    monkeypatch.setattr(flow.Flow, "process", fake_process)
+    worker = threading.Thread(target=f._job_loop, daemon=True)
+    worker.start()
+    f.recording = True
+    f._mic_held = True
+    f._mic_lock.acquire()
+    f.on_release()
+    assert entered.wait(2), "the first take should be decoding"
+    assert f.busy.locked()
+    f.on_press("dictate")
+    assert f.recording is True, "a press while busy must start recording"
+    assert starts == [1]
+    f.on_release()
+    release_first.set()
+    deadline = time.time() + 2
+    while pasted != ["first", "second"] and time.time() < deadline:
+        time.sleep(0.01)
+    f._job_q.put(None)
+    worker.join(1)
+    assert pasted == ["first", "second"]
+    assert not worker.is_alive()
+
+
+def test_press_during_a_short_probe_still_records(monkeypatch):
+    import flow
+    f = _bare(monkeypatch)
+    ready = threading.Event()
+
+    def probe():
+        f._mic_lock.acquire()
+        ready.set()
+        time.sleep(0.15)
+        f._mic_lock.release()
+
+    threading.Thread(target=probe, daemon=True).start()
+    assert ready.wait(1)
+    f.on_press("dictate")
+    assert f.recording is True
+
+
+def test_press_during_a_long_probe_is_not_silent(monkeypatch):
+    import flow
+    f = _bare(monkeypatch)
+    monkeypatch.setattr(flow, "_MIC_WAIT_S", 0.05)
+    held = threading.Event()
+    release = threading.Event()
+
+    def probe():
+        f._mic_lock.acquire()
+        held.set()
+        release.wait(2)
+        f._mic_lock.release()
+
+    threading.Thread(target=probe, daemon=True).start()
+    assert held.wait(1)
+    says = []
+    f.overlay = types.SimpleNamespace(set=says.append)
+    f.on_press("dictate")
+    release.set()
+    assert f.recording is False
+    assert says and says[0][0] == "say"
+    assert "Microphone" in says[0][1]
+
+
+def test_startup_probe_does_not_hold_the_processing_lock(monkeypatch):
+    import flow
+    f = _bare(monkeypatch)
+    f.recorder.device_index = 1
+    f.recorder.device_name = "Headset"
+    seen = {}
+
+    def probe(index, sample_rate, seconds=0.4):
+        seen["busy"] = f.busy.locked()
+        # RLock has no locked(). A second thread failing to acquire means
+        # the probe is holding the mic lock.
+        grabbed = []
+
+        def try_acquire():
+            ok = f._mic_lock.acquire(blocking=False)
+            grabbed.append(ok)
+            if ok:
+                f._mic_lock.release()
+
+        t = threading.Thread(target=try_acquire)
+        t.start()
+        t.join()
+        seen["mic_held"] = grabbed == [False]
+        return 1.0
+
+    monkeypatch.setattr(flow, "probe_input", probe)
+    f.startup_mic_check()
+    assert seen == {"busy": False, "mic_held": True}
+
+
+def test_recover_mic_does_not_retarget_during_a_recording(monkeypatch):
+    import flow
+    f = _bare(monkeypatch)
+    f.recorder.device_name = "old"
+    f.recorder.retarget = lambda spec: retargets.append(spec) or True
+    retargets = []
+    monkeypatch.setattr(flow, "live_input_devices", lambda: [(2, "New Mic")])
+    monkeypatch.setattr(flow, "probe_input", lambda *a, **k: 1.0)
+    f.recording = True
+    f._mic_lock.acquire()
+    done = threading.Event()
+
+    def run():
+        f.recover_mic(min_gap_s=0)
+        done.set()
+
+    threading.Thread(target=run, daemon=True).start()
+    time.sleep(0.15)
+    assert retargets == []
+    assert not done.is_set()
+    f.recording = False
+    f._mic_lock.release()
+    assert done.wait(2)
+    assert retargets == [2]
+
+
+def test_remote_start_still_refuses_while_a_local_recording_is_active(monkeypatch):
+    f = _bare(monkeypatch)
+    f.recording = True
+    f._mic_lock.acquire()
+    assert f.remote_start() is False
+    assert f.active_mode == "dictate"

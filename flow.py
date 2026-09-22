@@ -1051,6 +1051,7 @@ _HOTKEY_VK = {
 _KEY_POLL_S = 0.15          # ctrl-loop idle poll; two polls confirm a lost KEY_UP
 _KEY_UP_POLLS = 2           # one GetAsyncKeyState flicker must not cut a dictation
 _REPEAT_MAX_GAP_S = 1.0     # Windows auto-repeat is ~30–50ms; a longer gap is a new press
+_MIC_WAIT_S = 1.0           # a press waits this long for a probe, then says so
 
 
 def _vk_for_hotkey(name):
@@ -1149,8 +1150,11 @@ class Flow:
         self._record_started_at = None
         import queue as _queue
         self._ctrl_q = _queue.Queue()
+        self._job_q = _queue.Queue()  # dictations, processed strictly in press order
         self._vm_q = _queue.Queue()  # hands VM-triggered transcripts to the server
-        self.busy = threading.Lock()
+        self.busy = threading.Lock()  # processing only; a press must not look at this
+        self._mic_lock = threading.RLock()  # probe/retarget vs a live recording
+        self._mic_held = False
         self.model_lock = threading.Lock()  # serialize GPU across hotkey + server
         self._remote_gen = 0  # remote session counter (stale-timer guard)
         # Session transitions happen on two threads (hotkey ctrl-loop and HTTP
@@ -1163,6 +1167,8 @@ class Flow:
             history_dir = self.cfg.get("history", {}).get("dir", "data")
             self.hermes = Mouthpiece(
                 self.cfg["hermes"], APP_DIR / history_dir)
+        threading.Thread(target=self._job_loop, daemon=True,
+                         name="flow-jobs").start()
         threading.Thread(target=self._ctrl_loop, daemon=True,
                          name="hotkey-ctrl").start()
         self.started_at = time.time()
@@ -1285,7 +1291,16 @@ class Flow:
         return True
 
     def recover_mic(self, min_gap_s=20.0):
-        """Switch to the input device carrying the strongest signal."""
+        """Switch to the input device carrying the strongest signal.
+
+        Holds _mic_lock for the whole sweep so a retarget cannot land in the
+        middle of a recording. startup_mic_check calls this on the same thread
+        and already holds the lock; it is an RLock.
+        """
+        with self._mic_lock:
+            return self._recover_mic(min_gap_s)
+
+    def _recover_mic(self, min_gap_s=20.0):
         now = time.time()
         if now - self._last_mic_probe < min_gap_s:
             return None
@@ -1310,6 +1325,10 @@ class Flow:
         loudest = max(level for _, _, level in scored)
         index, name, level = min(
             (c for c in scored if c[2] >= loudest * 0.7), key=lambda c: c[0])
+        with self._session_lock:
+            if self.recording:
+                print("[mic] recording in progress; not retargeting")
+                return None
         if not self.recorder.retarget(index):
             return None
         print(f"[mic] switched to {name} (peak {level:.5f})")
@@ -1318,14 +1337,14 @@ class Flow:
     def startup_mic_check(self):
         """Log — and quietly fix — a dead default input before first use.
 
-        Runs on a daemon thread with `busy` held: probing/retargeting must not
-        interleave with a recording, and every other retarget caller already
-        runs under `busy` — on_press and remote_start both bail while it's
-        locked, so a press during the (normally 0.3s) probe is dropped rather
-        than corrupted."""
+        Holds _mic_lock, not `busy`. A press during the probe waits up to
+        _MIC_WAIT_S and then records; past that it gets an overlay message
+        instead of a silent drop. Processing a previous dictation does not
+        block the probe or the press.
+        """
         if self.cfg["mode"] == "client" or not self.cfg.get("mic_silence_guard", True):
             return
-        with self.busy:
+        with self._mic_lock:
             with self._session_lock:
                 if self.recording:
                     return  # a session beat us to the mic; leave it alone
@@ -1412,53 +1431,106 @@ class Flow:
         if self.overlay:
             self.overlay.set(("hud", "agent_result", full))
 
+    def _release_mic(self):
+        if not getattr(self, "_mic_held", False):
+            return
+        self._mic_held = False
+        try:
+            self._mic_lock.release()
+        except RuntimeError:
+            pass
+
+    def _note_mic_wait(self):
+        print(f"[hotkey] mic probe still running after {_MIC_WAIT_S:.0f}s")
+        if self.overlay:
+            self.overlay.set((
+                "say",
+                "Microphone is still being checked. Release and try again."))
+
+    def _submit_job(self, mode, audio, streamer, hermes_context):
+        """Hand a finished take to the single worker. Press order is paste order."""
+        if mode == "hermes":
+            self._job_q.put(("hermes", (audio, hermes_context)))
+        elif mode == "command":
+            self._job_q.put(("command", (audio,)))
+        else:
+            self._job_q.put(("dictate", (audio, streamer)))
+
+    def _job_loop(self):
+        while True:
+            job = self._job_q.get()
+            if job is None:
+                return
+            kind, args = job
+            try:
+                if kind == "dictate":
+                    self.process(*args)
+                elif kind == "command":
+                    self.process_command(*args)
+                elif kind == "hermes":
+                    self.process_hermes(*args)
+            except Exception as e:
+                # One failed take must not kill the worker; the next press
+                # is already queued behind this one.
+                print(f"[hotkey] {kind} job failed: {e}")
+
     def on_press(self, mode="dictate"):
         stop_speech()
-        with self._session_lock:
-            if self.recording or self.busy.locked():
-                return
-            context = None
-            if mode == "hermes":
-                if not self.hermes:
+        # Wait outside _session_lock: a probe may take seconds, and the
+        # previous release still needs that lock. `busy` is processing, not
+        # the mic — a new press records while the previous take decodes.
+        if not self._mic_lock.acquire(timeout=_MIC_WAIT_S):
+            self._note_mic_wait()
+            return
+        started = False
+        try:
+            with self._session_lock:
+                if self.recording:
                     return
-                # LOCAL ONLY on this path. on_press runs on the keyboard-hook
-                # thread while holding _session_lock, which dictation also
-                # needs — so a network call here would let a slow or hung
-                # Hermes freeze right ctrl too, and an exception would strand
-                # self.recording=True and wedge every hotkey until restart.
-                # The thread NAME comes from local rules; the session id is
-                # resolved later on the worker thread in process_hermes.
-                try:
-                    window = foreground_window()
-                    context = {"window": window,
-                               "title": self.hermes.predict_title(window)}
-                except Exception as exc:                     # never wedge
-                    print(f"[pc-hermes] thread predict failed: {exc}")
-                    context = {"window": "", "title": "Hermes"}
-                self.hermes_context = dict(context)
-            self.active_mode = mode
-            self.recording = True
-            self._record_started_at = time.monotonic()
-            if self.live_worker:
-                self.live_worker.pause("recorder-owner")
-            self.recorder.start()  # first — capture must not wait on mute/icon
-            self.set_icon("rec", (f"Hermes · {context['title']}"
-                                  if context else None))
-            if self.cfg.get("mute_output_while_recording"):
-                self.muter.mute()
-            if mode == "dictate" and self.cfg["streaming"]["enabled"]:
-                if self.cfg["mode"] == "client":
-                    if self.cfg["streaming"].get("client", True):
-                        self.streamer = ClientStreamer(self)
-                        self.streamer.start()
-                    return
-                # Feedback mode belongs to the skill, not to "does a style
-                # exist" — see feedback_mode(). Defaults reproduce today's
-                # behaviour exactly: matched -> ghost, unmatched -> live.
-                live = (self.cfg["streaming"].get("live_type", True)
-                        and feedback_mode(self.cfg, foreground_window()) == "live")
-                self.streamer = StreamWorker(self, live=live)
-                self.streamer.start()
+                context = None
+                if mode == "hermes":
+                    if not self.hermes:
+                        return
+                    # LOCAL ONLY on this path. on_press runs on the ctrl-loop
+                    # thread while holding _session_lock — a network call here
+                    # would freeze every hotkey. The thread name comes from
+                    # local rules; the session id is resolved in process_hermes.
+                    try:
+                        window = foreground_window()
+                        context = {"window": window,
+                                   "title": self.hermes.predict_title(window)}
+                    except Exception as exc:                 # never wedge
+                        print(f"[pc-hermes] thread predict failed: {exc}")
+                        context = {"window": "", "title": "Hermes"}
+                    self.hermes_context = dict(context)
+                self.active_mode = mode
+                self.recording = True
+                self._record_started_at = time.monotonic()
+                self._mic_held = True
+                started = True
+                if self.live_worker:
+                    self.live_worker.pause("recorder-owner")
+                self.recorder.start()  # first — capture must not wait on mute/icon
+                self.set_icon("rec", (f"Hermes · {context['title']}"
+                                      if context else None))
+                if self.cfg.get("mute_output_while_recording"):
+                    self.muter.mute()
+                if mode == "dictate" and self.cfg["streaming"]["enabled"]:
+                    if self.cfg["mode"] == "client":
+                        if self.cfg["streaming"].get("client", True):
+                            self.streamer = ClientStreamer(self)
+                            self.streamer.start()
+                        return
+                    # Feedback mode belongs to the skill, not to "does a style
+                    # exist" — see feedback_mode(). Defaults reproduce today's
+                    # behaviour exactly: matched -> ghost, unmatched -> live.
+                    live = (self.cfg["streaming"].get("live_type", True)
+                            and feedback_mode(self.cfg, foreground_window()) == "live")
+                    self.streamer = StreamWorker(self, live=live)
+                    self.streamer.start()
+        finally:
+            if not started:
+                self._mic_lock.release()
 
     def on_release(self):
         with self._session_lock:
@@ -1479,16 +1551,10 @@ class Flow:
             self.hermes_context = None
             if self.live_worker and mode not in ("command", "hermes"):
                 self.live_worker.resume("recorder-owner")
-        if mode == "hermes":
-            threading.Thread(target=self.process_hermes,
-                             args=(audio, hermes_context),
-                             daemon=True, name="flow-hermes").start()
-        elif mode == "command":
-            threading.Thread(target=self.process_command, args=(audio,),
-                             daemon=True).start()
-        else:
-            threading.Thread(target=self.process, args=(audio, streamer),
-                             daemon=True).start()
+        # The audio array is already detached. Free the mic before the
+        # (possibly slow) decode so the next press can record immediately.
+        self._release_mic()
+        self._submit_job(mode, audio, streamer, hermes_context)
 
     def bias_prompt(self, committed=""):
         """initial_prompt = personal vocabulary + committed text so far."""
@@ -1873,31 +1939,45 @@ class Flow:
 
     def remote_start(self):
         """Bridge mode (e.g. the work VM): a remote client starts a host-mic
-        recording; the transcript is returned to the caller, never pasted here."""
-        with self._session_lock:
-            if self.recording or self.busy.locked():
-                return False
-            self.active_mode = "remote"
-            self.recording = True
-            if self.live_worker:
-                self.live_worker.pause("recorder-owner")
-            self._remote_gen += 1
-            gen = self._remote_gen
-            self.recorder.start()
-            self.set_icon("rec")
-            if self.cfg.get("mute_output_while_recording"):
-                self.muter.mute()
-            if self.cfg["streaming"]["enabled"]:
-                # Host-side streaming for the VM bridge: commits accumulate
-                # while the key is held; the daemon polls /record/partial and
-                # types committed deltas live.
-                self.remote_streamer = StreamWorker(self, live=False)
-                self.remote_streamer.start()
-            # Orphan guard: if the client dies mid-recording, don't record forever.
-            t = threading.Timer(600, lambda: self.remote_cancel(gen))
-            t.daemon = True
-            t.start()
-            return True
+        recording; the transcript is returned to the caller, never pasted here.
+
+        Still refuses while a local recording is active or a take is decoding
+        (`busy`). A probe holding the mic lock also refuses — non-blocking,
+        so the HTTP handler never waits out a device sweep.
+        """
+        if not self._mic_lock.acquire(blocking=False):
+            return False
+        started = False
+        try:
+            with self._session_lock:
+                if self.recording or self.busy.locked():
+                    return False
+                self.active_mode = "remote"
+                self.recording = True
+                self._mic_held = True
+                started = True
+                if self.live_worker:
+                    self.live_worker.pause("recorder-owner")
+                self._remote_gen += 1
+                gen = self._remote_gen
+                self.recorder.start()
+                self.set_icon("rec")
+                if self.cfg.get("mute_output_while_recording"):
+                    self.muter.mute()
+                if self.cfg["streaming"]["enabled"]:
+                    # Host-side streaming for the VM bridge: commits accumulate
+                    # while the key is held; the daemon polls /record/partial and
+                    # types committed deltas live.
+                    self.remote_streamer = StreamWorker(self, live=False)
+                    self.remote_streamer.start()
+                # Orphan guard: if the client dies mid-recording, don't record forever.
+                t = threading.Timer(600, lambda: self.remote_cancel(gen))
+                t.daemon = True
+                t.start()
+                return True
+        finally:
+            if not started:
+                self._mic_lock.release()
 
     def remote_stop(self, window=None):
         """Returns the transcript, '' if too short/empty, None if no session."""
@@ -1912,6 +1992,7 @@ class Flow:
             self.muter.restore()
             if self.live_worker:
                 self.live_worker.resume("recorder-owner")
+        self._release_mic()
         with self.busy:
             self.set_icon("work")
             try:
@@ -1945,8 +2026,9 @@ class Flow:
             if self.live_worker:
                 self.live_worker.resume("recorder-owner")
             self.restore_base_state()
-            print("[remote] recording cancelled")
-            return True
+        self._release_mic()
+        print("[remote] recording cancelled")
+        return True
 
     def _ptt_mode(self, name):
         if name == self.cfg.get("hotkey"):
@@ -2139,6 +2221,7 @@ class Flow:
                 print(f"[hotkey] {action} handler error: {e}")
                 self.recording = False
                 self._record_started_at = None
+                self._release_mic()
 
     def maybe_start_server(self):
         s = self.cfg["server"]

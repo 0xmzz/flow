@@ -1160,6 +1160,8 @@ def test_on_press_wires_feedback_mode_into_the_streamer(monkeypatch):
         f.cfg = cfg
         f._session_lock = threading.RLock()
         f.busy = threading.Lock()
+        f._mic_lock = threading.RLock()
+        f._mic_held = False
         f.recording = False
         f.streamer = None
         f.live_worker = None
