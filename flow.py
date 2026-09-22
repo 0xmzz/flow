@@ -165,6 +165,7 @@ DEFAULTS = {
     "paste_mode": "clipboard",     # "clipboard" (fast, restores clipboard) or "type"
     "mute_output_while_recording": True,  # silence speakers during dictation
     "min_duration_s": 0.6,         # includes the pre-roll
+    "max_record_s": 600,           # local orphan cap; release and transcribe, don't discard
     "pre_roll_s": 0.4,             # mic ring buffer prepended on press
     "overlay": True,               # on-screen listening/transcribing pill
     "save_last_audio": False,      # debug: write each recording to last.wav for tuning
@@ -1039,6 +1040,38 @@ def foreground_window():
         return "?"
 
 
+# Hotkeys we can check against the real OS key state. Anything else
+# (f8, letters, ...) keeps hook-only behaviour: there is no VK to ask.
+_HOTKEY_VK = {
+    "right ctrl": 0xA3,
+    "right alt": 0xA5,
+    "right shift": 0xA1,
+    "f9": 0x78,
+}
+_KEY_POLL_S = 0.15          # ctrl-loop idle poll; two polls confirm a lost KEY_UP
+_KEY_UP_POLLS = 2           # one GetAsyncKeyState flicker must not cut a dictation
+_REPEAT_MAX_GAP_S = 1.0     # Windows auto-repeat is ~30–50ms; a longer gap is a new press
+
+
+def _vk_for_hotkey(name):
+    if not isinstance(name, str):
+        return None
+    return _HOTKEY_VK.get(name.lower())
+
+
+def _os_key_down(vk):
+    """True when the OS reports vk held, False when up, None if unavailable.
+
+    Tests monkeypatch this. Non-Windows (no user32) returns None so the
+    watchdog degrades to hook events only.
+    """
+    try:
+        import ctypes
+        return bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
+    except Exception:
+        return None
+
+
 def paste_text(text, mode, restore=True):
     print(f"[paste] mode={mode} target window: {foreground_window()!r}")
     if mode == "type":
@@ -1083,6 +1116,12 @@ class Flow:
         self.streamer = None
         self._pressed_keys = set()
         self._active_ptt_key = None
+        # Hook thread and the ctrl-loop watchdog both touch these. The lock is
+        # held only for the set update — _on_key must stay non-blocking.
+        self._key_lock = threading.Lock()
+        self._key_seen_at = {}     # name -> monotonic time of the last event
+        self._os_up_streak = 0      # consecutive polls the OS reported the key up
+        self._record_started_at = None
         import queue as _queue
         self._ctrl_q = _queue.Queue()
         self._vm_q = _queue.Queue()  # hands VM-triggered transcripts to the server
@@ -1374,6 +1413,7 @@ class Flow:
                 self.hermes_context = dict(context)
             self.active_mode = mode
             self.recording = True
+            self._record_started_at = time.monotonic()
             if self.live_worker:
                 self.live_worker.pause("recorder-owner")
             self.recorder.start()  # first — capture must not wait on mute/icon
@@ -1402,6 +1442,7 @@ class Flow:
             if self.active_mode == "remote":
                 return  # remote session owns the recorder; the hotkey must not hijack it
             self.recording = False
+            self._record_started_at = None
             streamer = self.streamer
             self.streamer = None
             if streamer:
@@ -1849,46 +1890,178 @@ class Flow:
             print("[remote] recording cancelled")
             return True
 
-    def _on_key(self, event):
-        # This runs inside the keyboard listener thread — it MUST be trivial and
-        # never throw, or the listener dies and every hotkey stops working until
-        # restart. So: match, drop auto-repeat, enqueue. All real work (mute,
-        # audio start, transcription) happens in _ctrl_loop.
-        name = event.name
-        if name == self.cfg.get("live_hotkey"):
-            if event.event_type == keyboard.KEY_DOWN and name not in self._pressed_keys:
+    def _ptt_mode(self, name):
+        if name == self.cfg.get("hotkey"):
+            return "dictate"
+        if name and name == self.cfg.get("command_hotkey"):
+            return "command"
+        hermes = self.cfg.get("hermes") or {}
+        if hermes.get("enabled") and name == hermes.get("hotkey"):
+            return "hermes"
+        return None
+
+    def _on_live_key(self, event, name):
+        enqueue = False
+        with self._key_lock:
+            if (event.event_type == keyboard.KEY_DOWN
+                    and name not in self._pressed_keys):
                 self._pressed_keys.add(name)
-                self._ctrl_q.put(("toggle", "live"))
+                self._key_seen_at[name] = time.monotonic()
+                enqueue = True
             elif event.event_type == keyboard.KEY_UP:
                 self._pressed_keys.discard(name)
-            return
-        if name == self.cfg["hotkey"]:
-            mode = "dictate"
-        elif name == self.cfg.get("command_hotkey"):
-            mode = "command"
-        elif (self.cfg.get("hermes", {}).get("enabled")
-              and name == self.cfg.get("hermes", {}).get("hotkey")):
-            mode = "hermes"
-        else:
-            return
-        if event.event_type == keyboard.KEY_DOWN:
+                self._key_seen_at[name] = time.monotonic()
+        if enqueue:
+            self._ctrl_q.put(("toggle", "live"))
+
+    def _on_ptt_down(self, name, mode):
+        now = time.monotonic()
+        missed_up = False
+        start = False
+        gap = 0.0
+        with self._key_lock:
+            last = self._key_seen_at.get(name)
+            self._key_seen_at[name] = now
             if name in self._pressed_keys:
-                return  # ignore held-key auto-repeat
+                # Auto-repeat lands every ~30–50ms. A down after a silent
+                # second is a new press whose KEY_UP never arrived.
+                if last is not None and (now - last) <= _REPEAT_MAX_GAP_S:
+                    return
+                gap = now - last if last is not None else _REPEAT_MAX_GAP_S
+                self._pressed_keys.discard(name)
+                if name == self._active_ptt_key:
+                    self._active_ptt_key = None
+                    self._os_up_streak = 0
+                    missed_up = True
             self._pressed_keys.add(name)
             if self._active_ptt_key is None:
                 self._active_ptt_key = name
-                self._ctrl_q.put(("down", mode))
-        elif event.event_type == keyboard.KEY_UP:
+                self._os_up_streak = 0
+                start = True
+        if missed_up:
+            print(f"[hotkey] {name!r} down {gap:.1f}s after the last event; "
+                  "treating it as a missed release")
+            self._ctrl_q.put(("up", mode))
+        if start:
+            self._ctrl_q.put(("down", mode))
+
+    def _on_ptt_up(self, name, mode):
+        release = False
+        with self._key_lock:
+            self._key_seen_at[name] = time.monotonic()
             if name not in self._pressed_keys:
                 return
             self._pressed_keys.discard(name)
             if name == self._active_ptt_key:
                 self._active_ptt_key = None
-                self._ctrl_q.put(("up", mode))
+                self._os_up_streak = 0
+                release = True
+        if release:
+            self._ctrl_q.put(("up", mode))
+
+    def _on_key(self, event):
+        # This runs inside the keyboard listener thread — it MUST be trivial and
+        # never throw, or the listener dies and every hotkey stops working until
+        # restart. So: match, drop auto-repeat, enqueue. All real work (mute,
+        # audio start, transcription) happens in _ctrl_loop. The lock below is
+        # uncontended and held only for the set update.
+        try:
+            name = event.name
+            if name == self.cfg.get("live_hotkey"):
+                self._on_live_key(event, name)
+                return
+            mode = self._ptt_mode(name)
+            if mode is None:
+                return
+            if event.event_type == keyboard.KEY_DOWN:
+                self._on_ptt_down(name, mode)
+            elif event.event_type == keyboard.KEY_UP:
+                self._on_ptt_up(name, mode)
+        except Exception as e:
+            print(f"[hotkey] listener error: {e}")
+
+    def _drop_held_key(self):
+        """Forget the PTT key we think is held. Caller runs the release path."""
+        with self._key_lock:
+            name = self._active_ptt_key
+            if name:
+                self._pressed_keys.discard(name)
+                self._key_seen_at.pop(name, None)
+            self._active_ptt_key = None
+            self._os_up_streak = 0
+            return name
+
+    def _poll_key_watchdog(self):
+        """Synthesize KEY_UP when the OS says the held PTT key is up, twice.
+
+        A release over an elevated window, the lock screen, or a hook stall
+        never delivers KEY_UP. The next real press is then swallowed by the
+        auto-repeat guard and the mic stays open. One poll is not enough.
+        """
+        with self._key_lock:
+            name = self._active_ptt_key
+            if not name:
+                self._os_up_streak = 0
+                return
+            vk = _vk_for_hotkey(name)
+            if vk is None:
+                return  # no VK: degrade to today's hook-only behaviour
+            down = _os_key_down(vk)
+            if down is None or down:
+                self._os_up_streak = 0
+                return
+            self._os_up_streak += 1
+            if self._os_up_streak < _KEY_UP_POLLS:
+                return
+            self._pressed_keys.discard(name)
+            self._key_seen_at.pop(name, None)
+            self._active_ptt_key = None
+            self._os_up_streak = 0
+        print(f"[hotkey] {name!r} still marked held but the OS reports it up; "
+              "releasing")
+        self.on_release()
+
+    def _poll_record_cap(self):
+        """Force-release a local recording that has run past max_record_s.
+
+        Remote sessions keep their own cancel timer, and that one discards.
+        This path goes through on_release so the audio is transcribed.
+        Stopping the recording is what bounds Recorder._chunks.
+        """
+        if not self.recording or getattr(self, "active_mode", None) == "remote":
+            return
+        try:
+            cap = float(self.cfg.get("max_record_s", 600))
+        except (TypeError, ValueError, AttributeError):
+            return
+        if cap <= 0:
+            return
+        started = self._record_started_at
+        if started is None or (time.monotonic() - started) < cap:
+            return
+        print(f"[hotkey] local recording exceeded {cap:.0f}s; "
+              "releasing for transcription")
+        self._drop_held_key()
+        self.on_release()
 
     def _ctrl_loop(self):
-        while True:
-            action, mode = self._ctrl_q.get()
+        import queue
+        while not getattr(self, "_ctrl_stop", False):
+            try:
+                action, mode = self._ctrl_q.get(timeout=_KEY_POLL_S)
+            except queue.Empty:
+                if getattr(self, "_ctrl_stop", False):
+                    return
+                try:
+                    self._poll_key_watchdog()
+                    self._poll_record_cap()
+                except Exception as e:
+                    # Don't clear `recording` here: a failed poll must not
+                    # orphan the open mic. The next poll retries.
+                    print(f"[hotkey] watchdog error: {e}")
+                continue
+            if getattr(self, "_ctrl_stop", False):
+                return
             try:
                 if action == "toggle":
                     if not self.live_worker:
@@ -1907,6 +2080,7 @@ class Flow:
                 # Never let a press/release error propagate — recover the state.
                 print(f"[hotkey] {action} handler error: {e}")
                 self.recording = False
+                self._record_started_at = None
 
     def maybe_start_server(self):
         s = self.cfg["server"]
