@@ -43,7 +43,7 @@ def _bare(monkeypatch):
     f.hermes = None
     f.hermes_context = None
     f.busy = threading.Lock()
-    f._mic_lock = threading.RLock()
+    f._mic_lock = flow._new_mic_lock()
     f._mic_held = False
     f._job_q = queue.Queue()
     f._last_mic_probe = 0.0
@@ -527,8 +527,8 @@ def test_startup_probe_does_not_hold_the_processing_lock(monkeypatch):
 
     def probe(index, sample_rate, seconds=0.4):
         seen["busy"] = f.busy.locked()
-        # RLock has no locked(). A second thread failing to acquire means
-        # the probe is holding the mic lock.
+        # Lock has no locked() we can rely on. A second thread failing to
+        # acquire means the probe is holding the mic lock.
         grabbed = []
 
         def try_acquire():
@@ -580,6 +580,87 @@ def test_remote_start_still_refuses_while_a_local_recording_is_active(monkeypatc
     f._mic_lock.acquire()
     assert f.remote_start() is False
     assert f.active_mode == "dictate"
+
+
+def test_remote_stop_on_another_thread_frees_the_mic(monkeypatch):
+    """remote_start's thread must not keep the mic after remote_stop.
+
+    An RLock can only be released by its owner. remote_stop runs on the
+    HTTP thread that did not acquire, the release is swallowed, and the
+    next local press waits out the probe timeout forever.
+    """
+    import flow
+    f = _bare(monkeypatch)
+    f._remote_gen = 0
+    monkeypatch.setattr(flow, "_MIC_WAIT_S", 0.2)
+    f.recorder.stop = lambda: []
+    says = []
+    f.overlay = types.SimpleNamespace(set=says.append)
+    assert f.remote_start() is True
+
+    errors = []
+
+    def stop():
+        try:
+            assert f.remote_stop(window="vm") == ""
+        except Exception as exc:
+            errors.append(exc)
+
+    stopper = threading.Thread(target=stop)
+    stopper.start()
+    stopper.join(2)
+    assert not stopper.is_alive()
+    assert errors == []
+    assert f.recording is False
+
+    def press():
+        f.on_press("dictate")
+
+    presser = threading.Thread(target=press)
+    presser.start()
+    presser.join(2)
+    assert not presser.is_alive()
+    assert f.recording is True
+    assert not any(isinstance(m, tuple) and m and m[0] == "say" for m in says)
+
+
+def test_press_during_a_recording_does_not_wait_or_say_probe(monkeypatch):
+    """A second key, or a local press during a remote take, returns at once."""
+    import flow
+    f = _bare(monkeypatch)
+    monkeypatch.setattr(flow, "_MIC_WAIT_S", 0.4)
+    says = []
+    f.overlay = types.SimpleNamespace(set=says.append)
+    f.on_press("dictate")
+    assert f.recording is True
+    started = time.monotonic()
+    f.on_press("command")
+    assert time.monotonic() - started < 0.2
+    assert f.active_mode == "dictate"
+    assert says == []
+
+    f.on_release()
+    assert f.recording is False
+    held = threading.Event()
+    release = threading.Event()
+
+    def holder():
+        f._mic_lock.acquire()
+        f.recording = True
+        held.set()
+        release.wait(2)
+        f.recording = False
+        f._mic_lock.release()
+
+    threading.Thread(target=holder, daemon=True).start()
+    assert held.wait(1)
+    started = time.monotonic()
+    f.on_press("dictate")
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.2
+    assert f.recording is True
+    assert says == []
+    release.set()
 
 
 def test_on_release_does_not_join_the_streamer(monkeypatch):

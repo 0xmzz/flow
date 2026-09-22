@@ -1202,6 +1202,16 @@ def _os_key_down(vk):
         return None
 
 
+def _new_mic_lock():
+    """The recording lock. A plain Lock, released by whichever thread ends the take.
+
+    remote_start acquires it on the HTTP thread; remote_stop and the orphan
+    timer release it on other threads. An RLock can only be released by its
+    owner, so that release was swallowed and every later press timed out.
+    """
+    return threading.Lock()
+
+
 # OpenClipboard fails when another app holds it for a moment. Ten tries
 # over ~300ms covers that blip; the dictation is never dropped on the floor.
 _CLIP_RETRY_DELAYS = (0.02, 0.02, 0.03, 0.03, 0.04, 0.04, 0.04, 0.04, 0.04)
@@ -1282,7 +1292,7 @@ class Flow:
         self._job_q = _queue.Queue()  # dictations, processed strictly in press order
         self._vm_q = _queue.Queue()  # hands VM-triggered transcripts to the server
         self.busy = threading.Lock()  # processing only; a press must not look at this
-        self._mic_lock = threading.RLock()  # probe/retarget vs a live recording
+        self._mic_lock = _new_mic_lock()
         self._mic_held = False
         self.model_lock = threading.Lock()  # serialize GPU across hotkey + server
         self._remote_gen = 0  # remote session counter (stale-timer guard)
@@ -1422,8 +1432,8 @@ class Flow:
         """Switch to the input device carrying the strongest signal.
 
         Holds _mic_lock for the whole sweep so a retarget cannot land in the
-        middle of a recording. startup_mic_check calls this on the same thread
-        and may already hold the lock; it is an RLock.
+        middle of a recording. Callers must not already hold the lock:
+        startup_mic_check releases it before calling this.
         """
         with self._mic_lock:
             return self._recover_mic(min_gap_s, when_silent)
@@ -1632,10 +1642,19 @@ class Flow:
 
     def on_press(self, mode="dictate"):
         stop_speech()
+        # A second PTT key during a recording must return immediately. The
+        # lock is held for the whole take, so waiting out _MIC_WAIT_S would
+        # block the ctrl loop and then claim the microphone is being checked.
+        with self._session_lock:
+            if self.recording:
+                return
         # Wait outside _session_lock: a probe may take seconds, and the
         # previous release still needs that lock. `busy` is processing, not
         # the mic — a new press records while the previous take decodes.
         if not self._mic_lock.acquire(timeout=_MIC_WAIT_S):
+            with self._session_lock:
+                if self.recording:
+                    return
             self._note_mic_wait()
             return
         started = False
