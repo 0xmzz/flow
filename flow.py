@@ -226,6 +226,101 @@ CLEANUP_PROMPT = (
 )
 
 
+# Whisper caption outros. Longest first so "thank you so much…" wins over
+# "thank you for watching". Matched only as a trailing phrase.
+_OUTRO_PHRASES = (
+    "thank you so much for watching",
+    "thank you for watching",
+    "thanks for watching",
+    "i'll see you in the next video",
+    "i’ll see you in the next video",
+    "see you in the next video",
+    "like and subscribe",
+    "please subscribe",
+    "subscribe to my channel",
+)
+
+
+def _sentence_spans(text):
+    """Sentences with their original spacing, split on . ! ?"""
+    return re.findall(r"[^.!?]*[.!?]+|[^.!?]+$", text)
+
+
+def _norm_sentence(sentence):
+    folded = sentence.replace("’", "'").lower()
+    folded = re.sub(r"[^\w\s']", " ", folded)
+    return re.sub(r"\s+", " ", folded).strip()
+
+
+def _strip_trailing_outros(text):
+    phrases = "|".join(re.escape(p) for p in _OUTRO_PHRASES)
+    trail = re.compile(
+        rf"[\s,]*(?:\band\b\s+)?(?:{phrases})\b[^\w]*$",
+        re.IGNORECASE,
+    )
+    whole = re.compile(rf"^(?:{phrases})\b[^\w]*$", re.IGNORECASE)
+    current = text.strip()
+    while current:
+        nxt = trail.sub("", current).strip()
+        if nxt == current:
+            nxt = whole.sub("", current).strip()
+        if nxt == current:
+            return current
+        current = nxt
+    return current
+
+
+def _collapse_repeated_sentences(text):
+    """A sentence said ≥3 times in a row keeps one copy."""
+    parts = [p for p in _sentence_spans(text) if p.strip()]
+    if len(parts) < 3:
+        return text.strip()
+    norms = [_norm_sentence(p) for p in parts]
+    kept = []
+    i = 0
+    while i < len(parts):
+        j = i + 1
+        while j < len(parts) and norms[j] and norms[j] == norms[i]:
+            j += 1
+        if j - i >= 3:
+            kept.append(parts[i].strip())
+        else:
+            kept.extend(p.strip() for p in parts[i:j])
+        i = j
+    return " ".join(kept).strip()
+
+
+def _drop_trailing_short_run(text):
+    """Drop a trailing run of ≥3 identical sentences of ≤3 words each."""
+    parts = [p for p in _sentence_spans(text) if p.strip()]
+    if len(parts) < 3:
+        return text.strip()
+    norms = [_norm_sentence(p) for p in parts]
+    last = norms[-1]
+    if not last or len(last.split()) > 3:
+        return text.strip()
+    i = len(parts) - 1
+    while i >= 0 and norms[i] == last:
+        i -= 1
+    if len(parts) - 1 - i >= 3:
+        return " ".join(p.strip() for p in parts[:i + 1]).strip()
+    return text.strip()
+
+
+def strip_hallucinations(text):
+    """Drop Whisper caption outros and stuttered sentence loops.
+
+    Applied to the newly decoded tail only. Committed (already typed) text
+    is not passed in, so a live prefix on screen is left alone.
+    """
+    if not text:
+        return text or ""
+    cleaned = _strip_trailing_outros(text)
+    cleaned = _drop_trailing_short_run(cleaned)
+    cleaned = _collapse_repeated_sentences(cleaned)
+    return cleaned.strip()
+
+
 def apply_replacements(text, cfg):
     """Whole-word, case-insensitive replacements (e.g. btw -> by the way)."""
     reps = cfg.get("replacements") or {}
@@ -1684,15 +1779,18 @@ class Flow:
         prompt = ((committed_text[-200:] or None) if private
                   else self.bias_prompt(committed_text))
         segs = self.decode(tail, prompt=prompt) if len(tail) > 0 else []
-        raw = (committed_text + " "
-               + " ".join(s.text.strip() for s in segs)).strip()
+        # `raw` keeps the decoder output, hallucinations included. The filter
+        # touches only the new tail — committed text is already on screen
+        # when live-typing, and process() slices text[live_typed:].
+        tail_raw = " ".join(s.text.strip() for s in segs).strip()
+        raw = (committed_text + " " + tail_raw).strip()
+        text = (committed_text + " " + strip_hallucinations(tail_raw)).strip()
         asr_t = time.time() - t0
-        text = raw
         cleanup_s = 0.0
-        if (raw and self.cfg["cleanup"]["enabled"] and not skip_cleanup
+        if (text and self.cfg["cleanup"]["enabled"] and not skip_cleanup
                 and not private):
             c0 = time.monotonic()
-            text = llm_cleanup(raw, self.cfg, window=window)
+            text = llm_cleanup(text, self.cfg, window=window)
             cleanup_s = time.monotonic() - c0
         meta = {"asr_s": round(asr_t, 2), "duration_s": round(dur, 2),
                 "cleanup_s": round(cleanup_s, 3)}

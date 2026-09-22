@@ -750,6 +750,58 @@ def test_history_row_carries_e2e_and_stages(monkeypatch, tmp_path):
     assert row["text"] == "hello"
 
 
+@pytest.mark.parametrize(("heard", "kept"), [
+    ("Ship the report. Thanks for watching!", "Ship the report."),
+    ("Ship the report. Thank you for watching.", "Ship the report."),
+    ("Ship the report. Thank you so much for watching.", "Ship the report."),
+    ("Thank you for watching, and I'll see you in the next video.", ""),
+    ("See you in the next video.", ""),
+    ("Please subscribe.", ""),
+    ("Like and subscribe!", ""),
+    ("Ship it. Bye. Bye. Bye. Bye. Bye.", "Ship it."),
+    ("Ship it. Thank you. Thank you. Thank you.", "Ship it."),
+    ("I walked the dog today. I walked the dog today. "
+     "I walked the dog today.", "I walked the dog today."),
+    ("I was watching the build fail earlier today.",
+     "I was watching the build fail earlier today."),
+    ("Do not subscribe to that theory, please think first.",
+     "Do not subscribe to that theory, please think first."),
+    ("That was kind. Thank you.", "That was kind. Thank you."),
+    ("Go home. Go home.", "Go home. Go home."),
+])
+def test_strip_hallucinations(heard, kept):
+    import flow
+    assert flow.strip_hallucinations(heard) == kept
+
+
+def test_filter_keeps_raw_history_and_does_not_touch_committed(monkeypatch, tmp_path):
+    import types
+    import numpy as np
+    import flow
+    from store import TranscriptStore
+    f = _bare(monkeypatch)
+    f.store = TranscriptStore(tmp_path)
+    f.cfg["cleanup"] = {"enabled": False}
+    f.cfg["model"] = "m"
+    f.cfg["device"] = "cpu"
+    f.cfg["trusted_devices"] = []
+    f.model_lock = threading.Lock()
+    monkeypatch.setattr(
+        flow.Flow, "decode",
+        lambda self, audio, **k: [types.SimpleNamespace(
+            text="Send the file. Thanks for watching!")])
+    text, _ = f.transcribe_and_store(
+        np.zeros(1600, dtype=np.float32),
+        committed=("Bye. Bye. Bye.", 0))
+    assert text.startswith("Bye. Bye. Bye.")
+    assert "Thanks for watching" not in text
+    assert text.endswith("Send the file.")
+    row = f.store.read()[-1]
+    assert "Thanks for watching" in row["text"]
+    assert row["cleaned"].endswith("Send the file.")
+    assert "Thanks for watching" not in row["cleaned"]
+
+
 def test_slow_e2e_prints_the_stage_breakdown(monkeypatch, capsys):
     f = _bare(monkeypatch)
     f.store = None
