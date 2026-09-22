@@ -854,6 +854,39 @@ def test_store_add_timing_fields_are_optional(tmp_path):
     assert "e2e_s" not in st.read()[0]
 
 
+def test_replacement_error_still_pastes_and_stores(monkeypatch, tmp_path, capsys):
+    """A bad replacements entry must not drop the paste or the history row."""
+    import types
+    import numpy as np
+    import flow
+    from store import TranscriptStore
+    f = _bare(monkeypatch)
+    f.store = TranscriptStore(tmp_path)
+    f.cfg["min_duration_s"] = 0
+    f.cfg["cleanup"] = {"enabled": False}
+    f.cfg["model"] = "m"
+    f.cfg["device"] = "cpu"
+    f.model_lock = threading.Lock()
+    pasted = []
+    monkeypatch.setattr(flow.Flow, "mic_is_deaf", lambda self, audio: False)
+    monkeypatch.setattr(
+        flow.Flow, "decode",
+        lambda self, audio, **k: [types.SimpleNamespace(text="ship the report")])
+    monkeypatch.setattr(flow, "paste_text",
+                        lambda text, mode, restore=True: pasted.append(text))
+
+    def boom(text, cfg):
+        raise TypeError("bad replacement")
+
+    monkeypatch.setattr(flow, "apply_replacements", boom)
+    f.process(np.zeros(1600, dtype=np.float32))
+    assert pasted == ["ship the report"]
+    rows = f.store.read()
+    assert len(rows) == 1
+    assert rows[0]["text"] == "ship the report"
+    assert "replacements failed" in capsys.readouterr().out
+
+
 def test_history_row_carries_e2e_and_stages(monkeypatch, tmp_path):
     from store import TranscriptStore
     f = _bare(monkeypatch)

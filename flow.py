@@ -2031,28 +2031,49 @@ class Flow:
                     persist=False)
                 self._remember(text)
                 p0 = time.monotonic()
-                if text and live_typed:
-                    # Part of the text is already on screen — flush the rest.
-                    remainder = apply_replacements(text[live_typed:], self.cfg)
-                    self._safe_paste(remainder, "clipboard", restore=False)
-                elif text:
-                    self._safe_paste(apply_replacements(text, self.cfg),
-                                     self.cfg["paste_mode"])
-                paste_s = time.monotonic() - p0
-                stages = {
-                    "queue_wait": round(queue_s, 3),
-                    "stream_join": round(join_s, 3),
-                    "decode": meta.get("asr_s") or 0,
-                    "cleanup": meta.get("cleanup_s") or 0,
-                    "paste": round(paste_s, 3),
-                }
-                e2e = self._note_e2e(released_at, stages,
-                                     meta.get("duration_s") or 0)
-                # Disk waits until the paste has been attempted.
-                self._flush_pending(meta, e2e_s=e2e, stages=stages)
-                if self.cfg.get("save_last_audio"):
-                    save_wav(APP_DIR / "last.wav", audio,
-                             self.cfg["sample_rate"])
+                e2e = None
+                stages = None
+                flushed = False
+                try:
+                    # A bad replacements entry must not drop the dictation.
+                    # Paste the unreplaced text and still write history.
+                    try:
+                        if text and live_typed:
+                            # Part of the text is already on screen — flush the rest.
+                            remainder = apply_replacements(
+                                text[live_typed:], self.cfg)
+                            self._safe_paste(remainder, "clipboard",
+                                             restore=False)
+                        elif text:
+                            self._safe_paste(apply_replacements(text, self.cfg),
+                                             self.cfg["paste_mode"])
+                    except Exception as e:
+                        print(f"[paste] replacements failed, pasting the "
+                              f"transcript unchanged: {e}")
+                        if text and live_typed:
+                            self._safe_paste(text[live_typed:], "clipboard",
+                                             restore=False)
+                        elif text:
+                            self._safe_paste(text, self.cfg["paste_mode"])
+                    paste_s = time.monotonic() - p0
+                    stages = {
+                        "queue_wait": round(queue_s, 3),
+                        "stream_join": round(join_s, 3),
+                        "decode": meta.get("asr_s") or 0,
+                        "cleanup": meta.get("cleanup_s") or 0,
+                        "paste": round(paste_s, 3),
+                    }
+                    e2e = self._note_e2e(released_at, stages,
+                                         meta.get("duration_s") or 0)
+                    # Disk waits until the paste has been attempted.
+                    self._flush_pending(meta, e2e_s=e2e, stages=stages)
+                    flushed = True
+                    if self.cfg.get("save_last_audio"):
+                        save_wav(APP_DIR / "last.wav", audio,
+                                 self.cfg["sample_rate"])
+                finally:
+                    if not flushed:
+                        self._flush_pending(meta, e2e_s=e2e, stages=stages)
             finally:
                 stop.set()
                 watcher.join(timeout=1.0)
