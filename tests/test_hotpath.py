@@ -877,6 +877,43 @@ def test_store_add_timing_fields_are_optional(tmp_path):
     assert "e2e_s" not in st.read()[0]
 
 
+def test_transcribe_route_omits_internal_timing(tmp_path):
+    import json
+    import urllib.request
+    import numpy as np
+    from server import make_server
+    from store import TranscriptStore, wav_bytes
+
+    class _Stub:
+        def __init__(self):
+            self.cfg = {"server": {"token": "tok"}}
+            self.store = TranscriptStore(tmp_path)
+            self.started_at = 0.0
+            self.model_lock = threading.Lock()
+
+        def transcribe_and_store(self, audio, sample_rate=None, source="remote",
+                                 window=None, committed=("", 0)):
+            return "hello", {
+                "asr_s": 0.2, "duration_s": 1.0, "cleanup_s": 0.4,
+                "pending": {"raw": "hello"},
+            }
+
+    httpd = make_server(_Stub(), "127.0.0.1", 0, "tok")
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        wav = wav_bytes(np.zeros(1600, dtype=np.float32), 16000)
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/transcribe", data=wav,
+            headers={"Authorization": "Bearer tok",
+                     "Content-Type": "audio/wav"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            out = json.loads(resp.read())
+    finally:
+        httpd.shutdown()
+    assert out == {"text": "hello", "asr_s": 0.2, "duration_s": 1.0}
+
+
 def test_replacement_error_still_pastes_and_stores(monkeypatch, tmp_path, capsys):
     """A bad replacements entry must not drop the paste or the history row."""
     import types

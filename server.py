@@ -117,7 +117,13 @@ def make_server(flow, host, port, token):
                 return self._json(400, {"error": f"bad audio: {e}"})
             text, meta = flow.transcribe_and_store(
                 audio, sample_rate=sr, source=source, window=window)
-            return self._json(200, {"text": text, **meta})
+            # Clients already read text / asr_s / duration_s. cleanup_s and
+            # any later internal timing stay off this route.
+            return self._json(200, {
+                "text": text,
+                "asr_s": meta.get("asr_s"),
+                "duration_s": meta.get("duration_s"),
+            })
 
         def do_OPTIONS(self):
             self.send_response(204)
