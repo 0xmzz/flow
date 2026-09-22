@@ -1970,7 +1970,9 @@ class Flow:
             if stop.is_set():
                 return
             elapsed = time.monotonic() - started
-            if self.overlay:
+            # A newer take owns the overlay while the mic is open. Keep the
+            # clock running so the line returns when that take ends.
+            if self.overlay and not self.recording:
                 self.overlay.set(("work", _transcribing_label(elapsed)))
             next_at += _WAIT_TICK_S
             if next_at <= time.monotonic():

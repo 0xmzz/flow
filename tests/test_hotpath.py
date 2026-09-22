@@ -768,6 +768,42 @@ def test_slow_process_emits_overlay_progress_and_stops(monkeypatch):
     assert late == []
 
 
+def test_wait_ticker_stays_quiet_while_a_newer_take_is_recording(monkeypatch):
+    """Job A's 'Transcribing' ticks must not cover a newer take's overlay."""
+    import flow
+    f = _bare(monkeypatch)
+    monkeypatch.setattr(flow, "_WAIT_HINT_S", 1.5)
+    monkeypatch.setattr(flow, "_WAIT_TICK_S", 1.0)
+    clock = {"t": 10.0}
+    monkeypatch.setattr(flow.time, "monotonic", lambda: clock["t"])
+    messages = []
+    recording_at_push = []
+
+    def capture(msg):
+        messages.append(msg)
+        recording_at_push.append(f.recording)
+
+    f.overlay = types.SimpleNamespace(set=capture)
+    f.recording = True
+    phase = {"waits": 0}
+
+    class _Stop:
+        def is_set(self):
+            return phase["waits"] >= 6
+
+        def wait(self, timeout):
+            phase["waits"] += 1
+            if phase["waits"] == 4:
+                f.recording = False
+            clock["t"] += timeout
+            return self.is_set()
+
+    f._announce_wait(clock["t"], _Stop())
+    work = [m for m in messages if isinstance(m, tuple) and m and m[0] == "work"]
+    assert work, "ticks resume once the newer recording ends"
+    assert recording_at_push == [False] * len(recording_at_push)
+
+
 def test_fast_process_does_not_announce_a_wait(monkeypatch):
     import numpy as np
     import flow
