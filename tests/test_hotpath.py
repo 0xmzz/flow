@@ -1178,3 +1178,185 @@ def test_startup_retry_gap_does_not_hold_the_mic_lock(monkeypatch):
                         lambda *a, **k: (_ for _ in ()).throw(
                             AssertionError("a sweep that finds a mic does not recheck")))
     f.startup_mic_check()
+
+
+def _hook_idle(monkeypatch, flow, seconds, parked):
+    """Flag `parked` from whichever idle wait the streamer actually uses.
+
+    A reverted `time.sleep` still trips the flag, then `stop` sits in `join`
+    until its 2s timeout. `Event.wait` returns as soon as halt/stop/finish sets it.
+    """
+    real_sleep = flow.time.sleep
+
+    def sleep(secs):
+        if secs == seconds:
+            parked.set()
+        return real_sleep(secs)
+
+    real_wait = threading.Event.wait
+
+    def wait(self, timeout=None):
+        if timeout == seconds:
+            parked.set()
+        return real_wait(self, timeout)
+
+    monkeypatch.setattr(flow.time, "sleep", sleep)
+    monkeypatch.setattr(threading.Event, "wait", wait)
+
+
+def _stream_flow(monkeypatch, interval):
+    import numpy as np
+    import flow
+    f = _bare(monkeypatch)
+    f.model_lock = threading.Lock()
+    f.cfg["sample_rate"] = 16000
+    f.cfg["streaming"] = {
+        "interval_s": interval,
+        "unstable_tail_s": 0.6,
+        "pause_gap_s": 0.25,
+    }
+    audio = np.ones(16000 * 2, dtype=np.float32)
+    f.recorder = types.SimpleNamespace(snapshot=lambda: audio)
+    return flow, f
+
+
+def _agreed_words():
+    """Stable prefix with pause gaps, so a pass that is allowed to finish commits."""
+    return [types.SimpleNamespace(words=[
+        types.SimpleNamespace(word=" hello", start=0.0, end=0.4),
+        types.SimpleNamespace(word=" there", start=0.9, end=1.2),
+    ])]
+
+
+def test_stream_worker_halt_cuts_the_idle_wait(monkeypatch):
+    flow, f = _stream_flow(monkeypatch, 5.0)
+    parked = threading.Event()
+    _hook_idle(monkeypatch, flow, 5.0, parked)
+    worker = flow.StreamWorker(f)
+    worker.start()
+    assert parked.wait(1.0), "idle wait never started"
+    worker.halt()
+    t0 = time.perf_counter()
+    text, samples = worker.stop()
+    elapsed = time.perf_counter() - t0
+    alive = worker._thread.is_alive()
+    assert elapsed < 0.1 and not alive, (elapsed, alive)
+    assert (text, samples) == ("", 0)
+
+
+def test_agreeing_pass_still_commits_when_the_take_stays_open(monkeypatch):
+    flow, f = _stream_flow(monkeypatch, 0.01)
+    monkeypatch.setattr(flow.Flow, "decode",
+                        lambda self, audio, **k: _agreed_words())
+    worker = flow.StreamWorker(f)
+    worker._prev = ["hello", "there"]
+    worker.start()
+    deadline = time.time() + 2
+    while not worker.committed_text and time.time() < deadline:
+        time.sleep(0.01)
+    worker.halt()
+    worker.stop()
+    assert worker.committed_text == "hello there"
+    assert worker.committed_samples == int(1.2 * 16000)
+    assert not worker._thread.is_alive()
+
+
+def _client_flow(monkeypatch):
+    import numpy as np
+    import flow
+    f = _bare(monkeypatch)
+    f.cfg["sample_rate"] = 16000
+    f.cfg["server"] = {"token": "tok"}
+    f.cfg["client_name"] = "box"
+    f.cfg["server_url"] = "http://lane.test"
+    f.resolve_lane = lambda *a, **k: "http://lane.test"
+    f.recorder = types.SimpleNamespace(
+        snapshot=lambda: np.zeros(0, dtype=np.float32))
+    monkeypatch.setattr(flow, "foreground_window", lambda: "ed")
+    monkeypatch.setattr("pyperclip.paste", lambda: "")
+    monkeypatch.setattr("pyperclip.copy", lambda _t: None)
+
+    class _Resp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"sid": "s1", "committed": "", "text": "final"}
+
+    monkeypatch.setattr("requests.post", lambda url, **k: _Resp())
+    return flow, f
+
+
+def _started_client(monkeypatch):
+    flow, f = _client_flow(monkeypatch)
+    parked = threading.Event()
+    _hook_idle(monkeypatch, flow, 0.35, parked)
+    streamer = flow.ClientStreamer(f)
+    streamer.start()
+    assert streamer.sid == "s1" and streamer._thread is not None
+    assert parked.wait(1.0), "idle wait never started"
+    return streamer
+
+
+def test_client_streamer_halt_cuts_the_idle_wait(monkeypatch):
+    streamer = _started_client(monkeypatch)
+    streamer.halt()
+    t0 = time.perf_counter()
+    text, samples = streamer.stop()
+    elapsed = time.perf_counter() - t0
+    alive = streamer._thread.is_alive()
+    assert elapsed < 0.1 and not alive, (elapsed, alive)
+    assert (text, samples) == ("", 0)
+
+
+def test_client_streamer_finish_cuts_the_idle_wait(monkeypatch):
+    streamer = _started_client(monkeypatch)
+    t0 = time.perf_counter()
+    text, typed = streamer.finish()
+    elapsed = time.perf_counter() - t0
+    alive = streamer._thread.is_alive()
+    assert elapsed < 0.1 and not alive, (elapsed, alive)
+    assert (text, typed) == ("final", 0)
+
+
+def test_halt_during_decode_joins_and_commits_nothing(monkeypatch):
+    flow, f = _stream_flow(monkeypatch, 0.01)
+    entered = threading.Event()
+    release = threading.Event()
+    left = threading.Event()
+
+    def decode(self, audio, **k):
+        entered.set()
+        release.wait(3)
+        left.set()
+        return _agreed_words()
+
+    monkeypatch.setattr(flow.Flow, "decode", decode)
+    worker = flow.StreamWorker(f)
+    worker._prev = ["hello", "there"]
+    worker.start()
+    assert entered.wait(2.0), "decode never started"
+    worker.halt()
+    done = threading.Event()
+    out = {}
+
+    def join():
+        t0 = time.perf_counter()
+        out["ret"] = worker.stop()
+        out["dt"] = time.perf_counter() - t0
+        done.set()
+
+    threading.Thread(target=join, daemon=True).start()
+    time.sleep(0.2)
+    assert not done.is_set(), "stop() returned while decode was still blocked"
+    assert not left.is_set()
+    assert worker.committed_text == ""
+    assert worker.committed_samples == 0
+    release.set()
+    assert done.wait(1.0)
+    assert left.is_set()
+    assert 0.15 <= out["dt"] < 1.0
+    assert not worker._thread.is_alive()
+    assert out["ret"] == ("", 0)
+    assert worker.committed_text == ""
+    assert worker.committed_samples == 0

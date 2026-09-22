@@ -670,6 +670,7 @@ class StreamWorker:
         self._prev = []          # word texts from the previous pass
         self._active = False
         self._thread = None
+        self._wake = threading.Event()  # cuts the idle wait; does not abort a pass
         if live:
             try:
                 self.saved_clip = pyperclip.paste()
@@ -677,6 +678,9 @@ class StreamWorker:
                 pass
 
     def start(self):
+        # A previous stop() leaves the event set. Clear it before the thread
+        # exists so the first wait is a full interval, same as the old sleep.
+        self._wake.clear()
         self._active = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -684,9 +688,11 @@ class StreamWorker:
     def halt(self):
         """Stop committing. Join happens later, off the ctrl-loop thread."""
         self._active = False
+        self._wake.set()
 
     def stop(self):
         self._active = False
+        self._wake.set()
         if self._thread:
             self._thread.join(2.0)
         return self.committed_text, self.committed_samples
@@ -698,7 +704,7 @@ class StreamWorker:
         unstable = scfg.get("unstable_tail_s", 0.6)
         pause_gap = scfg.get("pause_gap_s", 0.25)
         while self._active:
-            time.sleep(interval)
+            self._wake.wait(interval)
             if not self._active:
                 return
             if self.flow.model_lock.locked():
@@ -783,6 +789,7 @@ class ClientStreamer:
         self.saved_clip = None
         self._active = False
         self._thread = None
+        self._wake = threading.Event()
 
     def _url(self, path):
         # Same lane the one-shot path picked, or streaming would keep aiming at
@@ -811,6 +818,7 @@ class ClientStreamer:
             self.saved_clip = pyperclip.paste()
         except Exception:
             pass
+        self._wake.clear()
         self._active = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -819,7 +827,7 @@ class ClientStreamer:
         import requests
         sr = self.flow.cfg["sample_rate"]
         while self._active:
-            time.sleep(0.35)
+            self._wake.wait(0.35)
             snap = self.flow.recorder.snapshot()
             new = snap[self.sent:]
             if len(new) < sr * 0.25:
@@ -850,10 +858,12 @@ class ClientStreamer:
     def halt(self):
         """Stop uploading. finish() joins the thread off the ctrl loop."""
         self._active = False
+        self._wake.set()
 
     def stop(self):
         """on_release calls this like a StreamWorker; the real work is finish()."""
         self.halt()
+        self._wake.set()
         if self._thread:
             self._thread.join(2.0)
         return self.committed, 0
@@ -862,6 +872,7 @@ class ClientStreamer:
         """Stop uploading; final decode on the server. Returns (text, typed)."""
         import requests
         self._active = False
+        self._wake.set()
         if self._thread:
             self._thread.join(2.0)
         if not self.sid:
