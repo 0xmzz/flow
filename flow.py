@@ -1599,7 +1599,13 @@ class Flow:
 
     def set_icon(self, state, context=None):
         if self.tray:
-            self.tray.icon = make_icon(state)
+            # pystray can raise transient Win32 errors (WinError 1402, invalid
+            # cursor handle). A tray glitch must never fail the take or leave
+            # the overlay counting forever.
+            try:
+                self.tray.icon = make_icon(state)
+            except Exception as e:
+                print(f"[tray] icon update failed: {e}")
         if self.overlay:
             # Enrich the listening state with the target window so the pill can
             # show "→ where the text is going" (display-only, never sent).
@@ -1998,8 +2004,10 @@ class Flow:
             daemon=True, name="flow-wait")
         watcher.start()
         with self.busy:
-            self.set_icon("work")
             try:
+                # Inside the try: whatever fails from here on, the finally
+                # stops the "Transcribing… (Ns)" ticker.
+                self.set_icon("work")
                 work_started = time.monotonic()
                 queue_s = (0.0 if released_at is None
                            else max(0.0, work_started - released_at))
