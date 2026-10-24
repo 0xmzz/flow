@@ -442,17 +442,59 @@ def _scratch_pattern(phrases):
     return re.compile(rf"\b(?:{body})\b[.!?…,;:]*", re.IGNORECASE)
 
 
-def _phrase_key(text):
-    folded = text.replace("’", "'").lower()
-    folded = re.sub(r"[^\w\s']", " ", folded)
-    return re.sub(r"\s+", " ", folded).strip()
+def _scratch_cut(text, match_start, match_end):
+    """Where a scratch command deletes, measured from the command's position.
+
+    The command does not have to be its own sentence. When it begins a
+    sentence ("Drop. Scratch that and continue."), the sentence that ends
+    just before it is the one that goes, and the words after the command
+    stay. When it sits mid-sentence, the words before it in that sentence
+    are what was just said. A command with no preceding sentence removes
+    only itself.
+    """
+    spans = _sentence_spans(text)
+    idx = None
+    for i, (s, e) in enumerate(spans):
+        if s <= match_start < e or (match_start == e and e == len(text)):
+            idx = i
+            break
+    if idx is None:
+        return match_start, match_end
+    s, _e = spans[idx]
+    at_start = text[s:match_start].strip() == ""
+    if at_start and idx > 0:
+        return spans[idx - 1][0], match_end
+    if at_start:
+        return match_start, match_end
+    return s, match_end
+
+
+def _join_scratch(prefix, rest):
+    """Glue the kept text. A continuation that now starts a sentence is capped.
+
+    "Keep. " + "and continue." becomes "Keep. And continue." The same
+    characters come back when there is nothing to join.
+    """
+    pre = prefix.rstrip()
+    nxt = rest.lstrip()
+    if not pre:
+        if nxt and nxt[0].isalpha() and nxt[0].islower():
+            return nxt[0].upper() + nxt[1:]
+        return nxt
+    if not nxt:
+        return pre
+    if pre[-1] in ".!?" and nxt[0].isalpha() and nxt[0].islower():
+        nxt = nxt[0].upper() + nxt[1:]
+    return pre + " " + nxt
 
 
 def apply_voice_edits(text, cfg=None):
-    """Drop a scratch-phrase and the sentence immediately before it.
+    """Drop a scratch-phrase and the sentence that ends before it.
 
     "scratch that." at the end of "Keep this. Drop me. Scratch that." removes
-    "Drop me." and the command. The phrase alone, or with nothing before it,
+    "Drop me." and the command. "Keep. Drop. Scratch that and continue."
+    removes "Drop." and the command, and caps the continuation:
+    "Keep. And continue." The phrase alone, or with nothing before it,
     removes only itself. The same string comes back when nothing matches.
     """
     if not text:
@@ -466,90 +508,55 @@ def apply_voice_edits(text, cfg=None):
         m = pat.search(text)
         if not m:
             break
-        spans = _sentence_spans(text)
-        idx = None
-        for i, (s, e) in enumerate(spans):
-            if s <= m.start() < e:
-                idx = i
-                break
-        if idx is None:
-            cut_from, cut_to = m.start(), m.end()
-        else:
-            s, e = spans[idx]
-            own = _phrase_key(text[s:e]) == _phrase_key(m.group())
-            if own and idx > 0:
-                cut_from = spans[idx - 1][0]
-                cut_to = e
-            elif own:
-                cut_from, cut_to = s, e
-            else:
-                # The command sits inside a longer sentence: that sentence,
-                # up through the command, is what was just said.
-                cut_from, cut_to = s, max(m.end(), s)
+        cut_from, cut_to = _scratch_cut(text, m.start(), m.end())
         if cut_to <= cut_from:
             cut_from, cut_to = m.start(), m.end()
-        text = text[:cut_from] + text[cut_to:]
-        if cut_from == 0:
-            text = text.lstrip()
+        text = _join_scratch(text[:cut_from], text[cut_to:])
         changed = True
     return text.strip() if changed else text
 
 
-def plan_retract(spans, old, new, typed_len):
-    """Map a deletion in `old` -> `new` onto characters already live-typed.
+def _drop_scratch_phrases(text, cfg=None):
+    """Remove scratch phrases only. The surrounding sentences stay."""
+    if not text:
+        return text or ""
+    phrases = _scratch_phrases(cfg)
+    if not phrases:
+        return text
+    pat = _scratch_pattern(phrases)
+    changed = False
+    for _ in range(20):
+        m = pat.search(text)
+        if not m:
+            break
+        text = text[:m.start()] + text[m.end():]
+        changed = True
+    if not changed:
+        return text
+    return re.sub(r"[ \t]{2,}", " ", text)
 
-    `spans` is (src_start, src_end, pasted) for each commit, covering
-    `old[:typed_len]`. Returns (erase, retype, new_spans, new_typed_len).
-    `erase` is the screen suffix to backspace; `retype` is the part of that
-    suffix the deletion did not actually remove.
+
+def voice_edit_keeping_screen(text, typed_len, cfg=None):
+    """Scratch-that for text that is not on screen yet.
+
+    `typed_len` characters are already live-typed. They are returned
+    unchanged — this never asks the caller to backspace. A command whose
+    sentence is already inside that prefix drops only the phrase (when the
+    phrase itself has not been typed) and the caller logs it. A command
+    that sits entirely past the prefix deletes the preceding sentence too.
+    Returns (new_text, typed_len).
     """
-    spans = list(spans or [])
-    typed_len = max(0, min(int(typed_len or 0), len(old or "")))
-    if old == new or not old:
-        return "", "", spans, typed_len
-    pre = 0
-    limit = min(len(old), len(new))
-    while pre < limit and old[pre] == new[pre]:
-        pre += 1
-    so, sn = len(old), len(new)
-    while so > pre and sn > pre and old[so - 1] == new[sn - 1]:
-        so -= 1
-        sn -= 1
-    if pre >= typed_len:
-        return "", "", spans, typed_len
-
-    def consume(src_from):
-        keep, erased = [], []
-        for s, e, pasted in spans:
-            pasted = pasted or ""
-            if e <= src_from:
-                keep.append((s, e, pasted))
-            elif s >= src_from:
-                erased.append(pasted)
-            elif len(pasted) == e - s:
-                cut = src_from - s
-                keep.append((s, src_from, pasted[:cut]))
-                erased.append(pasted[cut:])
-            else:
-                # A replacement changed the length inside this commit, so the
-                # screen text cannot be sliced. Drop the whole commit from
-                # the screen; the kept source is retyped as itself.
-                erased.append(pasted)
-                kept_src = old[s:src_from]
-                if kept_src:
-                    keep.append((s, src_from, kept_src))
-        return keep, "".join(erased)
-
-    keep_prefix, erase = consume(pre)
-    if so >= typed_len:
-        return erase, "", keep_prefix, pre
-    _keep_tail, retype = consume(so)
-    new_typed = pre + (typed_len - so)
-    # The surviving suffix moved left by the deletion.
-    new_spans = list(keep_prefix)
-    if retype:
-        new_spans.append((pre, new_typed, retype))
-    return erase, retype, new_spans, new_typed
+    text = text or ""
+    typed_len = max(0, min(int(typed_len or 0), len(text)))
+    if typed_len <= 0:
+        return apply_voice_edits(text, cfg), 0
+    prefix = text[:typed_len]
+    full = apply_voice_edits(text, cfg)
+    if full.startswith(prefix):
+        return full, typed_len
+    tail = _drop_scratch_phrases(text[typed_len:], cfg)
+    print("[voice] scratch that left the on-screen sentence; dropped the phrase")
+    return prefix + tail, typed_len
 
 
 def resolve_profile(cfg, window):
@@ -680,6 +687,10 @@ class Recorder:
         self._stream = None
         self._subscribers = []
         self._buf_lock = threading.Lock()
+        # Bumped on start and again when the take is sealed. discard_prefix
+        # and snapshot refuse a generation that is no longer current, so a
+        # streamer from the previous take cannot trim or read the next one.
+        self._gen = 0
         # Samples dropped from the front of this take. The text for them is
         # already committed; snapshot/stop only carry the tail.
         self._discarded = 0
@@ -792,34 +803,59 @@ class Recorder:
                        self._ring_samples - len(self._ring[0]) >= self.pre_roll):
                     self._ring_samples -= len(self._ring.popleft())
 
-    def start(self):
+    def start(self, prefix=None):
+        """Begin a take. `prefix` seeds the buffer and skips the pre-roll ring.
+
+        A hands-free latch passes the audio sealed at the first tap so the
+        gesture in between is not speech. Returns this take's generation.
+        """
         if self._stream is None or not self._stream.active:
             self._open()  # recover from device loss
         with self._buf_lock:
-            self._chunks = list(self._ring)  # pre-roll: capture speech before the press
+            self._gen += 1
+            if prefix is not None and len(prefix):
+                arr = np.asarray(prefix, dtype=np.float32).reshape(-1, 1)
+                self._chunks = [arr]
+            else:
+                # pre-roll: capture speech before the press
+                self._chunks = list(self._ring)
             self._discarded = 0
             self._recording = True
+            return self._gen
 
-    def snapshot(self):
-        """Audio still held (recording continues). O(uncommitted) after a trim."""
+    def generation(self):
         with self._buf_lock:
+            return self._gen
+
+    def snapshot(self, gen=None):
+        """Audio still held (recording continues). O(uncommitted) after a trim.
+
+        A `gen` from a take that has already been sealed returns empty, so a
+        stale streamer cannot read the next take.
+        """
+        with self._buf_lock:
+            if gen is not None and gen != self._gen:
+                return np.zeros(0, dtype=np.float32)
             chunks = list(self._chunks)
         if not chunks:
             return np.zeros(0, dtype=np.float32)
         return np.concatenate(chunks).flatten()
 
-    def discard_prefix(self, n):
+    def discard_prefix(self, n, gen=None):
         """Drop the first n samples of the current buffer.
 
         n indexes snapshot(), not the original take. The text for this audio
         is already committed; keeping the samples would make every later pass
         concatenate the whole dictation. Returns how many samples were dropped.
+        A `gen` that is not the current take drops nothing.
         """
         n = int(n)
         if n <= 0:
             return 0
-        dropped = 0
         with self._buf_lock:
+            if gen is not None and gen != self._gen:
+                return 0
+            dropped = 0
             while n > 0 and self._chunks:
                 chunk = self._chunks[0]
                 frames = int(chunk.shape[0])
@@ -834,19 +870,38 @@ class Recorder:
             self._discarded += dropped
         return dropped
 
-    def stop(self):
+    def capture(self, streamer=None):
+        """Seal the take. Return (audio, (committed_text, committed_samples)).
+
+        The copy and the commit offsets are taken under one lock, then the
+        generation advances. A streamer still inside a pass cannot trim this
+        buffer or the next take, and it cannot rebase the offsets just read.
+        """
         with self._buf_lock:
             self._recording = False
             chunks = list(self._chunks)
-            discarded = self._discarded
+            discarded = int(self._discarded)
             self._discarded = 0
-            # Keep _chunks. ClientStreamer.finish() still reads the tail
-            # after stop(), and start() replaces the buffer on the next take.
+            frames = sum(int(c.shape[0]) for c in chunks)
+            if streamer is not None:
+                frozen = (getattr(streamer, "committed_text", "") or "",
+                          int(getattr(streamer, "committed_samples", 0) or 0))
+                try:
+                    streamer._frozen = frozen
+                except Exception:
+                    pass
+            else:
+                frozen = ("", 0)
+            self.last_discarded = discarded
+            self.last_full_samples = discarded + frames
+            self._gen += 1
         audio = (np.concatenate(chunks).flatten() if chunks
                  else np.zeros(0, dtype=np.float32))
-        # Captured before the next take can start and overwrite them.
-        self.last_discarded = discarded
-        self.last_full_samples = discarded + int(audio.shape[0])
+        return audio, frozen
+
+    def stop(self):
+        """End the take and return its audio. See capture()."""
+        audio, _frozen = self.capture(None)
         return audio
 
     def subscribe(self, maxsize=96):
@@ -873,9 +928,8 @@ class StreamWorker:
         self.live = live         # paste committed words while still recording
         self.typed_len = 0       # chars of committed_text already pasted
         self.typed_chars = 0     # chars actually put on screen (after replacements)
-        # (src_start, src_end, pasted) per live commit, so a later voice edit
-        # can backspace exactly the characters that commit put on screen.
-        self._typed_spans = []
+        self._gen = None         # Recorder generation this worker may trim
+        self._frozen = None      # (text, samples) sealed with the audio
         self.saved_clip = None
         self._prev = []          # word texts from the previous pass
         self._active = False
@@ -919,7 +973,7 @@ class StreamWorker:
                 return
             if self.flow.model_lock.locked():
                 continue  # don't queue behind other GPU work; try next cycle
-            snap = self.source.snapshot()
+            snap = self._snapshot()
             tail = snap[self.committed_samples:]
             if len(tail) < sr * 1.5:
                 continue
@@ -930,6 +984,8 @@ class StreamWorker:
                 print(f"[stream] pass failed: {e}")
                 continue
             if not self._active:   # released mid-pass: let the final pass own it
+                return
+            if not self._generation_ok():
                 return
             tail_dur = len(tail) / sr
             # Word-level commit: whisper often yields ONE growing segment, so
@@ -963,62 +1019,100 @@ class StreamWorker:
                     phrase = (clean[len(base):].strip()
                               if clean.startswith(base) else "")
                     print(f"[stream] dropped a looped phrase")
-                self.committed_text = (self.committed_text + " " + phrase).strip()
-                self.committed_samples += int(words[cut - 1].end * sr)
-                self._prev = texts[cut:]
-                edited = apply_voice_edits(self.committed_text, self.flow.cfg)
-                if edited != self.committed_text:
-                    self._retract_to(edited)
-                elif self.live and not getattr(self.flow, "rewrite_take", False):
-                    self.type_chunk()
-                self._drop_committed_audio()
+                self._commit_phrase(phrase, int(words[cut - 1].end * sr),
+                                    texts[cut:])
             else:
                 self._prev = texts
 
-    def _retract_to(self, new_text):
-        """committed_text lost a scratch-phrase. Erase what was already typed."""
-        erase, retype, spans, new_len = plan_retract(
-            self._typed_spans, self.committed_text, new_text, self.typed_len)
-        self._typed_spans = spans
-        self.committed_text = new_text
-        self.typed_len = new_len
-        self.typed_chars = sum(len(p) for _s, _e, p in spans if p)
-        if not self.live:
-            return
-        if erase:
-            self.flow._erase_typed(len(erase))
-        if retype:
-            try:
-                self._paste_screen(retype)
-            except Exception as e:
-                print(f"[stream] live type failed: {e}")
+    def _generation_ok(self):
+        gen = getattr(self, "_gen", None)
+        src_gen = getattr(self.source, "_gen", None)
+        if gen is None or src_gen is None:
+            return True
+        return gen == src_gen
 
-    def retract_toward(self, old, new, typed_len):
-        """Final transcript changed under the typed prefix. Same bookkeeping."""
-        erase, retype, spans, new_len = plan_retract(
-            self._typed_spans, old, new, typed_len)
-        self._typed_spans = spans
-        self.typed_len = new_len
-        self.typed_chars = sum(len(p) for _s, _e, p in spans if p)
-        if self.committed_text and old.startswith(self.committed_text):
-            self.committed_text = new[:new_len] if not new.startswith(
-                self.committed_text) else self.committed_text
-        return len(erase), retype, new_len
+    def _snapshot(self):
+        snap = self.source.snapshot
+        gen = getattr(self, "_gen", None)
+        if gen is None:
+            return snap()
+        try:
+            return snap(gen)
+        except TypeError:
+            return snap()
+
+    def _should_live_type(self):
+        """Hands-free and rewrite never type while the take is open.
+
+        A latched take commits in memory and pastes once at the end, so
+        scratch-that can edit pure text and a moved caret is never backspaced.
+        """
+        if not self.live or not self._active:
+            return False
+        if getattr(self, "_frozen", None) is not None:
+            return False
+        flow = self.flow
+        if getattr(flow, "rewrite_take", False) or getattr(flow, "latched", False):
+            return False
+        return True
+
+    def _commit_phrase(self, phrase, sample_at, rest_prev):
+        """Commit under the recorder lock, then type and trim outside it.
+
+        capture() holds the same lock while it copies the audio and the
+        offsets. A pass that loses the race sees the sealed generation and
+        leaves both alone.
+        """
+        lock = getattr(self.source, "_buf_lock", None)
+
+        def apply():
+            if not self._active or getattr(self, "_frozen", None) is not None:
+                return False
+            if not self._generation_ok():
+                return False
+            self.committed_text = (self.committed_text + " " + phrase).strip()
+            self.committed_samples += int(sample_at)
+            self._prev = rest_prev
+            edited, _kept = voice_edit_keeping_screen(
+                self.committed_text, self.typed_len, self.flow.cfg)
+            self.committed_text = edited
+            return True
+
+        if lock is None:
+            ok = apply()
+        else:
+            with lock:
+                ok = apply()
+        if not ok:
+            return
+        if self._should_live_type():
+            self.type_chunk()
+        self._drop_committed_audio()
 
     def _drop_committed_audio(self):
         """Drop samples whose text is committed, and typed when live-typing.
 
         committed_samples is rebased onto what snapshot() still returns, so
         the final `audio[committed_samples:]` stays the uncommitted tail.
+        A sealed or stale generation drops nothing and does not rebase.
         """
         if self.committed_samples <= 0:
+            return
+        if getattr(self, "_frozen", None) is not None:
+            return
+        if not self._generation_ok():
             return
         if self.live and self.typed_len < len(self.committed_text):
             return
         drop = getattr(self.source, "discard_prefix", None)
         if drop is None:
             return
-        dropped = drop(self.committed_samples)
+        gen = getattr(self, "_gen", None)
+        try:
+            dropped = (drop(self.committed_samples) if gen is None
+                       else drop(self.committed_samples, gen))
+        except TypeError:
+            dropped = drop(self.committed_samples)
         if dropped:
             self.committed_samples -= dropped
 
@@ -1026,6 +1120,8 @@ class StreamWorker:
         """Paste newly committed words at the cursor while still recording.
         Uses clipboard+ctrl+v: the user is physically holding ctrl already, so
         synthetic character typing would trigger app shortcuts — paste is safe."""
+        if not self._should_live_type():
+            return
         start = self.typed_len
         chunk = self.committed_text[start:]
         if not chunk:
@@ -1033,7 +1129,6 @@ class StreamWorker:
         try:
             pasted = apply_replacements(chunk, self.flow.cfg)
             self._paste_screen(pasted)
-            self._typed_spans.append((start, len(self.committed_text), pasted))
             self.typed_len = len(self.committed_text)
             self.typed_chars += len(pasted)
         except Exception as e:
@@ -1058,8 +1153,11 @@ class StreamWorker:
 
 class ClientStreamer:
     """Thin-client streaming: upload PCM16 chunks to the server while the key
-    is held, live-type the committed text the server returns (committed text
-    never retracts, so typing it early is safe)."""
+    is held, live-type the committed text the server returns.
+
+    The local recorder is never trimmed. A failed finish still has the whole
+    take for the one-shot fallback. Rewrite is not a client-mode feature;
+    a latched take does not type until the final paste."""
 
     def __init__(self, flow):
         self.flow = flow
@@ -1068,6 +1166,7 @@ class ClientStreamer:
         self.typed = 0
         self.sent = 0
         self.saved_clip = None
+        self._gen = None
         self._active = False
         self._thread = None
         self._wake = threading.Event()
@@ -1104,12 +1203,31 @@ class ClientStreamer:
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
+    def _snap(self):
+        """This take's buffer. A sealed generation reads as empty."""
+        snap = self.flow.recorder.snapshot
+        gen = getattr(self, "_gen", None)
+        if gen is None:
+            return snap()
+        try:
+            audio = snap(gen)
+        except TypeError:
+            audio = snap()
+        src_gen = getattr(self.flow.recorder, "_gen", None)
+        if src_gen is not None and src_gen != gen:
+            return np.zeros(0, dtype=np.float32)
+        return audio
+
     def _loop(self):
         import requests
         sr = self.flow.cfg["sample_rate"]
         while self._active:
             self._wake.wait(0.35)
-            snap = self.flow.recorder.snapshot()
+            if not self._active:
+                return
+            snap = self._snap()
+            if self.sent > len(snap):
+                continue  # stale view of a later take — keep the local audio
             new = snap[self.sent:]
             if len(new) < sr * 0.25:
                 continue
@@ -1119,17 +1237,18 @@ class ClientStreamer:
                                   data=pcm, headers=self._hdr(), timeout=6)
                 r.raise_for_status()
                 self.sent = len(snap)
-                # The server has this prefix. Drop it locally so a long take
-                # does not keep concatenating audio that will never be reread.
-                drop = getattr(self.flow.recorder, "discard_prefix", None)
-                if drop is not None and self.sent:
-                    self.sent = max(0, self.sent - drop(self.sent))
+                # No local trim. The upload can succeed with an empty commit;
+                # the one-shot fallback still needs every sample.
                 self.committed = r.json().get("committed", "")
                 self._type_delta()
             except Exception as e:
                 print(f"[client-stream] chunk failed: {e}")
 
     def _type_delta(self):
+        if getattr(self.flow, "latched", False):
+            return
+        if getattr(self.flow, "rewrite_take", False):
+            return
         chunk = self.committed[self.typed:]
         if not chunk:
             return
@@ -1154,8 +1273,12 @@ class ClientStreamer:
             self._thread.join(2.0)
         return self.committed, 0
 
-    def finish(self):
-        """Stop uploading; final decode on the server. Returns (text, typed)."""
+    def finish(self, audio=None):
+        """Stop uploading; final decode on the server. Returns (text, typed).
+
+        `audio` is the take sealed at release. The live recorder is not read,
+        so a take that has already started cannot be uploaded as this tail.
+        """
         import requests
         self._active = False
         self._wake.set()
@@ -1165,8 +1288,14 @@ class ClientStreamer:
             return None, 0  # streaming never started -> caller does one-shot
         # ship any remaining audio, then finish
         try:
-            snap = self.flow.recorder.snapshot()
-            new = snap[self.sent:]
+            if audio is not None:
+                snap = np.asarray(audio, dtype=np.float32).reshape(-1)
+            else:
+                snap = self._snap()
+            if self.sent > len(snap):
+                new = np.zeros(0, dtype=np.float32)
+            else:
+                new = snap[self.sent:]
             if len(new):
                 pcm = (np.clip(new, -1, 1) * 32767).astype("<i2").tobytes()
                 requests.post(self._url(f"/stream/{self.sid}/audio"), data=pcm,
@@ -1619,6 +1748,15 @@ def foreground_window():
         return "?"
 
 
+def foreground_hwnd():
+    """HWND of the foreground window, or 0 when it cannot be read."""
+    try:
+        import ctypes
+        return int(ctypes.windll.user32.GetForegroundWindow() or 0)
+    except Exception:
+        return 0
+
+
 # Hotkeys we can check against the real OS key state. Anything else
 # (f8, letters, ...) keeps hook-only behaviour: there is no VK to ask.
 _HOTKEY_VK = {
@@ -1649,12 +1787,18 @@ _WAIT_TICK_S = 1.0
 
 _SUMMARY_KEYS = ("shift", "left shift", "right shift")
 _REWRITE_KEYS = ("alt", "left alt", "right alt")
-# Double-tap latch. The first press has to be a tap, not a hold, and the
-# second press has to follow the release immediately. A lone short tap still
-# ends the take — the release is only deferred across this gap.
+# Double-tap latch. Both presses must be taps (each shorter than
+# _LATCH_MAX_PRESS_S) and the gap between the first release and the second
+# press must be shorter than _LATCH_GAP_S. The latch is confirmed on the
+# second release. A longer second press is an ordinary hold-to-talk.
+# A lone short tap seals its audio at the first release; the gap only decides
+# whether a second tap is the latch gesture. It does not keep the mic open.
 _LATCH_MAX_PRESS_S = 0.35
 _LATCH_GAP_S = 0.40
 _LATCH_IDLE = {"phase": "idle", "down_at": None, "up_at": None}
+# VK_CONTROL, VK_MENU, VK_SHIFT. Either side counts.
+_MODIFIER_VKS = (0x11, 0x12, 0x10)
+_MODIFIER_WAIT_S = 1.5
 
 
 def _transcribing_label(elapsed):
@@ -1694,6 +1838,13 @@ def format_elapsed(seconds):
     return f"{whole // 60:02d}:{whole % 60:02d}"
 
 
+def format_latched_context(seconds, words):
+    """Hands-free context line: elapsed time and how many words are committed."""
+    n = max(0, int(words or 0))
+    unit = "word" if n == 1 else "words"
+    return f"{format_elapsed(seconds)} · {n} {unit}"
+
+
 def rec_overlay(flag, context, hints_enabled):
     """Status, context, hint for the recording pill.
 
@@ -1713,29 +1864,33 @@ def rec_overlay(flag, context, hints_enabled):
 def latch_step(state, event, now):
     """Pure double-tap latch.
 
-    state: phase idle | holding | pending | latched, plus down_at / up_at.
+    state: phase idle | holding | pending | second | latched,
+    plus down_at / up_at.
     event: "down" | "up" | "tick".
     Returns (new_state, action) with action in
-    None | "start" | "release" | "latch" | "stop" | "restart".
+    None | "start" | "seal" | "second" | "release" | "latch" | "stop" | "restart".
 
+    "seal" is a short first release: the audio boundary is this moment.
+    "second" is a press inside the gap. It is not a latch yet. A short
+    second release is "latch"; a long one is "release" (ordinary hold-to-talk).
     "restart" is a second press that missed the gap: end the first take,
-    then begin another. A press while latched is "stop" — the same as a
-    release. Releases while latched do nothing.
+    then begin another. A press while latched is "stop".
+    Releases while latched do nothing.
     """
     st = dict(state or _LATCH_IDLE)
     phase = st.get("phase") or "idle"
     if event == "down":
         if phase == "pending":
             gap = now - (st.get("up_at") or now)
-            if gap <= _LATCH_GAP_S:
-                st.update(phase="latched", down_at=now, up_at=None)
-                return st, "latch"
+            if gap < _LATCH_GAP_S:
+                st.update(phase="second", down_at=now, up_at=None)
+                return st, "second"
             st.update(phase="holding", down_at=now, up_at=None)
             return st, "restart"
         if phase == "latched":
             st.update(phase="idle", down_at=None, up_at=None)
             return st, "stop"
-        if phase == "holding":
+        if phase in ("holding", "second"):
             return st, None
         st.update(phase="holding", down_at=now, up_at=None)
         return st, "start"
@@ -1744,7 +1899,14 @@ def latch_step(state, event, now):
             held = now - (st.get("down_at") if st.get("down_at") is not None else now)
             if held < _LATCH_MAX_PRESS_S:
                 st.update(phase="pending", up_at=now)
-                return st, None
+                return st, "seal"
+            st.update(phase="idle", down_at=None, up_at=None)
+            return st, "release"
+        if phase == "second":
+            held = now - (st.get("down_at") if st.get("down_at") is not None else now)
+            if held < _LATCH_MAX_PRESS_S:
+                st.update(phase="latched", up_at=now)
+                return st, "latch"
             st.update(phase="idle", down_at=None, up_at=None)
             return st, "release"
         return st, None
@@ -1755,29 +1917,60 @@ def latch_step(state, event, now):
     return st, None
 
 
-def capture_selection():
-    """Copy the current selection. (None, saved) when nothing was selected.
+def modifiers_are_up():
+    """True when ctrl, alt and shift are all up. Unknown OS state counts as up."""
+    for vk in _MODIFIER_VKS:
+        if _os_key_down(vk):
+            return False
+    return True
 
-    Ctrl+C leaves the selection in place. An unchanged or empty clipboard
-    means the app had nothing selected — callers must not paste over it.
+
+def wait_modifiers_up(timeout_s=_MODIFIER_WAIT_S):
+    """Wait until ctrl, alt and shift are physically up. False on timeout."""
+    deadline = time.monotonic() + float(timeout_s)
+    while True:
+        if modifiers_are_up():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.02)
+
+
+def capture_selection():
+    """Copy the current selection. Returns (text, saved, problem).
+
+    problem is "modifiers" when ctrl, alt or shift stayed down, "nosel" when
+    nothing was copied, and None when `text` is the selection.
+
+    A unique sentinel is placed on the clipboard before Ctrl+C. If it is
+    still there afterwards, the app copied nothing — including the case
+    where a real selection would have equalled the previous clipboard.
+    VS Code copies the current line when nothing is selected; a sentinel
+    cannot tell that line from a real selection. That is a known limitation.
     """
     try:
         saved = pyperclip.paste()
     except Exception:
         saved = ""
+    if not wait_modifiers_up():
+        print("[rewrite] modifiers still down; not sending ctrl+c")
+        return None, saved, "modifiers"
+    sentinel = f"flow-sel-{time.monotonic_ns()}-{os.getpid()}"
+    if not _copy_clipboard(sentinel):
+        return None, saved, "nosel"
     try:
         keyboard.send("ctrl+c")
     except Exception as e:
         print(f"[rewrite] could not copy the selection: {e}")
-        return None, saved
+        return None, saved, "nosel"
     time.sleep(0.08)
     try:
         current = pyperclip.paste()
     except Exception:
         current = ""
-    if not (current or "").strip() or current == saved:
-        return None, saved
-    return current, saved
+    if current == sentinel or not (current or "").strip():
+        return None, saved, "nosel"
+    return current, saved, None
 
 
 def _vk_for_hotkey(name):
@@ -1879,6 +2072,10 @@ class Flow:
         self.rewrite_take = False  # alt during this dictation: rewrite selection
         self.latched = False       # hands-free: key-up does not end the take
         self._latch = dict(_LATCH_IDLE)
+        self._sealed = None        # short tap parked until the gap decides
+        self._live_buffer = False  # recorder is capturing the current press
+        self._take_hwnd = 0        # foreground window when the take opened
+        self._plain_release = False  # chord convert: next up is not a latch
         self._alt_down = set()
         self._alt_held = False
         self._latched_shown = None
@@ -2229,7 +2426,8 @@ class Flow:
 
     def _submit_job(self, mode, audio, streamer, hermes_context,
                     released_at=None, summary=False, rewrite=False,
-                    full_samples=None, discarded=0):
+                    full_samples=None, discarded=0, committed_at_release=None,
+                    take_hwnd=0):
         """Hand a finished take to the single worker. Press order is paste order."""
         if mode == "hermes":
             self._job_q.put(("hermes", (audio, hermes_context)))
@@ -2238,7 +2436,7 @@ class Flow:
         else:
             self._job_q.put(("dictate", (
                 audio, streamer, released_at, summary, rewrite,
-                full_samples, discarded)))
+                full_samples, discarded, committed_at_release, take_hwnd)))
 
     def _job_loop(self):
         while True:
@@ -2303,9 +2501,14 @@ class Flow:
                 # drop the "holding" phase this press just entered.
                 self.latched = False
                 self._latched_shown = None
+                self._sealed = None
+                self._live_buffer = True
+                self._take_hwnd = foreground_hwnd()
                 # Alt already down as the take opens: rewrite from the first
                 # word, so live typing never replaces the selection.
-                if mode == "dictate" and getattr(self, "_alt_held", False):
+                # Client mode has no rewrite — the server on this PC does it.
+                if (mode == "dictate" and getattr(self, "_alt_held", False)
+                        and self.cfg.get("mode") != "client"):
                     self.rewrite_take = True
                 self.recording = True
                 self._record_started_at = time.monotonic()
@@ -2313,30 +2516,59 @@ class Flow:
                 started = True
                 if self.live_worker:
                     self.live_worker.pause("recorder-owner")
-                self.recorder.start()  # first — capture must not wait on mute/icon
+                gen = self.recorder.start()  # first — capture must not wait on mute/icon
                 self.set_icon("rec", (f"Hermes · {context['title']}"
                                       if context else None))
                 if self.rewrite_take and self.overlay:
                     self.overlay.set(("rec", None, "rewrite"))
                 if self.cfg.get("mute_output_while_recording"):
                     self.muter.mute()
-                if mode == "dictate" and self.cfg["streaming"]["enabled"]:
-                    if self.cfg["mode"] == "client":
-                        if self.cfg["streaming"].get("client", True):
-                            self.streamer = ClientStreamer(self)
-                            self.streamer.start()
-                        return
-                    # Feedback mode belongs to the skill, not to "does a style
-                    # exist" — see feedback_mode(). Defaults reproduce today's
-                    # behaviour exactly: matched -> ghost, unmatched -> live.
-                    live = (self.cfg["streaming"].get("live_type", True)
-                            and feedback_mode(self.cfg, foreground_window()) == "live"
-                            and not self.rewrite_take)
-                    self.streamer = StreamWorker(self, live=live)
-                    self.streamer.start()
+                self._open_streamer(gen)
         finally:
             if not started:
                 self._mic_lock.release()
+
+    def _open_streamer(self, gen, handsfree=False):
+        """Start the rolling decoder for the open take. Hands-free never types."""
+        if self.active_mode != "dictate" or not self.cfg["streaming"]["enabled"]:
+            self.streamer = None
+            return
+        if self.cfg.get("mode") == "client":
+            if self.cfg["streaming"].get("client", True):
+                self.streamer = ClientStreamer(self)
+                self.streamer._gen = gen
+                self.streamer.start()
+            return
+        if handsfree or getattr(self, "latched", False):
+            live = False
+        else:
+            # Feedback mode belongs to the skill, not to "does a style
+            # exist" — see feedback_mode(). Defaults reproduce today's
+            # behaviour exactly: matched -> ghost, unmatched -> live.
+            live = (self.cfg["streaming"].get("live_type", True)
+                    and feedback_mode(self.cfg, foreground_window()) == "live"
+                    and not self.rewrite_take
+                    and not self.summary_take)
+        self.streamer = StreamWorker(self, live=live)
+        self.streamer._gen = gen
+        self.streamer.start()
+
+    def _capture_take(self, streamer):
+        """Audio plus the commit offsets, or stop() when the recorder is a fake."""
+        cap = getattr(self.recorder, "capture", None)
+        if cap is not None:
+            try:
+                return cap(streamer)
+            except TypeError:
+                pass
+        audio = self.recorder.stop()
+        if streamer is None:
+            return audio, ("", 0)
+        frozen = getattr(streamer, "_frozen", None)
+        if frozen is None:
+            frozen = (getattr(streamer, "committed_text", "") or "",
+                      int(getattr(streamer, "committed_samples", 0) or 0))
+        return audio, frozen
 
     def _enable_summary(self):
         """Shift during a dictation take: stop live typing, paste a to-the-point
@@ -2347,6 +2579,9 @@ class Flow:
             if getattr(self, "rewrite_take", False):
                 return  # the first modifier wins
             self.summary_take = True
+            sealed = getattr(self, "_sealed", None)
+            if isinstance(sealed, dict):
+                sealed["summary"] = True
             if self.streamer is not None:
                 self.streamer.live = False
         print("[summary] on for this take")
@@ -2356,7 +2591,10 @@ class Flow:
     def _enable_rewrite(self):
         """Alt during a dictation (or a command that ctrl joined): at release,
         rewrite the current selection. No live typing — it would replace the
-        selection before we can copy it."""
+        selection before we can copy it. Client mode does not rewrite."""
+        if self.cfg.get("mode") == "client":
+            print("[rewrite] ignored in client mode")
+            return
         with self._session_lock:
             if not self.recording or self.active_mode not in ("dictate", "command"):
                 return
@@ -2367,55 +2605,113 @@ class Flow:
             if self.active_mode == "command":
                 self.active_mode = "dictate"
             self.rewrite_take = True
+            sealed = getattr(self, "_sealed", None)
+            if isinstance(sealed, dict):
+                sealed["rewrite"] = True
             if self.streamer is not None:
                 self.streamer.live = False
         print("[rewrite] on for this take")
         if self.overlay:
             self.overlay.set(("rec", None, "rewrite"))
 
+    def _latched_words(self):
+        streamer = getattr(self, "streamer", None)
+        if streamer is None:
+            return 0
+        text = getattr(streamer, "committed_text", None)
+        if text is None:
+            text = getattr(streamer, "committed", "") or ""
+        text = text or ""
+        return len(text.split()) if text.strip() else 0
+
+    def _latched_context_now(self):
+        started = self._record_started_at
+        elapsed = 0 if started is None else max(0.0, time.monotonic() - started)
+        return format_latched_context(elapsed, self._latched_words())
+
     def _show_latched(self):
-        self._latched_shown = format_elapsed(0)
+        self._latched_shown = self._latched_context_now()
         if self.overlay and not getattr(self, "summary_take", False) \
                 and not getattr(self, "rewrite_take", False):
             self.overlay.set(("rec", self._latched_shown, "handsfree"))
 
     def on_release(self):
+        sealed_job = None
+        current = None
         with self._session_lock:
             if not self.recording:
                 return
             if self.active_mode == "remote":
                 return  # remote session owns the recorder; the hotkey must not hijack it
+            sealed = getattr(self, "_sealed", None)
+            live = getattr(self, "_live_buffer", True)
+            summary = getattr(self, "summary_take", False)
+            rewrite = getattr(self, "rewrite_take", False)
+            mode = self.active_mode
+            hwnd = getattr(self, "_take_hwnd", 0) or 0
             self.recording = False
             self._record_started_at = None
             self.latched = False
             self._latch = dict(_LATCH_IDLE)
             self._latched_shown = None
-            streamer = self.streamer
-            self.streamer = None
-            # Signal only. stop() joins the stream thread for up to 2s and
-            # must not run here — this is the ctrl loop, and the next press
-            # is waiting behind it. process() joins before it reads the commit.
-            if streamer:
-                streamer.halt()
-            audio = self.recorder.stop()
-            full_samples = getattr(self.recorder, "last_full_samples", None)
-            discarded = getattr(self.recorder, "last_discarded", 0)
-            self.muter.restore()
-            mode = self.active_mode
-            summary = getattr(self, "summary_take", False)
-            rewrite = getattr(self, "rewrite_take", False)
+            self._live_buffer = False
+            self._sealed = None
             self.summary_take = False
             self.rewrite_take = False
-            hermes_context = self.hermes_context
-            self.hermes_context = None
-            if self.live_worker and mode not in ("command", "hermes"):
-                self.live_worker.resume("recorder-owner")
+            if sealed is not None and not live:
+                # The short tap already sealed its audio. Do not stop again:
+                # a second stop would be a different buffer.
+                self.streamer = None
+                self.muter.restore()
+                hermes_context = self.hermes_context
+                self.hermes_context = None
+                if self.live_worker and sealed["mode"] not in ("command", "hermes"):
+                    self.live_worker.resume("recorder-owner")
+                sealed_job = (sealed, hermes_context)
+            else:
+                streamer = self.streamer
+                self.streamer = None
+                # Signal only. stop() joins the stream thread for up to 2s and
+                # must not run here — this is the ctrl loop, and the next press
+                # is waiting behind it. process() joins before it reads the commit.
+                if streamer:
+                    streamer.halt()
+                # Offsets and audio under one lock. A late trim cannot rebase
+                # this pair or the next take.
+                audio, committed = self._capture_take(streamer)
+                full_samples = getattr(self.recorder, "last_full_samples", None)
+                discarded = getattr(self.recorder, "last_discarded", 0)
+                self.muter.restore()
+                hermes_context = self.hermes_context
+                self.hermes_context = None
+                if self.live_worker and mode not in ("command", "hermes"):
+                    self.live_worker.resume("recorder-owner")
+                current = (mode, audio, streamer, summary, rewrite,
+                           full_samples, discarded, committed, hermes_context,
+                           hwnd)
+                if sealed is not None:
+                    sealed_job = (sealed, None)
         # The audio array is already detached. Free the mic before the
         # (possibly slow) decode so the next press can record immediately.
         self._release_mic()
-        self._submit_job(mode, audio, streamer, hermes_context,
-                         time.monotonic(), summary=summary, rewrite=rewrite,
-                         full_samples=full_samples, discarded=discarded)
+        if sealed_job is not None:
+            sealed, hermes_context = sealed_job
+            self._submit_job(
+                sealed["mode"], sealed["audio"], sealed["streamer"],
+                hermes_context, time.monotonic(),
+                summary=sealed["summary"], rewrite=sealed["rewrite"],
+                full_samples=sealed["full_samples"],
+                discarded=sealed["discarded"],
+                committed_at_release=sealed["committed"],
+                take_hwnd=sealed["hwnd"])
+        if current is not None:
+            (mode, audio, streamer, summary, rewrite, full_samples,
+             discarded, committed, hermes_context, hwnd) = current
+            self._submit_job(
+                mode, audio, streamer, hermes_context, time.monotonic(),
+                summary=summary, rewrite=rewrite,
+                full_samples=full_samples, discarded=discarded,
+                committed_at_release=committed, take_hwnd=hwnd)
 
     def bias_prompt(self, committed=""):
         """initial_prompt = personal vocabulary + committed text so far."""
@@ -2632,14 +2928,28 @@ class Flow:
             return
         _copy_clipboard(saved)
 
-    def _rewrite_selection(self, instruction):
+    def _rewrite_selection(self, instruction, take_hwnd=0):
         """Paste a rewrite over the selection. None when nothing was pasted.
 
         No selection and an LLM failure both leave the document alone. The
         clipboard is restored either way; a successful paste restores after
-        ctrl+v has had a moment to read it.
+        ctrl+v has had a moment to read it. Ctrl, alt and shift must be up
+        before the copy and again before the paste. A different foreground
+        window at paste time keeps the result on the clipboard instead.
         """
-        selection, saved = capture_selection()
+        got = capture_selection()
+        if len(got) == 2:
+            selection, saved = got
+            problem = None if selection else "nosel"
+        else:
+            selection, saved, problem = got
+        if problem == "modifiers":
+            if self.overlay:
+                self.overlay.set((
+                    "say",
+                    "Let go of Ctrl, Alt and Shift — rewrite cancelled"))
+            self._restore_clip(saved)
+            return None
         if not selection:
             if self.overlay:
                 self.overlay.set(("say", "Select text first"))
@@ -2654,30 +2964,62 @@ class Flow:
                     "say", "Rewrite failed — selection left unchanged"))
             self._restore_clip(saved)
             return None
+        if not wait_modifiers_up():
+            if self.overlay:
+                self.overlay.set((
+                    "say",
+                    "Let go of Ctrl, Alt and Shift — rewrite cancelled"))
+            self._restore_clip(saved)
+            return None
+        now = foreground_hwnd()
+        if take_hwnd and now and now != take_hwnd:
+            _copy_clipboard(rewritten)
+            print("[rewrite] window changed; copied instead of pasting")
+            if self.overlay:
+                self.overlay.set(("say", "Rewrite copied — window changed"))
+            return rewritten
         self._safe_paste(rewritten, "clipboard", restore=False)
         self._restore_clip(saved, delay=0.6)
         return rewritten
 
-    def _apply_voice_edit(self, text, streamer, live_typed):
-        """Scratch-phrase on the final transcript. Erase typed chars it drops."""
-        edited = apply_voice_edits(text, self.cfg)
-        if edited == text or streamer is None or not hasattr(streamer, "retract_toward"):
-            return edited, live_typed
-        erase_n, retype, new_len = streamer.retract_toward(
-            text, edited, live_typed)
-        if erase_n:
-            self._erase_typed(erase_n)
-        if retype:
-            try:
-                pyperclip.copy(retype)
-                time.sleep(0.02)
-                keyboard.send("ctrl+v")
-            except Exception as e:
-                print(f"[voice] could not restore typed text: {e}")
-        return edited, new_len
+    def _apply_voice_edit(self, text, live_typed):
+        """Scratch-that on text that is not already on screen.
+
+        Already-typed sentences stay. The phrase itself is dropped from the
+        untyped tail. Nothing is backspaced.
+        """
+        return voice_edit_keeping_screen(text or "", live_typed, self.cfg)
+
+    def _can_erase_typed(self, take_hwnd):
+        """Summary may backspace only into the same window, with modifiers up."""
+        if not wait_modifiers_up():
+            print("[summary] modifiers still down; leaving the dictated text")
+            return False
+        now = foreground_hwnd()
+        if take_hwnd and now and now != take_hwnd:
+            print("[summary] window changed; leaving the dictated text")
+            return False
+        return True
+
+    def _erase_summary_prefix(self, streamer, live_typed, take_hwnd):
+        """Erase live-typed dictation before pasting a summary.
+
+        Returns (live_typed, left_raw). A refused erase still returns 0 so
+        the summary is pasted after the raw text, which stays on screen.
+        """
+        if not live_typed or streamer is None:
+            return live_typed, False
+        if not self._can_erase_typed(take_hwnd):
+            if self.overlay:
+                self.overlay.set((
+                    "say", "Summary pasted — original left in place"))
+            return 0, True
+        self._erase_typed(getattr(streamer, "typed_chars", 0) or live_typed)
+        return 0, False
 
     def process(self, audio, streamer=None, released_at=None, summary=False,
-                rewrite=False, full_samples=None, discarded=0):
+                rewrite=False, full_samples=None, discarded=0,
+                committed_at_release=None, take_hwnd=0):
         stop = threading.Event()
         started = time.monotonic() if released_at is None else released_at
         watcher = threading.Thread(
@@ -2701,14 +3043,17 @@ class Flow:
                 if not discarded and self.mic_is_deaf(audio):
                     return
                 if self.cfg["mode"] == "client":
+                    # Rewrite selection runs on the server box, not a thin client.
+                    if rewrite:
+                        print("[rewrite] ignored in client mode")
+                        rewrite = False
                     if isinstance(streamer, ClientStreamer) and streamer.sid:
-                        text, typed = streamer.finish()
+                        text, typed = streamer.finish(audio)
                         if text is None:  # server lost the session mid-flight
+                            # `audio` is the full take: client mode does not trim.
                             text, typed = self.client_transcribe(audio, "/transcribe"), 0
-                        text = apply_voice_edits(text or "", self.cfg)
-                        if rewrite:
-                            self._remember(self._rewrite_selection(text) or "")
-                            return
+                        text, typed = voice_edit_keeping_screen(
+                            text or "", typed, self.cfg)
                         self._remember(text)
                         remainder = (text or "")[typed:]
                         if remainder:
@@ -2718,12 +3063,9 @@ class Flow:
                             time.sleep(0.3)
                             streamer.restore_clipboard()
                     else:
-                        text = apply_voice_edits(
+                        text, _typed = voice_edit_keeping_screen(
                             self.client_transcribe(audio, "/transcribe") or "",
-                            self.cfg)
-                        if rewrite:
-                            self._remember(self._rewrite_selection(text) or "")
-                            return
+                            0, self.cfg)
                         self._remember(text)
                         self._safe_paste(text, self.cfg["paste_mode"])
                     return
@@ -2731,22 +3073,28 @@ class Flow:
                 if streamer:
                     # Join only after the rolling pass has been halted, so
                     # committed_text cannot move under the final decode.
+                    # The offsets used below were captured with the audio.
                     j0 = time.monotonic()
-                    committed = streamer.stop()
+                    streamer.stop()
                     join_s = time.monotonic() - j0
                     live_typed = streamer.typed_len
                 else:
-                    committed = ("", 0)
                     live_typed = 0
+                if committed_at_release is not None:
+                    committed = committed_at_release
+                elif streamer is not None:
+                    committed = (streamer.committed_text, streamer.committed_samples)
+                else:
+                    committed = ("", 0)
                 text, meta = self.transcribe_and_store(
                     audio, source="pc-hotkey", window=foreground_window(),
                     committed=committed, skip_cleanup=live_typed > 0,
                     persist=False, full_samples=full_samples,
                     keep_audio=not discarded)
-                text, live_typed = self._apply_voice_edit(
-                    text, streamer, live_typed)
+                text, live_typed = self._apply_voice_edit(text, live_typed)
                 if rewrite:
-                    out = self._rewrite_selection(text) if text else None
+                    out = (self._rewrite_selection(text, take_hwnd)
+                           if text else None)
                     self._remember(out or "")
                     pending = (meta or {}).get("pending")
                     if pending and out:
@@ -2760,9 +3108,8 @@ class Flow:
                         self.overlay.set(("work", "Making it to the point…"))
                     short = llm_summarize(text, self.cfg)
                     if short:
-                        if live_typed and streamer is not None:
-                            self._erase_typed(streamer.typed_chars)
-                        live_typed = 0
+                        live_typed, _left = self._erase_summary_prefix(
+                            streamer, live_typed, take_hwnd)
                         text = short
                         pending = (meta or {}).get("pending")
                         if pending:
@@ -3069,7 +3416,8 @@ class Flow:
                     self.live_worker.pause("recorder-owner")
                 self._remote_gen += 1
                 gen = self._remote_gen
-                self.recorder.start()
+                take_gen = self.recorder.start()
+                self._clear_latch()
                 self.set_icon("rec")
                 if self.cfg.get("mute_output_while_recording"):
                     self.muter.mute()
@@ -3078,6 +3426,7 @@ class Flow:
                     # while the key is held; the daemon polls /record/partial and
                     # types committed deltas live.
                     self.remote_streamer = StreamWorker(self, live=False)
+                    self.remote_streamer._gen = take_gen
                     self.remote_streamer.start()
                 # Orphan guard: if the client dies mid-recording, don't record forever.
                 t = threading.Timer(600, lambda: self.remote_cancel(gen))
@@ -3096,13 +3445,17 @@ class Flow:
             self.recording = False
             streamer = getattr(self, "remote_streamer", None)
             self.remote_streamer = None
-            committed = streamer.stop() if streamer else ("", 0)
-            audio = self.recorder.stop()
+            if streamer:
+                streamer.halt()
+            audio, committed = self._capture_take(streamer)
             full_samples = getattr(self.recorder, "last_full_samples", None)
             discarded = getattr(self.recorder, "last_discarded", 0)
+            self._clear_latch()
             self.muter.restore()
             if self.live_worker:
                 self.live_worker.resume("recorder-owner")
+        if streamer:
+            streamer.stop()  # join off the lock; offsets were frozen in capture
         self._release_mic()
         with self.busy:
             self.set_icon("work")
@@ -3133,15 +3486,26 @@ class Flow:
             streamer = getattr(self, "remote_streamer", None)
             self.remote_streamer = None
             if streamer:
-                streamer.stop()
-            self.recorder.stop()
+                streamer.halt()
+            self.recorder.stop()  # seals the generation before the next take
+            self._clear_latch()
             self.muter.restore()
             if self.live_worker:
                 self.live_worker.resume("recorder-owner")
             self.restore_base_state()
+        if streamer:
+            streamer.stop()
         self._release_mic()
         print("[remote] recording cancelled")
         return True
+
+    def _clear_latch(self):
+        """Drop local double-tap state. A remote session must not leave it armed."""
+        self.latched = False
+        self._latch = dict(_LATCH_IDLE)
+        self._latched_shown = None
+        self._sealed = None
+        self._plain_release = False
 
     def _ptt_mode(self, name):
         if name == self.cfg.get("hotkey"):
@@ -3268,6 +3632,13 @@ class Flow:
                     and active == "command"
                     and getattr(self, "_alt_held", False)
                     and not getattr(self, "rewrite_take", False)):
+                # The take ends when ctrl is released, not when alt is.
+                with self._key_lock:
+                    self._pressed_keys.add(name)
+                    self._key_seen_at[name] = time.monotonic()
+                    self._active_ptt_key = name
+                    self._os_up_streak = 0
+                self._plain_release = True
                 self._ctrl_q.put(("rewrite", None))
                 return
             if (name in _SUMMARY_KEYS and down
@@ -3307,8 +3678,11 @@ class Flow:
         never delivers KEY_UP. The next real press is then swallowed by the
         auto-repeat guard and the mic stays open. One poll is not enough.
         A latched take is supposed to have the key up — don't end it.
+        A lost KEY_UP while latched still has to clear the pressed-key set,
+        or the next tap inside a second is swallowed as auto-repeat.
         """
         if getattr(self, "latched", False):
+            self._reconcile_latched_key()
             return
         with self._key_lock:
             name = self._active_ptt_key
@@ -3332,6 +3706,32 @@ class Flow:
         print(f"[hotkey] {name!r} still marked held but the OS reports it up; "
               "releasing")
         self.on_release()
+
+    def _reconcile_latched_key(self):
+        """While latched, forget a key the OS says is up. Do not end the take."""
+        with self._key_lock:
+            name = self._active_ptt_key or (self.cfg.get("hotkey")
+                                            if self.cfg else None)
+            if not name:
+                return
+            if name not in self._pressed_keys and self._active_ptt_key is None:
+                self._os_up_streak = 0
+                return
+            vk = _vk_for_hotkey(name)
+            if vk is None:
+                return
+            down = _os_key_down(vk)
+            if down is None or down:
+                self._os_up_streak = 0
+                return
+            self._os_up_streak += 1
+            if self._os_up_streak < _KEY_UP_POLLS:
+                return
+            self._pressed_keys.discard(name)
+            self._key_seen_at.pop(name, None)
+            if self._active_ptt_key == name:
+                self._active_ptt_key = None
+            self._os_up_streak = 0
 
     def _poll_record_cap(self):
         """Force-release a local recording that has run past its cap.
@@ -3361,8 +3761,19 @@ class Flow:
         self.on_release()
 
     def _latch_event(self, event, now):
-        """Apply one dictate-hotkey event to the double-tap machine."""
+        """Apply one dictate-hotkey event to the double-tap machine.
+
+        Local taps are ignored while a remote session owns the recorder.
+        A latched phase with nothing recording is stale and must not swallow
+        the next press.
+        """
+        if self.recording and getattr(self, "active_mode", None) == "remote":
+            return
         state = getattr(self, "_latch", None) or dict(_LATCH_IDLE)
+        if not self.recording and state.get("phase") == "latched":
+            state = dict(_LATCH_IDLE)
+            self._latch = state
+            self.latched = False
         new_state, action = latch_step(state, event, now)
         self._latch = new_state
         self.latched = new_state.get("phase") == "latched"
@@ -3371,6 +3782,12 @@ class Flow:
             if not self.recording:
                 self._latch = dict(_LATCH_IDLE)
                 self.latched = False
+        elif action == "seal":
+            self._seal_open_take()
+        elif action == "second":
+            self._begin_second_press()
+        elif action == "latch":
+            self._enter_handsfree()
         elif action == "restart":
             self.on_release()
             self._latch = {"phase": "holding", "down_at": now, "up_at": None}
@@ -3380,8 +3797,86 @@ class Flow:
                 self._latch = dict(_LATCH_IDLE)
         elif action in ("release", "stop"):
             self.on_release()
-        elif action == "latch":
-            self._show_latched()
+
+    def _seal_open_take(self):
+        """Stop the mic at this release and park the audio until the gap ends.
+
+        Post-release speech stays in the pre-roll ring. It is not part of
+        this take. A second tap inside the gap is a gesture, not more speech.
+        """
+        with self._session_lock:
+            if not self.recording or getattr(self, "active_mode", None) == "remote":
+                return
+            streamer = self.streamer
+            self.streamer = None
+            if streamer is not None:
+                streamer.halt()
+            audio, committed = self._capture_take(streamer)
+            self._sealed = {
+                "audio": audio,
+                "streamer": streamer,
+                "committed": committed,
+                "summary": bool(getattr(self, "summary_take", False)),
+                "rewrite": bool(getattr(self, "rewrite_take", False)),
+                "full_samples": getattr(self.recorder, "last_full_samples", None),
+                "discarded": getattr(self.recorder, "last_discarded", 0),
+                "hwnd": getattr(self, "_take_hwnd", 0) or 0,
+                "mode": self.active_mode,
+                "started": self._record_started_at,
+            }
+            self._live_buffer = False
+
+    def _begin_second_press(self):
+        """Record the second press on its own. The sealed tap stays parked."""
+        with self._session_lock:
+            if not self.recording or getattr(self, "_sealed", None) is None:
+                return
+            try:
+                gen = self.recorder.start()
+            except TypeError:
+                gen = None
+            self._live_buffer = True
+            self._record_started_at = time.monotonic()
+            self._take_hwnd = foreground_hwnd() or getattr(self, "_take_hwnd", 0)
+            self._open_streamer(gen)
+
+    def _enter_handsfree(self):
+        """Second tap was short. Discard it and keep recording without typing.
+
+        The audio sealed at the first release is the start of this take.
+        Everything is pasted once, when the latch stops.
+        """
+        with self._session_lock:
+            if not self.recording:
+                return
+            gesture = self.streamer
+            self.streamer = None
+            if gesture is not None:
+                gesture.halt()
+            self._capture_take(gesture)  # drop the gesture; seal its generation
+            sealed = getattr(self, "_sealed", None)
+            self._sealed = None
+            prefix = None if not sealed else sealed.get("audio")
+            try:
+                gen = self.recorder.start(prefix)
+            except TypeError:
+                gen = self.recorder.start()
+            self._live_buffer = True
+            self.latched = True
+            if sealed and sealed.get("started") is not None:
+                self._record_started_at = sealed["started"]
+            if sealed and sealed.get("hwnd"):
+                self._take_hwnd = sealed["hwnd"]
+            self._open_streamer(gen, handsfree=True)
+        self._show_latched()
+
+    def _handle_up(self, mode, when):
+        """Key-up from the ctrl loop. A converted chord releases plainly."""
+        if mode == "dictate" and not getattr(self, "_plain_release", False):
+            self._latch_event("up", when)
+        else:
+            self._plain_release = False
+            self.on_release()
 
     def _poll_latch(self):
         """Fire a deferred short-tap release once the double-tap window closes."""
@@ -3390,14 +3885,14 @@ class Flow:
         self._latch_event("tick", time.monotonic())
 
     def _poll_latched_clock(self):
-        """Hands-free context line: elapsed mm:ss, about once a second."""
+        """Hands-free context line: elapsed and word count, about once a second."""
         if not getattr(self, "latched", False) or not self.recording:
             return
         if getattr(self, "summary_take", False) or getattr(self, "rewrite_take", False):
             return
         if self.overlay is None or self._record_started_at is None:
             return
-        shown = format_elapsed(time.monotonic() - self._record_started_at)
+        shown = self._latched_context_now()
         if shown == getattr(self, "_latched_shown", None):
             return
         self._latched_shown = shown
@@ -3445,10 +3940,7 @@ class Flow:
                         self.on_press(mode)
                 elif action == "up":
                     when = self._pop_ptt_time()
-                    if mode == "dictate":
-                        self._latch_event("up", when)
-                    else:
-                        self.on_release()
+                    self._handle_up(mode, when)
                 else:
                     self.on_release()
             except Exception as e:
