@@ -467,7 +467,7 @@ def test_press_while_busy_records_and_pastes_in_order(monkeypatch):
     entered = threading.Event()
     release_first = threading.Event()
 
-    def fake_process(self, audio, streamer=None, released_at=None):
+    def fake_process(self, audio, streamer=None, released_at=None, summary=False):
         self.busy.acquire()
         try:
             if audio == "first":

@@ -48,6 +48,7 @@ else:
 import keyboard
 import numpy as np
 import pyperclip
+import requests
 import sounddevice as sd
 # faster_whisper is imported lazily in Flow._load_model — thin clients don't
 # have (or need) the CUDA stack installed.
@@ -699,6 +700,7 @@ class StreamWorker:
         self.committed_samples = 0
         self.live = live         # paste committed words while still recording
         self.typed_len = 0       # chars of committed_text already pasted
+        self.typed_chars = 0     # chars actually put on screen (after replacements)
         self.saved_clip = None
         self._prev = []          # word texts from the previous pass
         self._active = False
@@ -802,10 +804,12 @@ class StreamWorker:
         if not chunk:
             return
         try:
-            pyperclip.copy(apply_replacements(chunk, self.flow.cfg))
+            pasted = apply_replacements(chunk, self.flow.cfg)
+            pyperclip.copy(pasted)
             time.sleep(0.02)
             keyboard.send("ctrl+v")
             self.typed_len = len(self.committed_text)
+            self.typed_chars += len(pasted)
         except Exception as e:
             print(f"[stream] live type failed: {e}")
 
@@ -1114,10 +1118,15 @@ class Overlay:
                     revert_mode[0] = None
                     status.config(fg=fg)
                     if kind == "rec":
-                        status.config(text="Listening")
+                        summary_on = (isinstance(s, tuple) and len(s) > 2
+                                      and s[2] == "summary")
+                        status.config(text=("Listening · to the point"
+                                            if summary_on else "Listening"))
                         context.config(
-                            text=describe_target(s[1] if isinstance(s, tuple)
-                                                 and len(s) > 1 else ""))
+                            text=("Summarizing when you let go"
+                                  if summary_on else
+                                  describe_target(s[1] if isinstance(s, tuple)
+                                                  and len(s) > 1 else "")))
                         hide_at[0] = None
                         show("rec")
                         place()
@@ -1229,6 +1238,58 @@ class OutputMuter:
             pass
 
 
+SUMMARY_PROMPT = (
+    "You rewrite a dictated voice note so it is to the point. Keep every "
+    "concrete fact, number, name, question and request; drop filler, "
+    "repetition, false starts and thinking out loud. Keep the speaker's voice "
+    "(first person, same intent: a question stays a question, an instruction "
+    "stays an instruction). Use short sentences, or a few '- ' bullets only if "
+    "there are several separate points. Never add facts, greetings or "
+    "commentary. Output only the rewritten text."
+)
+
+SUMMARY_DEFAULTS = [
+    # multivac's 4080 via the flow-asr node's token-checked /summarize proxy,
+    # so beast's GPU stays free and multivac's Ollama stays on loopback.
+    {"provider": "flow-node", "model": "qwen3.5:9b",
+     "url": "http://multivac:8757/summarize"},
+    # beast fallback: qwen3:8b (5 GB) fits beside Whisper on the 5090.
+    {"provider": "ollama", "model": "qwen3:8b",
+     "base_url": "http://127.0.0.1:11434"},
+]
+
+
+def _summary_call(p, text, cfg):
+    if p.get("provider") == "flow-node":
+        r = requests.post(
+            p["url"], timeout=p.get("timeout_s", 30),
+            headers={"Authorization": "Bearer " + cfg["server"]["token"]},
+            json={"model": p.get("model"), "system": SUMMARY_PROMPT, "text": text})
+        r.raise_for_status()
+        out = (r.json().get("text") or "").strip()
+        if not out:
+            raise ValueError("empty response")
+        return out
+    return llm.call_provider(p, SUMMARY_PROMPT, text, max_tokens=1024)
+
+
+def llm_summarize(text, cfg):
+    """'To the point' rewrite for a shift+dictation take. None on failure,
+    so the caller pastes the raw transcript instead of nothing. Lanes are the
+    user's own machines (config "summary.lanes"), so local_only does not apply."""
+    lanes = (cfg.get("summary") or {}).get("lanes") or SUMMARY_DEFAULTS
+    for p in lanes:
+        t0 = time.time()
+        try:
+            out = _summary_call(p, text, cfg)
+            print(f"[summary] {p.get('model')} in {time.time() - t0:.2f}s "
+                  f"({len(text.split())} -> {len(out.split())} words)")
+            return out
+        except Exception as e:
+            print(f"[summary] {p.get('model')} failed: {e}")
+    return None
+
+
 def llm_cleanup(text, cfg, window=None):
     c = cfg["cleanup"]
     style = match_profile(cfg, window)
@@ -1289,6 +1350,9 @@ def _speech_enabled(cfg):
 _WAIT_HINT_S = 1.5          # after this long, the overlay counts the seconds
 _WAIT_BUSY_S = 8.0          # after this long, say the machine is busy
 _WAIT_TICK_S = 1.0
+
+
+_SUMMARY_KEYS = ("shift", "left shift", "right shift")
 
 
 def _transcribing_label(elapsed):
@@ -1394,6 +1458,7 @@ class Flow:
         self.recording = False
         self.last_text = ""
         self.active_mode = "dictate"
+        self.summary_take = False  # shift pressed during this dictation take
         self.hermes_context = None
         self.streamer = None
         self._pressed_keys = set()
@@ -1736,14 +1801,14 @@ class Flow:
                 "Microphone is still being checked. Release and try again."))
 
     def _submit_job(self, mode, audio, streamer, hermes_context,
-                    released_at=None):
+                    released_at=None, summary=False):
         """Hand a finished take to the single worker. Press order is paste order."""
         if mode == "hermes":
             self._job_q.put(("hermes", (audio, hermes_context)))
         elif mode == "command":
             self._job_q.put(("command", (audio,)))
         else:
-            self._job_q.put(("dictate", (audio, streamer, released_at)))
+            self._job_q.put(("dictate", (audio, streamer, released_at, summary)))
 
     def _job_loop(self):
         while True:
@@ -1802,6 +1867,7 @@ class Flow:
                         context = {"window": "", "title": "Hermes"}
                     self.hermes_context = dict(context)
                 self.active_mode = mode
+                self.summary_take = False
                 self.recording = True
                 self._record_started_at = time.monotonic()
                 self._mic_held = True
@@ -1830,6 +1896,19 @@ class Flow:
             if not started:
                 self._mic_lock.release()
 
+    def _enable_summary(self):
+        """Shift during a dictation take: stop live typing, paste a to-the-point
+        rewrite at release. Words already typed are replaced at release."""
+        with self._session_lock:
+            if not self.recording or self.active_mode != "dictate":
+                return
+            self.summary_take = True
+            if self.streamer is not None:
+                self.streamer.live = False
+        print("[summary] on for this take")
+        if self.overlay:
+            self.overlay.set(("rec", None, "summary"))
+
     def on_release(self):
         with self._session_lock:
             if not self.recording:
@@ -1848,6 +1927,8 @@ class Flow:
             audio = self.recorder.stop()
             self.muter.restore()
             mode = self.active_mode
+            summary = getattr(self, "summary_take", False)
+            self.summary_take = False
             hermes_context = self.hermes_context
             self.hermes_context = None
             if self.live_worker and mode not in ("command", "hermes"):
@@ -1856,7 +1937,7 @@ class Flow:
         # (possibly slow) decode so the next press can record immediately.
         self._release_mic()
         self._submit_job(mode, audio, streamer, hermes_context,
-                         time.monotonic())
+                         time.monotonic(), summary=summary)
 
     def bias_prompt(self, committed=""):
         """initial_prompt = personal vocabulary + committed text so far."""
@@ -2019,6 +2100,17 @@ class Flow:
         elif self.overlay:
             self.overlay.set(("say", "Couldn't copy the last dictation"))
 
+    def _erase_typed(self, n):
+        """Remove the n characters live typing already put at the cursor."""
+        if n <= 0:
+            return
+        try:
+            for _ in range(n):
+                keyboard.send("backspace")
+            time.sleep(0.05)
+        except Exception as e:
+            print(f"[summary] could not erase live-typed text: {e}")
+
     def _announce_wait(self, started, stop):
         """Enqueue a ticking 'still transcribing' line. Never touches Tk."""
         next_at = started + _WAIT_HINT_S
@@ -2039,7 +2131,7 @@ class Flow:
             if next_at <= time.monotonic():
                 next_at = time.monotonic() + _WAIT_TICK_S
 
-    def process(self, audio, streamer=None, released_at=None):
+    def process(self, audio, streamer=None, released_at=None, summary=False):
         stop = threading.Event()
         started = time.monotonic() if released_at is None else released_at
         watcher = threading.Thread(
@@ -2092,6 +2184,20 @@ class Flow:
                     audio, source="pc-hotkey", window=foreground_window(),
                     committed=committed, skip_cleanup=live_typed > 0,
                     persist=False)
+                if summary and text:
+                    if self.overlay:
+                        self.overlay.set(("work", "Making it to the point…"))
+                    short = llm_summarize(text, self.cfg)
+                    if short:
+                        if live_typed and streamer is not None:
+                            self._erase_typed(streamer.typed_chars)
+                        live_typed = 0
+                        text = short
+                        pending = (meta or {}).get("pending")
+                        if pending:
+                            pending["cleaned"] = short
+                    elif self.overlay:
+                        self.overlay.set(("say", "Summary failed — pasted what you said"))
                 self._remember(text)
                 p0 = time.monotonic()
                 e2e = None
@@ -2538,6 +2644,11 @@ class Flow:
         # uncontended and held only for the set update.
         try:
             name = event.name
+            if (name in _SUMMARY_KEYS and event.event_type == keyboard.KEY_DOWN
+                    and self.recording and self.active_mode == "dictate"
+                    and not getattr(self, "summary_take", False)):
+                self._ctrl_q.put(("summary", None))
+                return
             if name == self.cfg.get("live_hotkey"):
                 self._on_live_key(event, name)
                 return
@@ -2643,6 +2754,8 @@ class Flow:
                         self.live_worker.stop()
                     else:
                         self.live_worker.start()
+                elif action == "summary":
+                    self._enable_summary()
                 elif action == "down":
                     self.on_press(mode)
                 else:
