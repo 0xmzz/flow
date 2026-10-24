@@ -366,6 +366,38 @@ def _short_run_spans(text):
     return []
 
 
+_WORD_RE = re.compile(r"[A-Za-z0-9']+")
+
+
+def _word_loop_spans(text, min_reps=4, max_n=3):
+    """A 1-3 word unit repeated >=4 times in a row ("safe, safe, safe, safe")
+    keeps the first copy. Real speech rarely says the same word four times
+    running; Whisper loops do it constantly on weak audio."""
+    toks = [(m.start(), m.end(), m.group().lower()) for m in _WORD_RE.finditer(text)]
+    spans = []
+    i = 0
+    while i < len(toks):
+        best = None
+        for n in range(1, max_n + 1):
+            unit = [t[2] for t in toks[i:i + n]]
+            if len(unit) < n:
+                break
+            reps = 1
+            while [t[2] for t in toks[i + reps * n:i + (reps + 1) * n]] == unit:
+                reps += 1
+            if reps >= min_reps and (best is None or reps * n > best[0] * best[1]):
+                best = (reps, n)
+        if best:
+            reps, n = best
+            end_tok = toks[i + reps * n - 1]
+            # keep the first copy up to (not including) its trailing separator
+            spans.append((toks[i + n - 1][1], end_tok[1]))
+            i += reps * n
+        else:
+            i += 1
+    return spans
+
+
 def strip_hallucinations(text):
     """Drop Whisper caption outros and stuttered sentence loops.
 
@@ -380,6 +412,7 @@ def strip_hallucinations(text):
     cut = _cut_spans(text, _amara_spans(text))
     cut = _cut_spans(cut, _trailing_outro_spans(cut))
     cut = _cut_spans(cut, _short_run_spans(cut) + _repeat_spans(cut))
+    cut = _cut_spans(cut, _word_loop_spans(cut))
     return text if cut == text else cut
 
 
@@ -743,6 +776,16 @@ class StreamWorker:
                     cut = i + 1
             if cut:
                 phrase = "".join(w.word for w in words[:cut]).strip()
+                # Live text is typed before the final pass, so loops must be
+                # caught here too. Filter the joined text; when the loop runs
+                # into what is already on screen, keep only the new remainder.
+                joined = (self.committed_text + " " + phrase).strip()
+                clean = strip_hallucinations(joined)
+                if clean != joined:
+                    base = self.committed_text
+                    phrase = (clean[len(base):].strip()
+                              if clean.startswith(base) else "")
+                    print(f"[stream] dropped a looped phrase")
                 self.committed_text = (self.committed_text + " " + phrase).strip()
                 self.committed_samples += int(words[cut - 1].end * sr)
                 self._prev = texts[cut:]
