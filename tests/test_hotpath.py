@@ -68,9 +68,11 @@ def _drain(f):
     """Run queued press/release actions the way _ctrl_loop does."""
     while True:
         try:
-            action, mode = f._ctrl_q.get_nowait()
+            item = f._ctrl_q.get_nowait()
         except queue.Empty:
             return
+        action = item[0]
+        mode = item[1] if len(item) > 1 else None
         if action == "down":
             f.on_press(mode)
         elif action == "up":
@@ -470,7 +472,8 @@ def test_press_while_busy_records_and_pastes_in_order(monkeypatch):
 
     def fake_process(self, audio, streamer=None, released_at=None, summary=False,
                      rewrite=False, full_samples=None, discarded=0,
-                     committed_at_release=None, take_hwnd=0, input_tick=None):
+                     committed_at_release=None, take_hwnd=0, input_tick=None,
+                     rewrite_capture=None):
         self.busy.acquire()
         try:
             if audio == "first":

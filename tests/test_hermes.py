@@ -152,7 +152,7 @@ def test_right_ctrl_dispatch_never_queues_hermes(monkeypatch):
     obj._ctrl_q = SimpleNamespace(put=queued.append)
     obj._on_key(SimpleNamespace(name="right ctrl",
                                 event_type=flow.keyboard.KEY_DOWN))
-    assert queued == [("down", "dictate")]
+    assert queued == [("down", "dictate", "right ctrl")]
 
 
 def test_dictation_transcript_never_sent_to_hermes(monkeypatch):

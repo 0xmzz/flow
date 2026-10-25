@@ -983,6 +983,10 @@ class StreamWorker:
         self._gen = None         # Recorder generation this worker may trim
         self._frozen = None      # (text, samples) sealed with the audio
         self.saved_clip = None
+        # Generation at the moment this worker saved the clipboard. Restores
+        # use this value. A later Flow write, including our own paste, moves
+        # it; cleanup must not read a fresh generation.
+        self.clip_gen = _clipboard_generation()
         self._prev = []          # word texts from the previous pass
         self._active = False
         self._thread = None
@@ -992,6 +996,7 @@ class StreamWorker:
                 self.saved_clip = pyperclip.paste()
             except Exception:
                 pass
+            self.clip_gen = _clipboard_generation()
 
     def start(self):
         # A previous stop() leaves the event set. Clear it before the thread
@@ -1221,17 +1226,22 @@ class StreamWorker:
             return
         if not _copy_clipboard(text):
             raise RuntimeError("clipboard copy failed")
+        self.clip_gen = _clipboard_generation()
         time.sleep(0.02)
         keyboard.send("ctrl+v")
 
     def restore_clipboard(self, expect_gen=None):
         """Put the user's clipboard back unless a newer Flow write owns it.
 
-        `expect_gen` is the generation when this restore was armed. A live
-        paste, or any other Flow clipboard write since then, makes this a
-        no-op instead of overwriting that payload.
+        `expect_gen` is the generation recorded when this clipboard was saved
+        or last written by this worker. A missing argument uses that recorded
+        value. Cleanup must not substitute the generation it sees now.
         """
         if self.saved_clip is None:
+            return
+        if expect_gen is None:
+            expect_gen = getattr(self, "clip_gen", None)
+        if expect_gen is None:
             return
         wrote = _copy_clipboard(self.saved_clip, expect_gen=expect_gen)
         if wrote:
@@ -1250,6 +1260,7 @@ class ClientStreamer:
         self.typed = 0
         self.sent = 0
         self.saved_clip = None
+        self.clip_gen = _clipboard_generation()
         self._active = False
         self._thread = None
         self._wake = threading.Event()
@@ -1281,6 +1292,7 @@ class ClientStreamer:
             self.saved_clip = pyperclip.paste()
         except Exception:
             pass
+        self.clip_gen = _clipboard_generation()
         self._wake.clear()
         self._active = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -1313,6 +1325,7 @@ class ClientStreamer:
         try:
             if not _copy_clipboard(chunk):
                 raise RuntimeError("clipboard copy failed")
+            self.clip_gen = _clipboard_generation()
             time.sleep(0.02)
             keyboard.send("ctrl+v")  # user is already holding ctrl — paste is safe
             self.typed = len(self.committed)
@@ -1360,6 +1373,10 @@ class ClientStreamer:
     def restore_clipboard(self, expect_gen=None):
         """See StreamWorker.restore_clipboard. A stale generation does not copy."""
         if self.saved_clip is None:
+            return
+        if expect_gen is None:
+            expect_gen = getattr(self, "clip_gen", None)
+        if expect_gen is None:
             return
         _copy_clipboard(self.saved_clip, expect_gen=expect_gen)
 
@@ -2046,18 +2063,28 @@ def capture_selection():
     GetLastInputInfo tick taken immediately after this Ctrl+C. Flow's own
     injection is therefore inside the stamp. A later user tick means the
     selection may have moved.
+
+    `capture_selection.generation` is the clipboard generation right after
+    this capture's own write (the sentinel). Restores of `saved` must use
+    that value. A later cleanup must not read a new generation.
     """
     capture_selection.context = None
+    capture_selection.generation = None
     try:
         saved = pyperclip.paste()
     except Exception:
         saved = ""
+    # Before any write. A modifier timeout never copies, so this is the
+    # generation a restore of `saved` is allowed to replace.
+    capture_selection.generation = _clipboard_generation()
     if not wait_modifiers_up():
         print("[rewrite] modifiers still down; not sending ctrl+c")
         return None, saved, "modifiers"
     sentinel = f"flow-sel-{time.monotonic_ns()}-{os.getpid()}"
     if not _copy_clipboard(sentinel):
         return None, saved, "nosel"
+    # Right after our own write. The app's Ctrl+C is not a Flow write.
+    capture_selection.generation = _clipboard_generation()
     try:
         keyboard.send("ctrl+c")
     except Exception as e:
@@ -2248,6 +2275,8 @@ class Flow:
         self._pressed_keys = set()
         self._active_ptt_key = None
         self._take_key = None  # key that owns the open take; its up may end it
+        self._take_gen = 0     # generation of that claim; a later press bumps it
+        self._owner_token = None  # (key, gen) of the current claim
         # Hook thread and the ctrl-loop watchdog both touch these. The lock is
         # held only for the set update — _on_key must stay non-blocking.
         self._key_lock = threading.Lock()
@@ -2590,17 +2619,26 @@ class Flow:
     def _submit_job(self, mode, audio, streamer, hermes_context,
                     released_at=None, summary=False, rewrite=False,
                     full_samples=None, discarded=0, committed_at_release=None,
-                    take_hwnd=0, input_tick=None):
-        """Hand a finished take to the single worker. Press order is paste order."""
+                    take_hwnd=0, input_tick=None, rewrite_capture=None):
+        """Hand a finished take to the single worker. Press order is paste order.
+
+        A rewrite captures the selection here, on the ctrl thread at release,
+        after the same modifier wait capture_selection already performs.
+        The text, saved clipboard and generation ride on the job. process()
+        does not capture again, so a selection made while this job waits is
+        not the one the model sees.
+        """
         if mode == "hermes":
             self._job_q.put(("hermes", (audio, hermes_context)))
         elif mode == "command":
             self._job_q.put(("command", (audio,)))
         else:
+            if rewrite and rewrite_capture is None:
+                rewrite_capture = self._bind_rewrite_target()
             self._job_q.put(("dictate", (
                 audio, streamer, released_at, summary, rewrite,
                 full_samples, discarded, committed_at_release, take_hwnd,
-                input_tick)))
+                input_tick, rewrite_capture)))
 
     def _job_loop(self):
         while True:
@@ -2620,7 +2658,69 @@ class Flow:
                 # is already queued behind this one.
                 print(f"[hotkey] {kind} job failed: {e}")
 
-    def on_press(self, mode="dictate"):
+    def _claim_owner(self, key, gen=None):
+        """Ctrl thread: this press owns the open take. Returns its generation.
+
+        A later press claims a new generation. Failure cleanup for this press
+        clears only when both the key and the generation still match.
+        """
+        lock = getattr(self, "_key_lock", None)
+
+        def _do():
+            allocated = gen
+            if allocated is None:
+                allocated = int(getattr(self, "_take_gen", 0) or 0) + 1
+            allocated = int(allocated)
+            self._take_gen = allocated
+            self._take_key = key
+            self._owner_token = (key, allocated)
+            return allocated
+
+        if lock is None:
+            return _do()
+        with lock:
+            return _do()
+
+    def _clear_take_owner(self, key, gen):
+        """Drop this press's claim. A newer generation is left in place."""
+        if key is None or gen is None:
+            return False
+        lock = getattr(self, "_key_lock", None)
+
+        def _do():
+            if getattr(self, "_take_key", None) != key:
+                return False
+            if getattr(self, "_take_gen", None) != gen:
+                return False
+            self._take_key = None
+            if getattr(self, "_owner_token", None) == (key, gen):
+                self._owner_token = None
+            return True
+
+        if lock is None:
+            return _do()
+        with lock:
+            return _do()
+
+    def _clear_owner_on_release(self, key):
+        """End ownership for this release without wiping a later press.
+
+        Callers that do not know the key (watchdog, direct on_release) clear
+        the open take. A keyed release clears only the claim it still owns.
+        """
+        if key is None:
+            self._take_key = None
+            self._owner_token = None
+            return
+        token = getattr(self, "_owner_token", None)
+        if token is None:
+            if getattr(self, "_take_key", None) == key:
+                self._take_key = None
+            return
+        if token[0] == key:
+            self._clear_take_owner(token[0], token[1])
+
+    def on_press(self, mode="dictate", key=None):
         stop_speech()
         # A second PTT key during a recording must return immediately. The
         # lock is held for the whole take, so waiting out _MIC_WAIT_S would
@@ -2628,69 +2728,92 @@ class Flow:
         with self._session_lock:
             if self.recording:
                 return
+        # Provisional ownership for this press, before the mic wait. Accepted
+        # takes keep it. A failed start clears it only while the generation
+        # still belongs to this press.
+        claimed = self._claim_owner(key) if key is not None else None
         # Wait outside _session_lock: a probe may take seconds, and the
         # previous release still needs that lock. `busy` is processing, not
         # the mic — a new press records while the previous take decodes.
         if not self._mic_lock.acquire(timeout=_MIC_WAIT_S):
             with self._session_lock:
-                if self.recording:
-                    return
-            self._note_mic_wait()
+                recording = self.recording
+            if not recording:
+                self._note_mic_wait()
+            self._clear_take_owner(key, claimed)
             return
         started = False
+        opened = False
         try:
-            with self._session_lock:
-                if self.recording:
-                    return
-                context = None
-                if mode == "hermes":
-                    if not self.hermes:
+            try:
+                with self._session_lock:
+                    if self.recording:
                         return
-                    # LOCAL ONLY on this path. on_press runs on the ctrl-loop
-                    # thread while holding _session_lock — a network call here
-                    # would freeze every hotkey. The thread name comes from
-                    # local rules; the session id is resolved in process_hermes.
-                    try:
-                        window = foreground_window()
-                        context = {"window": window,
-                                   "title": self.hermes.predict_title(window)}
-                    except Exception as exc:                 # never wedge
-                        print(f"[pc-hermes] thread predict failed: {exc}")
-                        context = {"window": "", "title": "Hermes"}
-                    self.hermes_context = dict(context)
-                self.active_mode = mode
-                self.summary_take = False
-                self.rewrite_take = False
-                self.latched = False
-                self._latched_shown = None
-                self._take_hwnd = foreground_hwnd()
-                pending = getattr(self, "_latch_pending", None)
-                self._latch_pending = None
-                if (mode == "dictate" and pending
-                        and self.cfg.get("mode") != "client"):
-                    # Same locked section as recording=True. A remote clear
-                    # that ran before this acquire cannot wipe it afterwards
-                    # without observing owner == "local".
-                    self._latch = pending
-                    self._latch_owner = "local"
-                    self.latched = pending.get("phase") == "latched"
-                self.recording = True
-                self._record_started_at = time.monotonic()
-                self._mic_held = True
-                started = True
-                if self.live_worker:
-                    self.live_worker.pause("recorder-owner")
-                gen = self.recorder.start()  # first — capture must not wait on mute/icon
-                self.set_icon("rec", (f"Hermes · {context['title']}"
-                                      if context else None))
-                if self.rewrite_take and self.overlay:
-                    self.overlay.set(("rec", None, "rewrite"))
-                if self.cfg.get("mute_output_while_recording"):
-                    self.muter.mute()
-                self._open_streamer(gen)
+                    context = None
+                    if mode == "hermes":
+                        if not self.hermes:
+                            return
+                        # LOCAL ONLY on this path. on_press runs on the ctrl-loop
+                        # thread while holding _session_lock — a network call here
+                        # would freeze every hotkey. The thread name comes from
+                        # local rules; the session id is resolved in process_hermes.
+                        try:
+                            window = foreground_window()
+                            context = {"window": window,
+                                       "title": self.hermes.predict_title(window)}
+                        except Exception as exc:                 # never wedge
+                            print(f"[pc-hermes] thread predict failed: {exc}")
+                            context = {"window": "", "title": "Hermes"}
+                        self.hermes_context = dict(context)
+                    self.active_mode = mode
+                    self.summary_take = False
+                    self.rewrite_take = False
+                    self.latched = False
+                    self._latched_shown = None
+                    self._take_hwnd = foreground_hwnd()
+                    pending = getattr(self, "_latch_pending", None)
+                    self._latch_pending = None
+                    if (mode == "dictate" and pending
+                            and self.cfg.get("mode") != "client"):
+                        # Same locked section as recording=True. A remote clear
+                        # that ran before this acquire cannot wipe it afterwards
+                        # without observing owner == "local".
+                        self._latch = pending
+                        self._latch_owner = "local"
+                        self.latched = pending.get("phase") == "latched"
+                    self.recording = True
+                    self._record_started_at = time.monotonic()
+                    self._mic_held = True
+                    started = True
+                    if self.live_worker:
+                        self.live_worker.pause("recorder-owner")
+                    rec_gen = self.recorder.start()  # first — capture must not wait on mute/icon
+                    opened = True
+                    self.set_icon("rec", (f"Hermes · {context['title']}"
+                                          if context else None))
+                    if self.rewrite_take and self.overlay:
+                        self.overlay.set(("rec", None, "rewrite"))
+                    if self.cfg.get("mute_output_while_recording"):
+                        self.muter.mute()
+                    self._open_streamer(rec_gen)
+            except Exception:
+                if started and not opened:
+                    with self._session_lock:
+                        self.recording = False
+                        self._record_started_at = None
+                        self.latched = False
+                    self._mic_held = False
+                    started = False
+                    self._clear_take_owner(key, claimed)
+                raise
         finally:
             if not started:
-                self._mic_lock.release()
+                if not self.recording:
+                    self._clear_take_owner(key, claimed)
+                try:
+                    self._mic_lock.release()
+                except RuntimeError:
+                    pass
 
     def _open_streamer(self, gen, handsfree=False):
         """Start the rolling decoder for the open take. Hands-free never types."""
@@ -2798,7 +2921,7 @@ class Flow:
                 and not getattr(self, "rewrite_take", False):
             self.overlay.set(("rec", self._latched_shown, "handsfree"))
 
-    def on_release(self):
+    def on_release(self, key=None):
         """End the open take and queue it. Ordinary releases do this at once.
 
         The latch machine sets `_keep_latch` first. It has already stored the
@@ -2811,7 +2934,7 @@ class Flow:
         current = None
         with self._session_lock:
             if not self.recording:
-                self._take_key = None
+                self._clear_owner_on_release(key)
                 return
             if self.active_mode == "remote":
                 return  # remote session owns the recorder; the hotkey must not hijack it
@@ -2821,7 +2944,7 @@ class Flow:
             hwnd = getattr(self, "_take_hwnd", 0) or 0
             self.recording = False
             self._record_started_at = None
-            self._take_key = None
+            self._clear_owner_on_release(key)
             self.latched = False
             self._latched_shown = None
             self._latch_pending = None
@@ -3059,24 +3182,22 @@ class Flow:
             if next_at <= time.monotonic():
                 next_at = time.monotonic() + _WAIT_TICK_S
 
-    def _restore_clip(self, saved, delay=0.0):
-        """Put the user's clipboard back. Delayed when a paste still needs it.
+    def _restore_clip(self, saved, delay=0.0, expect_gen=None):
+        """Put the user's clipboard back if this job still owns it.
 
-        A delayed restore carries the clipboard generation from schedule time.
-        A newer job that retains output, or any newer Flow clipboard write,
-        invalidates it. The old timer then does not overwrite that result.
+        `expect_gen` is the generation recorded at capture, right after that
+        capture's own writes. Immediate and delayed restores both use it.
+        Nothing here reads the generation again: a newer write must win.
         """
-        if saved is None:
+        if saved is None or expect_gen is None:
             return
         if delay and delay > 0:
-            gen = _clipboard_generation()
-
-            def go(gen=gen):
+            def go(gen=expect_gen):
                 time.sleep(delay)
                 _copy_clipboard(saved, expect_gen=gen)
             threading.Thread(target=go, daemon=True).start()
             return
-        _copy_clipboard(saved)
+        _copy_clipboard(saved, expect_gen=expect_gen)
 
     def _copy_kept_result(self, text, retain):
         """Put `text` on the clipboard. `retain` is this job's list, or None.
@@ -3112,10 +3233,13 @@ class Flow:
         Returns (target, abort_message). Modifiers must be up within 1.5s.
         If they are not, the rewrite is aborted with the existing message
         and nothing is copied from the selection. `target` holds the text,
-        the saved clipboard, and the hwnd, focus and input stamp taken
-        after Flow's own Ctrl+C.
+        the saved clipboard, the clipboard generation after this capture's
+        own write, and the hwnd, focus and input stamp taken after Flow's
+        own Ctrl+C.
         """
+        capture_selection.generation = None
         got = capture_selection()
+        gen = getattr(capture_selection, "generation", None)
         if len(got) == 2:
             selection, saved = got
             problem = None if selection else "nosel"
@@ -3125,17 +3249,18 @@ class Flow:
             msg = "Let go of Ctrl, Alt and Shift — rewrite cancelled"
             if self.overlay:
                 self.overlay.set(("say", msg))
-            self._restore_clip(saved)
+            self._restore_clip(saved, expect_gen=gen)
             return None, msg
         if not selection:
             msg = "Select text first"
             if self.overlay:
                 self.overlay.set(("say", msg))
-            self._restore_clip(saved)
+            self._restore_clip(saved, expect_gen=gen)
             return None, msg
         captured = dict(self._rewrite_captured_target())
         captured["text"] = selection
         captured["saved"] = saved
+        captured["gen"] = gen
         return captured, None
 
     def _rewrite_selection(self, instruction, take_hwnd=0, retain=None,
@@ -3154,6 +3279,7 @@ class Flow:
         so this job does not restore a streamer's clipboard over it.
         """
         saved = None
+        saved_gen = None
         restore = False
         try:
             if target is None:
@@ -3162,6 +3288,7 @@ class Flow:
                     return None
             selection = target.get("text")
             saved = target.get("saved")
+            saved_gen = target.get("gen")
             restore = True
             if not selection:
                 if self.overlay:
@@ -3201,7 +3328,7 @@ class Flow:
             return rewritten
         finally:
             if restore:
-                self._restore_clip(saved)
+                self._restore_clip(saved, expect_gen=saved_gen)
 
     def _apply_voice_edit(self, text, live_typed):
         """Scratch-that on text that is not already on screen.
@@ -3234,7 +3361,8 @@ class Flow:
 
     def process(self, audio, streamer=None, released_at=None, summary=False,
                 rewrite=False, full_samples=None, discarded=0,
-                committed_at_release=None, take_hwnd=0, input_tick=None):
+                committed_at_release=None, take_hwnd=0, input_tick=None,
+                rewrite_capture=None):
         stop = threading.Event()
         started = time.monotonic() if released_at is None else released_at
         watcher = threading.Thread(
@@ -3246,9 +3374,11 @@ class Flow:
                 # This job only. Cleared by falling out of process(); nothing
                 # on self remembers a clipboard decision for the next take.
                 retain_clip = False
-                # Clipboard saved by a rewrite capture. The finally puts it
-                # back unless the rewritten text was left for the user.
+                # Clipboard saved by a rewrite capture, and the generation
+                # recorded right after that capture's own write. The finally
+                # restores only while that generation is still current.
                 rewrite_saved = None
+                rewrite_gen = None
                 # Inside the try: whatever fails from here on, the finally
                 # stops the "Transcribing… (Ns)" ticker.
                 self.set_icon("work")
@@ -3274,10 +3404,13 @@ class Flow:
                             self._safe_paste(remainder, "clipboard",
                                              restore=typed == 0)
                         if typed:
-                            gen = _clipboard_generation()
                             time.sleep(0.3)
+                            gen = getattr(streamer, "clip_gen", None)
                             try:
-                                streamer.restore_clipboard(gen)
+                                if gen is None:
+                                    streamer.restore_clipboard()
+                                else:
+                                    streamer.restore_clipboard(gen)
                             except TypeError:
                                 streamer.restore_clipboard()
                     else:
@@ -3302,14 +3435,20 @@ class Flow:
                     committed = (streamer.committed_text, streamer.committed_samples)
                 else:
                     committed = ("", 0)
-                # Sentinel-copy the selection before ASR. A later failure
-                # restores this clipboard from the finally below.
+                # Selection captured at release, before this job waited.
+                # Direct callers that did not capture yet still bind here.
+                # A later failure restores that clipboard from the finally.
                 rewrite_target = None
                 rewrite_abort = None
                 if rewrite:
-                    rewrite_target, rewrite_abort = self._bind_rewrite_target()
+                    if rewrite_capture is None:
+                        rewrite_capture = self._bind_rewrite_target()
+                    if (isinstance(rewrite_capture, tuple)
+                            and len(rewrite_capture) == 2):
+                        rewrite_target, rewrite_abort = rewrite_capture
                     if rewrite_target is not None and not rewrite_abort:
                         rewrite_saved = rewrite_target.get("saved")
+                        rewrite_gen = rewrite_target.get("gen")
                 text, meta = self.transcribe_and_store(
                     audio, source="pc-hotkey", window=foreground_window(),
                     committed=committed, skip_cleanup=live_typed > 0,
@@ -3428,12 +3567,12 @@ class Flow:
                 stop.set()
                 watcher.join(timeout=1.0)
                 if rewrite_saved is not None:
-                    self._restore_clip(rewrite_saved)
+                    self._restore_clip(rewrite_saved, expect_gen=rewrite_gen)
                     rewrite_saved = None
                 if streamer:
-                    # Armed before the wait. A newer Flow write during it,
-                    # including the next take's live paste, makes this a no-op.
-                    gen = _clipboard_generation()
+                    # The worker recorded clip_gen at save and after its own
+                    # writes. Do not read the generation here: a newer take's
+                    # paste already owns the clipboard.
                     time.sleep(0.3)
                     if retain_clip:
                         # This job left its result on the clipboard. Drop the
@@ -3443,8 +3582,12 @@ class Flow:
                     else:
                         restore = getattr(streamer, "restore_clipboard", None)
                         if restore:
+                            gen = getattr(streamer, "clip_gen", None)
                             try:
-                                restore(gen)
+                                if gen is None:
+                                    restore()
+                                else:
+                                    restore(gen)
                             except TypeError:
                                 restore()
                 self.restore_base_state()
@@ -3857,18 +4000,18 @@ class Flow:
             elif self._active_ptt_key is None:
                 self._active_ptt_key = name
                 self._os_up_streak = 0
-                if not (getattr(self, "recording", False)
-                        or getattr(self, "latched", False)):
-                    self._take_key = name
+                # The key rides on the queue. The ctrl thread claims
+                # _take_key when the take is accepted, with that press's
+                # generation. A failed start clears only that claim.
                 start = True
         if missed_up:
             print(f"[hotkey] {name!r} down {gap:.1f}s after the last event; "
                   "treating it as a missed release")
             self._stamp_ptt(now)
-            self._ctrl_q.put(("up", mode))
+            self._ctrl_q.put(("up", mode, name))
         if start:
             self._stamp_ptt(now)
-            self._ctrl_q.put(("down", mode))
+            self._ctrl_q.put(("down", mode, name))
 
     def _on_ptt_up(self, name, mode):
         release = False
@@ -3887,7 +4030,7 @@ class Flow:
                     release = True
         if release:
             self._stamp_ptt(time.monotonic())
-            self._ctrl_q.put(("up", mode))
+            self._ctrl_q.put(("up", mode, name))
 
     def _stamp_ptt(self, when):
         q = getattr(self, "_ptt_times", None)
@@ -4046,7 +4189,7 @@ class Flow:
         self._drop_held_key()
         self.on_release()
 
-    def _latch_event(self, event, now):
+    def _latch_event(self, event, now, key=None):
         """Apply one dictate-hotkey event. Client mode never latches.
 
         The phase change is committed under `_session_lock` together with
@@ -4058,9 +4201,15 @@ class Flow:
         """
         if self.cfg.get("mode") == "client":
             if event == "down":
-                self.on_press("dictate")
+                if key is None:
+                    self.on_press("dictate")
+                else:
+                    self.on_press("dictate", key=key)
             elif event == "up":
-                self.on_release()
+                if key is None:
+                    self.on_release()
+                else:
+                    self.on_release(key)
             return
         with self._session_lock:
             if self.recording and getattr(self, "active_mode", None) == "remote":
@@ -4091,23 +4240,33 @@ class Flow:
                 if action is None and new_state.get("phase") == "latched":
                     self._latch_owner = "local"
         if action == "start":
-            self.on_press("dictate")
-            with self._session_lock:
-                if not self.recording and not self.latched:
-                    # The press did not open a take. Do not leave a local owner
-                    # behind, or a later remote clear would refuse to run.
-                    self._latch_pending = None
-                    self._latch_owner = None
-                    st = dict(self._latch or _LATCH_IDLE)
-                    if st.get("phase") == "holding":
-                        st["phase"] = "idle"
-                        st["candidate"] = False
-                        self._latch = st
+            try:
+                if key is None:
+                    self.on_press("dictate")
+                else:
+                    self.on_press("dictate", key=key)
+            finally:
+                with self._session_lock:
+                    if not self.recording and not self.latched:
+                        # The press did not open a take. Do not leave a local
+                        # owner behind, or a later remote clear would refuse
+                        # to run. Key ownership is cleared inside on_press,
+                        # and only for this press's generation.
+                        self._latch_pending = None
+                        self._latch_owner = None
+                        st = dict(self._latch or _LATCH_IDLE)
+                        if st.get("phase") == "holding":
+                            st["phase"] = "idle"
+                            st["candidate"] = False
+                            self._latch = st
         elif action == "latch":
             self._become_latched()
         elif action in ("release", "stop"):
             self._keep_latch = True
-            self.on_release()
+            if key is None:
+                self.on_release()
+            else:
+                self.on_release(key)
 
     def _become_latched(self):
         """The candidate release was short. Keep this recording, stop typing it."""
@@ -4126,15 +4285,17 @@ class Flow:
                 self.streamer.live = False
         self._show_latched()
 
-    def _handle_up(self, mode, when):
+    def _handle_up(self, mode, when, key=None):
         """Key-up from the ctrl loop.
 
         Client mode is the pre-latch hotkey: down starts, up ends.
         """
         if mode == "dictate" and self.cfg.get("mode") != "client":
-            self._latch_event("up", when)
-        else:
+            self._latch_event("up", when, key=key)
+        elif key is None:
             self.on_release()
+        else:
+            self.on_release(key)
 
     def _poll_latched_clock(self):
         """Hands-free context line: elapsed and word count, about once a second."""
@@ -4154,7 +4315,7 @@ class Flow:
         import queue
         while not getattr(self, "_ctrl_stop", False):
             try:
-                action, mode = self._ctrl_q.get(timeout=_KEY_POLL_S)
+                item = self._ctrl_q.get(timeout=_KEY_POLL_S)
             except queue.Empty:
                 if getattr(self, "_ctrl_stop", False):
                     return
@@ -4169,6 +4330,9 @@ class Flow:
                 continue
             if getattr(self, "_ctrl_stop", False):
                 return
+            action = item[0]
+            mode = item[1] if len(item) > 1 else None
+            key = item[2] if len(item) > 2 else None
             try:
                 if action == "toggle":
                     if not self.live_worker:
@@ -4186,19 +4350,24 @@ class Flow:
                 elif action == "down":
                     when = self._pop_ptt_time()
                     if mode == "dictate" and self.cfg.get("mode") != "client":
-                        self._latch_event("down", when)
-                    else:
+                        self._latch_event("down", when, key=key)
+                    elif key is None:
                         self.on_press(mode)
+                    else:
+                        self.on_press(mode, key=key)
                 elif action == "up":
                     when = self._pop_ptt_time()
-                    self._handle_up(mode, when)
+                    self._handle_up(mode, when, key=key)
                 else:
                     self.on_release()
             except Exception as e:
                 # Never let a press/release error propagate — recover the state.
+                # Clear this press's owner only. A later queued press keeps its.
                 print(f"[hotkey] {action} handler error: {e}")
                 self.recording = False
                 self._record_started_at = None
+                if key is not None:
+                    self._clear_owner_on_release(key)
                 self._release_mic()
 
     def maybe_start_server(self):

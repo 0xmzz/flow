@@ -342,7 +342,7 @@ def test_right_alt_alone_is_still_a_command(monkeypatch):
     import flow
     f = _flow(monkeypatch, recording=False)
     f._on_key(_ev("right alt", flow.keyboard.KEY_DOWN))
-    assert f._ctrl_q.get_nowait() == ("down", "command")
+    assert f._ctrl_q.get_nowait() == ("down", "command", "right alt")
 
 
 def test_ctrl_joining_an_alt_take_does_not_convert_it(monkeypatch):
@@ -434,7 +434,7 @@ def test_rewrite_with_no_selection_pastes_nothing(monkeypatch):
     f.overlay = types.SimpleNamespace(set=lambda state: said.append(state))
     monkeypatch.setattr(f, "_safe_paste", lambda *a, **k: pasted.append(a))
     monkeypatch.setattr(f, "_restore_clip",
-                        lambda saved, delay=0.0: restored.append((saved, delay)))
+                        lambda saved, delay=0.0, expect_gen=None: restored.append((saved, delay)))
     monkeypatch.setattr(flow, "capture_selection", lambda: (None, "previous"))
     monkeypatch.setattr(flow, "llm_rewrite", lambda *a, **k: (_ for _ in ()).throw(
         AssertionError("no selection must not call the model")))
@@ -451,7 +451,7 @@ def test_rewrite_llm_failure_leaves_the_selection_and_pastes_nothing(monkeypatch
     f.overlay = types.SimpleNamespace(set=lambda state: said.append(state))
     monkeypatch.setattr(f, "_safe_paste", lambda *a, **k: pasted.append(a))
     monkeypatch.setattr(f, "_restore_clip",
-                        lambda saved, delay=0.0: restored.append((saved, delay)))
+                        lambda saved, delay=0.0, expect_gen=None: restored.append((saved, delay)))
     monkeypatch.setattr(flow, "capture_selection",
                         lambda: ("Selected words", "previous"))
     monkeypatch.setattr(flow, "llm_rewrite", lambda *a, **k: None)
@@ -469,7 +469,7 @@ def test_rewrite_success_copies_and_does_not_paste(monkeypatch):
     f.overlay = types.SimpleNamespace(set=lambda state: said.append(state))
     monkeypatch.setattr(f, "_safe_paste", lambda *a, **k: pasted.append(a))
     monkeypatch.setattr(f, "_restore_clip",
-                        lambda saved, delay=0.0: restored.append((saved, delay)))
+                        lambda saved, delay=0.0, expect_gen=None: restored.append((saved, delay)))
     monkeypatch.setattr(flow, "_copy_clipboard",
                         lambda text, expect_gen=None: copied.append(text) or True)
     monkeypatch.setattr(flow, "capture_selection",
@@ -872,7 +872,7 @@ def test_astra_8_alt_first_stays_a_command(monkeypatch):
     assert f._ctrl_q.empty()
     assert f.rewrite_take is False
     f._on_key(_ev("right alt", flow.keyboard.KEY_UP))
-    assert f._ctrl_q.get_nowait() == ("up", "command")
+    assert f._ctrl_q.get_nowait() == ("up", "command", "right alt")
     f._on_key(_ev("right ctrl", flow.keyboard.KEY_UP))
     assert f._ctrl_q.empty()
     assert "right ctrl" not in f._pressed_keys
@@ -929,7 +929,7 @@ def test_astra_10_latched_watchdog_clears_a_stuck_key_without_stopping(monkeypat
     assert "right ctrl" not in f._pressed_keys
     clock["t"] = 1000.4
     f._on_key(_ev("right ctrl", flow.keyboard.KEY_DOWN))
-    assert f._ctrl_q.get_nowait() == ("down", "dictate")
+    assert f._ctrl_q.get_nowait() == ("down", "dictate", "right ctrl")
     f._latch_event("down", clock["t"])
     assert released == ["up"]
     assert f.latched is False
@@ -1020,7 +1020,7 @@ def test_astra_14_held_modifiers_block_copy_and_paste(monkeypatch):
     f.overlay = types.SimpleNamespace(set=lambda state: said.append(state))
     monkeypatch.setattr(f, "_safe_paste", lambda *a, **k: pasted.append(a))
     monkeypatch.setattr(f, "_restore_clip",
-                        lambda saved, delay=0.0: restored.append(saved))
+                        lambda saved, delay=0.0, expect_gen=None: restored.append(saved))
     calls = {"n": 0}
 
     def wait(*a, **k):
@@ -1124,9 +1124,12 @@ def _play_ctrl(f):
     """Control-thread order: the same branches _ctrl_loop runs, without the poll."""
     while True:
         try:
-            action, mode = f._ctrl_q.get_nowait()
+            item = f._ctrl_q.get_nowait()
         except queue.Empty:
             return
+        action = item[0]
+        mode = item[1] if len(item) > 1 else None
+        key = item[2] if len(item) > 2 else None
         if action == "rewrite":
             f._enable_rewrite()
         elif action == "summary":
@@ -1134,12 +1137,14 @@ def _play_ctrl(f):
         elif action == "down":
             when = f._pop_ptt_time()
             if mode == "dictate" and f.cfg.get("mode") != "client":
-                f._latch_event("down", when)
-            else:
+                f._latch_event("down", when, key=key)
+            elif key is None:
                 f.on_press(mode)
+            else:
+                f.on_press(mode, key=key)
         elif action == "up":
             when = f._pop_ptt_time()
-            f._handle_up(mode, when)
+            f._handle_up(mode, when, key=key)
         else:
             f.on_release()
 
@@ -1289,7 +1294,7 @@ def test_astra_r2_3_alt_ctrl_chord_converts_before_recording_starts(monkeypatch)
     f._on_key(_ev("right alt", flow.keyboard.KEY_UP))
     f._on_key(_ev("right ctrl", flow.keyboard.KEY_UP))
     items = _queued(f)
-    assert items == [("down", "command"), ("up", "command")]
+    assert items == [("down", "command", "right alt"), ("up", "command", "right alt")]
     _play_ctrl(f)
     assert f.recording is False
     kind, _args = f._job_q.get_nowait()
@@ -1423,7 +1428,7 @@ def test_astra_r2_6_a_short_ctrl_release_lets_the_next_mode_record(monkeypatch):
     first = f._job_q.get_nowait()
     assert np.all(np.asarray(first[1][0]) == 1)
     f._on_key(_ev("right alt", flow.keyboard.KEY_DOWN))
-    assert f._ctrl_q.get_nowait() == ("down", "command")
+    assert f._ctrl_q.get_nowait() == ("down", "command", "right alt")
     f.on_press("command")
     assert f.recording is True
     assert f.active_mode == "command"
@@ -1768,7 +1773,7 @@ def test_astra_r3_4_alt_first_does_not_start_rewrite(monkeypatch):
     f._on_key(_ev("right ctrl", flow.keyboard.KEY_UP))
     items = _queued(f)
     assert ("rewrite", None) not in items
-    assert items == [("down", "command"), ("up", "command")]
+    assert items == [("down", "command", "right alt"), ("up", "command", "right alt")]
     assert "right ctrl" not in f._pressed_keys
     assert f._active_ptt_key is None
     _play_ctrl(f)
@@ -1777,7 +1782,7 @@ def test_astra_r3_4_alt_first_does_not_start_rewrite(monkeypatch):
     kind, _args = f._job_q.get_nowait()
     assert kind == "command"
     f._on_key(_ev("right ctrl", flow.keyboard.KEY_DOWN))
-    assert f._ctrl_q.get_nowait() == ("down", "dictate")
+    assert f._ctrl_q.get_nowait() == ("down", "dictate", "right ctrl")
     f.recording = True
     f.active_mode = "dictate"
     f.rewrite_take = False
@@ -1838,7 +1843,7 @@ def test_astra_r3_6_pending_chord_does_not_convert_the_next_command(monkeypatch)
     f.on_release()
     assert f.recording is False
     f._on_key(_ev("right alt", flow.keyboard.KEY_DOWN))
-    assert f._ctrl_q.get_nowait() == ("down", "command")
+    assert f._ctrl_q.get_nowait() == ("down", "command", "right alt")
     f.on_press("command")
     assert f.active_mode == "command"
     assert f.rewrite_take is False
@@ -2336,3 +2341,234 @@ def test_astra_r5_5_rejected_command_up_does_not_stop_the_take(monkeypatch):
     tap(other, "right ctrl", 0.70, 0.80)
     assert other.recording is False
     assert other.latched is False
+
+
+# --- Astra round-6 ----------------------------------------------------------
+
+
+def test_astra_r6_1_rewrite_failure_does_not_restore_over_the_next_paste(monkeypatch):
+    """Older rewrite ASR failure during the next take's 20 ms wait.
+
+    The restore was armed at capture. It must not put ORIGINAL back over
+    NEW DICTATION, and ctrl+v pastes the new dictation.
+    """
+    import numpy as np
+    import flow
+    f = _flow(monkeypatch)
+    f.cfg["min_duration_s"] = 0
+    monkeypatch.setattr(f, "mic_is_deaf", lambda _a: False)
+    monkeypatch.setattr(flow, "wait_modifiers_up", lambda *a, **k: True)
+    state = {"clip": "ORIGINAL", "pasted": []}
+    monkeypatch.setattr(flow.pyperclip, "paste", lambda: state["clip"])
+    monkeypatch.setattr(flow.pyperclip, "copy",
+                        lambda text: state.__setitem__("clip", text))
+
+    def send(keys):
+        if keys == "ctrl+c":
+            state["clip"] = "Selected words"
+        elif keys == "ctrl+v":
+            state["pasted"].append(state["clip"])
+
+    monkeypatch.setattr(flow.keyboard, "send", send)
+    entered = threading.Event()
+    release = threading.Event()
+    done = threading.Event()
+
+    def asr(*_a, **_k):
+        entered.set()
+        assert release.wait(3)
+        raise RuntimeError("ASR failed")
+
+    monkeypatch.setattr(f, "transcribe_and_store", asr)
+    errors = []
+
+    def old_job():
+        try:
+            f.process(np.ones(32, dtype=np.float32), rewrite=True)
+        except RuntimeError as exc:
+            errors.append(str(exc))
+        finally:
+            done.set()
+
+    def sleep(n):
+        if n == 0.02:
+            release.set()
+            assert done.wait(3)
+
+    monkeypatch.setattr(flow.time, "sleep", sleep)
+    old = threading.Thread(target=old_job)
+    old.start()
+    assert entered.wait(3)
+    assert state["clip"] == "Selected words"
+    worker = flow.StreamWorker(f, live=True)
+    worker._active = True
+    worker.committed_text = "NEW DICTATION"
+    worker.typed_len = 0
+    worker.type_chunk()
+    old.join(3)
+    assert errors == ["ASR failed"]
+    assert state["pasted"] == ["NEW DICTATION"]
+    assert state["clip"] == "NEW DICTATION"
+    assert worker.typed_len == len("NEW DICTATION")
+
+
+def test_astra_r6_2_queued_taps_keep_take_ownership(monkeypatch):
+    """Release, down, release queued before the ctrl thread drains.
+
+    The latch's owner is the key that was accepted, so a right-alt tap
+    does not stop it.
+    """
+    import flow
+    f = _flow(monkeypatch)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(flow.time, "monotonic", lambda: clock["t"])
+
+    def event(name, kind, t, drain=True):
+        clock["t"] = t
+        f._on_key(_ev(name, kind))
+        if drain:
+            _play_ctrl(f)
+
+    event("right ctrl", flow.keyboard.KEY_DOWN, 0.0)
+    assert f.recording is True
+    assert f._take_key == "right ctrl"
+    event("right ctrl", flow.keyboard.KEY_UP, 0.10, drain=False)
+    event("right ctrl", flow.keyboard.KEY_DOWN, 0.30, drain=False)
+    event("right ctrl", flow.keyboard.KEY_UP, 0.40, drain=False)
+    _play_ctrl(f)
+    assert f.recording is True
+    assert f.latched is True
+    assert f._take_key == "right ctrl"
+    assert f._job_q.qsize() == 1
+    event("right shift", flow.keyboard.KEY_DOWN, 0.50)
+    event("right alt", flow.keyboard.KEY_DOWN, 0.55)
+    event("right alt", flow.keyboard.KEY_UP, 0.60)
+    assert f.recording is True
+    assert f.latched is True
+    assert f.summary_take is True
+    assert f._take_key == "right ctrl"
+    assert f._job_q.qsize() == 1
+
+
+def test_astra_r6_3_failed_start_clears_only_that_press(monkeypatch):
+    """Mic timeout and an open failure drop that press's owner.
+
+    A later right-alt press and a Hermes press still record. A claim that
+    a later press installed during the timeout stays.
+    """
+    import flow
+    f = _flow(monkeypatch)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(flow.time, "monotonic", lambda: clock["t"])
+    f._mic_lock = types.SimpleNamespace(
+        acquire=lambda timeout=None: False, release=lambda: None)
+    f._on_key(_ev("right ctrl", flow.keyboard.KEY_DOWN))
+    _play_ctrl(f)
+    clock["t"] = 1.2
+    f._on_key(_ev("right ctrl", flow.keyboard.KEY_UP))
+    _play_ctrl(f)
+    assert f.recording is False
+    assert f._latch["phase"] == "idle"
+    assert f._take_key is None
+    assert f._active_ptt_key is None
+
+    f._mic_lock = flow._new_mic_lock()
+    f.recorder = types.SimpleNamespace(start=lambda: 1, stop=lambda: b"",
+                                       level=0.0)
+    clock["t"] = 2.0
+    f._on_key(_ev("right alt", flow.keyboard.KEY_DOWN))
+    _play_ctrl(f)
+    assert f.recording is True
+    assert f.active_mode == "command"
+    assert f._take_key == "right alt"
+    clock["t"] = 2.2
+    f._on_key(_ev("right alt", flow.keyboard.KEY_UP))
+    _play_ctrl(f)
+    assert f.recording is False
+    assert f._take_key is None
+
+    f.cfg["hermes"] = {"enabled": True, "hotkey": "right shift"}
+    f.hermes = types.SimpleNamespace(predict_title=lambda _w: "Title")
+    clock["t"] = 3.0
+    f._on_key(_ev("right shift", flow.keyboard.KEY_DOWN))
+    _play_ctrl(f)
+    assert f.recording is True
+    assert f.active_mode == "hermes"
+    assert f._take_key == "right shift"
+
+    held = _flow(monkeypatch)
+    monkeypatch.setattr(flow.time, "monotonic", lambda: 0.0)
+
+    def acquire(timeout=None):
+        held._claim_owner("right alt")
+        return False
+
+    held._mic_lock = types.SimpleNamespace(acquire=acquire, release=lambda: None)
+    held._on_key(_ev("right ctrl", flow.keyboard.KEY_DOWN))
+    _play_ctrl(held)
+    held._on_key(_ev("right ctrl", flow.keyboard.KEY_UP))
+    _play_ctrl(held)
+    assert held.recording is False
+    assert held._take_key == "right alt"
+    assert held._take_gen == 2
+
+    broken = _flow(monkeypatch)
+
+    def boom():
+        raise OSError("mic did not open")
+
+    broken.recorder = types.SimpleNamespace(
+        start=boom, stop=lambda: b"", level=0.0)
+    broken._on_key(_ev("right ctrl", flow.keyboard.KEY_DOWN))
+    with pytest.raises(OSError):
+        _play_ctrl(broken)
+    broken._on_key(_ev("right ctrl", flow.keyboard.KEY_UP))
+    _play_ctrl(broken)
+    assert broken.recording is False
+    assert broken._take_key is None
+    assert broken._active_ptt_key is None
+    assert broken._latch["phase"] == "idle"
+    broken.recorder = types.SimpleNamespace(start=lambda: 1, stop=lambda: b"",
+                                            level=0.0)
+    broken.cfg["hermes"] = {"enabled": True, "hotkey": "right shift"}
+    broken.hermes = types.SimpleNamespace(predict_title=lambda _w: "Title")
+    broken._on_key(_ev("right shift", flow.keyboard.KEY_DOWN))
+    _play_ctrl(broken)
+    assert broken.recording is True
+    assert broken.active_mode == "hermes"
+
+
+def test_astra_r6_4_queued_rewrite_uses_the_release_selection(monkeypatch):
+    """Capture runs when the job is submitted, not when it later starts.
+
+    A at release, then B selected while the job waits: the model sees A.
+    """
+    import numpy as np
+    import flow
+    f = _flow(monkeypatch)
+    f.cfg["min_duration_s"] = 0
+    monkeypatch.setattr(f, "mic_is_deaf", lambda _a: False)
+    state = _selection_state(monkeypatch, flow, f)
+    state["selection"] = "A at release"
+    calls = {"n": 0}
+    real = flow.capture_selection
+
+    def wrapped():
+        calls["n"] += 1
+        return real()
+
+    monkeypatch.setattr(flow, "capture_selection", wrapped)
+    seen = []
+    monkeypatch.setattr(f, "transcribe_and_store",
+                        lambda *_a, **_k: ("be brief", {}))
+    monkeypatch.setattr(flow, "llm_rewrite",
+                        lambda _instruction, selection, _cfg: seen.append(selection) or "Brief.")
+    f._submit_job("dictate", np.ones(32, dtype=np.float32), None, None,
+                  rewrite=True)
+    assert calls["n"] == 1
+    state["selection"] = "B after release"
+    kind, args = f._job_q.get_nowait()
+    assert kind == "dictate"
+    f.process(*args)
+    assert calls["n"] == 1
+    assert seen == ["A at release"]
