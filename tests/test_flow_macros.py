@@ -2810,6 +2810,11 @@ def test_astra_r8_1_disabled_alt_never_captures_a_selection(monkeypatch):
     monkeypatch.setattr(flow, "paste_text", lambda *a, **k: None)
     monkeypatch.setattr(flow, "foreground_window", lambda: "Editor")
     monkeypatch.setattr(flow, "foreground_hwnd", lambda: 7)
+    # 7 is not a real window. An hwnd-only capture still pastes, so the
+    # clipboard assertion below stays about rewrite rather than copy-on-switch.
+    monkeypatch.setattr(
+        flow, "read_window_identity",
+        lambda hwnd: {"hwnd": int(hwnd or 0)})
     monkeypatch.setattr(flow.time, "sleep", lambda _s: None)
     monkeypatch.setattr(f, "mic_is_deaf", lambda _a: False)
     monkeypatch.setattr(f, "transcribe_and_store", lambda *a, **k: ("hello", {}))
@@ -2981,7 +2986,7 @@ def test_astra_r8_5_scratch_that_updates_stored_cleaned(monkeypatch):
     pasted = []
     monkeypatch.setattr(
         flow, "paste_text",
-        lambda text, mode, restore=True: pasted.append(text))
+        lambda text, mode, restore=True, confirm=None: pasted.append(text))
     f.process(np.ones(1600, dtype=np.float32))
     assert len(rows) == 1
     raw, kwargs = rows[0]
@@ -3221,7 +3226,7 @@ def test_astra_r9_3_streaming_scratch_keeps_the_raw_transcript(monkeypatch):
     pasted = []
     monkeypatch.setattr(
         flow, "paste_text",
-        lambda text, mode, restore=True: pasted.append(text))
+        lambda text, mode, restore=True, confirm=None: pasted.append(text))
 
     def decode(*_a, **_k):
         raise AssertionError("committed audio is not a tail")
@@ -3511,6 +3516,13 @@ class _Win:
     def is_minimized(self, hwnd):
         return int(hwnd or 0) in self.minimized
 
+    def identity(self, hwnd):
+        table = getattr(self, "identities", None) or {}
+        found = table.get(int(hwnd or 0))
+        if found:
+            return dict(found)
+        return {"hwnd": int(hwnd or 0), "pid": 0, "tid": 0, "class_name": ""}
+
     def force_foreground(self, *args, **kwargs):
         raise AssertionError("copy-on-switch must not move the foreground")
 
@@ -3673,7 +3685,12 @@ def _wire_paste(monkeypatch, f, bridge):
 
 
 def test_press_captures_only_the_foreground_hwnd(monkeypatch):
-    """One GetForegroundWindow at press. The focused control is not read."""
+    """One GetForegroundWindow at press. The focused control is not read.
+
+    The stored identity is that hwnd plus the process id, the thread id
+    from GetWindowThreadProcessId, and the window class name.
+    """
+    import inspect
     import flow
     f = _flow(monkeypatch)
     calls = {"n": 0}
@@ -3685,19 +3702,32 @@ def test_press_captures_only_the_foreground_hwnd(monkeypatch):
     def focus():
         raise AssertionError("focused control must not be captured at press")
 
+    def ident(hwnd):
+        calls["id"] = hwnd
+        return {"hwnd": int(hwnd), "pid": 5, "tid": 6, "class_name": "Notepad"}
+
+    src = inspect.getsource(flow.read_window_identity)
+    assert "GetWindowThreadProcessId" in src
+    assert "GetClassNameW" in src
     monkeypatch.setattr(flow, "foreground_hwnd", fg)
     monkeypatch.setattr(flow, "focused_control_hwnd", focus)
+    monkeypatch.setattr(flow, "read_window_identity", ident)
     f.on_press("dictate", key="right ctrl")
     assert calls["n"] == 1
+    assert calls["id"] == 11
     assert f._take_hwnd == 11
+    assert f._take_identity == {
+        "hwnd": 11, "pid": 5, "tid": 6, "class_name": "Notepad"}
     assert not hasattr(f, "_take_focus")
     f.on_release("right ctrl")
     kind, args = f._job_q.get_nowait()
     assert kind == "dictate"
-    assert args[8] == 11
+    assert args[8] == {
+        "hwnd": 11, "pid": 5, "tid": 6, "class_name": "Notepad"}
     assert not isinstance(args[8], tuple)
     assert args[-2] is None
     assert flow.captured_hwnd((11, 42)) == 11
+    assert flow.captured_hwnd(args[8]) == 11
 
 
 def test_final_paste_same_window_pastes_and_switched_window_copies(monkeypatch):
@@ -3894,3 +3924,391 @@ def test_paste_last_does_not_overwrite_raw_history(monkeypatch):
     assert rows[0][0] == heard
     assert rows[0][1]["cleaned"] == "Paste my last message."
     assert rows[0][1]["source"] == "pc-hotkey"
+
+
+def _record_keys(monkeypatch):
+    """press, release, send and write. A switched paste must leave this empty."""
+    import flow
+    keys = []
+    monkeypatch.setattr(flow.keyboard, "press",
+                        lambda key: keys.append(("press", key)))
+    monkeypatch.setattr(flow.keyboard, "release",
+                        lambda key: keys.append(("release", key)))
+    monkeypatch.setattr(flow.keyboard, "send",
+                        lambda *a, **k: keys.append(("send", a)))
+    monkeypatch.setattr(flow.keyboard, "write",
+                        lambda text: keys.append(("write", text)))
+    return keys
+
+
+def _no_restore_threads(monkeypatch):
+    """Replace Thread so a scheduled clipboard restore is visible and does not run."""
+    import flow
+    names = []
+
+    class _Thread:
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None,
+                     name=None):
+            names.append(getattr(target, "__name__", "") or "")
+
+        def start(self):
+            return None
+
+        def join(self, timeout=None):
+            return None
+
+    monkeypatch.setattr(flow.threading, "Thread", _Thread)
+    return names
+
+
+def test_switch_during_clipboard_retry_sends_no_keys(monkeypatch):
+    """Astra probe: A is foreground when delivery checks. The clipboard is
+    busy, and during the retry the user switches to B. No keys go to B.
+    The dictation stays on the clipboard and the old clipboard is not put back.
+    """
+    import numpy as np
+    import flow
+    f = _flow(monkeypatch)
+    f.cfg["min_duration_s"] = 0
+    f.cfg["sticky_target"] = True
+    fg = {"v": 1}
+    clip = {"v": "OLD"}
+    copies = {"n": 0}
+
+    class Bridge:
+        def foreground(self):
+            return fg["v"]
+
+        def is_window(self, hwnd):
+            return True
+
+        def is_minimized(self, hwnd):
+            return False
+
+        def identity(self, hwnd):
+            if int(hwnd) == 1:
+                return {"hwnd": 1, "pid": 10, "tid": 20, "class_name": "EditA"}
+            return {"hwnd": 2, "pid": 30, "tid": 40, "class_name": "EditB"}
+
+    f.targets = Bridge()
+    keys = _record_keys(monkeypatch)
+    threads = _no_restore_threads(monkeypatch)
+
+    def copy(text):
+        copies["n"] += 1
+        if copies["n"] == 1:
+            raise RuntimeError("Error calling OpenClipboard")
+        clip["v"] = text
+
+    def sleep(s):
+        if copies["n"] >= 1 and fg["v"] == 1 and s and s < 0.2:
+            fg["v"] = 2
+
+    monkeypatch.setattr(flow.pyperclip, "copy", copy)
+    monkeypatch.setattr(flow.pyperclip, "paste", lambda: clip["v"])
+    monkeypatch.setattr(flow.time, "sleep", sleep)
+    monkeypatch.setattr(f, "mic_is_deaf", lambda _a: False)
+    monkeypatch.setattr(flow, "foreground_window", lambda: "A")
+    said = []
+    f.overlay = types.SimpleNamespace(set=lambda item: said.append(item))
+    restored = []
+    streamer = types.SimpleNamespace(
+        typed_len=0, stop=lambda: None, committed_text="",
+        committed_samples=0, saved_clip="OLD", clip_gen=1,
+        restore_clipboard=lambda *a, **k: restored.append("OLD"))
+    monkeypatch.setattr(
+        f, "transcribe_and_store", lambda *a, **k: ("Hello", {}))
+    f.process(
+        np.ones(32, dtype=np.float32), streamer=streamer,
+        take_hwnd={"hwnd": 1, "pid": 10, "tid": 20, "class_name": "EditA"})
+    assert copies["n"] >= 2
+    assert fg["v"] == 2
+    assert keys == []
+    assert clip["v"] == "Hello"
+    assert "restore" not in threads
+    assert restored == []
+    assert streamer.saved_clip is None
+    assert f._paste_retained is True
+    assert f.last_text == "Hello"
+    assert ("say", flow.SWITCHED_WINDOW) in said
+
+
+def test_switch_during_paste_settle_sends_no_keys(monkeypatch):
+    """A copy that lands on the first try still waits 20 ms. A switch in
+    that gap is checked after the wait, and no keys are sent.
+    """
+    import numpy as np
+    import flow
+    f = _flow(monkeypatch)
+    f.cfg["min_duration_s"] = 0
+    f.cfg["sticky_target"] = True
+    fg = {"v": 1}
+    clip = {"v": "OLD"}
+
+    class Bridge:
+        def foreground(self):
+            return fg["v"]
+
+        def is_window(self, hwnd):
+            return True
+
+        def is_minimized(self, hwnd):
+            return False
+
+        def identity(self, hwnd):
+            return {"hwnd": int(hwnd), "pid": 10, "tid": 20, "class_name": "EditA"}
+
+    f.targets = Bridge()
+    keys = _record_keys(monkeypatch)
+    threads = _no_restore_threads(monkeypatch)
+
+    def copy(text):
+        clip["v"] = text
+
+    def sleep(s):
+        if s == 0.02 and clip["v"] == "Hello" and fg["v"] == 1:
+            fg["v"] = 2
+
+    monkeypatch.setattr(flow.pyperclip, "copy", copy)
+    monkeypatch.setattr(flow.pyperclip, "paste", lambda: clip["v"])
+    monkeypatch.setattr(flow.time, "sleep", sleep)
+    monkeypatch.setattr(f, "mic_is_deaf", lambda _a: False)
+    monkeypatch.setattr(flow, "foreground_window", lambda: "A")
+    said = []
+    f.overlay = types.SimpleNamespace(set=lambda item: said.append(item))
+    streamer = types.SimpleNamespace(
+        typed_len=0, stop=lambda: None, committed_text="",
+        committed_samples=0, saved_clip="OLD", clip_gen=1,
+        restore_clipboard=lambda *a, **k: None)
+    monkeypatch.setattr(
+        f, "transcribe_and_store", lambda *a, **k: ("Hello", {}))
+    f.process(
+        np.ones(32, dtype=np.float32), streamer=streamer,
+        take_hwnd={"hwnd": 1, "pid": 10, "tid": 20, "class_name": "EditA"})
+    assert fg["v"] == 2
+    assert keys == []
+    assert clip["v"] == "Hello"
+    assert "restore" not in threads
+    assert f._paste_retained is True
+    assert ("say", flow.SWITCHED_WINDOW) in said
+
+
+def test_switch_before_typing_fallback_sends_no_keys(monkeypatch):
+    """Clipboard retries all fail. The user has switched, so the typing
+    fallback must not write into the new window.
+    """
+    import numpy as np
+    import flow
+    f = _flow(monkeypatch)
+    f.cfg["min_duration_s"] = 0
+    f.cfg["sticky_target"] = True
+    fg = {"v": 1}
+    clip = {"v": "OLD"}
+    copies = {"n": 0}
+
+    class Bridge:
+        def foreground(self):
+            return fg["v"]
+
+        def is_window(self, hwnd):
+            return True
+
+        def is_minimized(self, hwnd):
+            return False
+
+        def identity(self, hwnd):
+            return {"hwnd": 1, "pid": 10, "tid": 20, "class_name": "EditA"}
+
+    f.targets = Bridge()
+    keys = _record_keys(monkeypatch)
+
+    def copy(_text):
+        copies["n"] += 1
+        raise RuntimeError("Error calling OpenClipboard")
+
+    def sleep(_s):
+        if copies["n"] >= 1:
+            fg["v"] = 2
+
+    monkeypatch.setattr(flow.pyperclip, "copy", copy)
+    monkeypatch.setattr(flow.pyperclip, "paste", lambda: clip["v"])
+    monkeypatch.setattr(flow.time, "sleep", sleep)
+    monkeypatch.setattr(f, "mic_is_deaf", lambda _a: False)
+    monkeypatch.setattr(flow, "foreground_window", lambda: "A")
+    said = []
+    f.overlay = types.SimpleNamespace(set=lambda item: said.append(item))
+    monkeypatch.setattr(
+        f, "transcribe_and_store", lambda *a, **k: ("Hello", {}))
+    f.process(
+        np.ones(32, dtype=np.float32),
+        take_hwnd={"hwnd": 1, "pid": 10, "tid": 20, "class_name": "EditA"})
+    assert copies["n"] == 10
+    assert fg["v"] == 2
+    assert keys == []
+    assert clip["v"] == "OLD"
+    assert f.last_text == "Hello"
+    says = [item[1] for item in said
+            if isinstance(item, tuple) and item and item[0] == "say"]
+    assert flow.SWITCHED_WINDOW_UNCOPIED in says
+    assert all("copied" not in s.lower() for s in says)
+
+
+def test_client_mode_paste_last_is_ordinary_text(monkeypatch):
+    """Server cleanup can return a paste-last phrase. Client mode pastes
+    that phrase as ordinary text and does not replace it with the previous
+    dictation. Both the one-shot path and the streaming finish path.
+    """
+    import numpy as np
+    import flow
+    f = _flow(monkeypatch)
+    f.cfg["mode"] = "client"
+    f.cfg["min_duration_s"] = 0
+    f.last_text = "PREVIOUS"
+    pasted = []
+    monkeypatch.setattr(f, "_safe_paste", lambda *a, **k: pasted.append(a[0]) or 4)
+    monkeypatch.setattr(f, "mic_is_deaf", lambda _a: False)
+    monkeypatch.setattr(flow.time, "sleep", lambda _s: None)
+    said = []
+    f.overlay = types.SimpleNamespace(set=lambda item: said.append(item))
+    monkeypatch.setattr(
+        f, "client_transcribe", lambda *a, **k: "Paste my last message.")
+    f.process(np.ones(16, dtype=np.float32))
+    assert pasted == ["Paste my last message."]
+    assert f.last_text == "Paste my last message."
+
+    pasted.clear()
+    f.last_text = "PREVIOUS"
+    streamer = flow.ClientStreamer(f)
+    streamer.sid = "s"
+    streamer.finish = lambda: ("Paste my last message.", 0)
+    streamer.saved_clip = "OLD"
+    streamer.restore_clipboard = lambda *a, **k: None
+    f.process(np.ones(16, dtype=np.float32), streamer=streamer)
+    assert pasted == ["Paste my last message."]
+    assert f.last_text == "Paste my last message."
+    assert ("say", flow.PASTE_LAST_EMPTY) not in said
+
+    cfg = {"mode": "client"}
+    assert flow.match_paste_last("paste my last message", cfg) is False
+    assert flow.paste_last_held("paste my", cfg) is False
+    decision = flow.apply_paste_last(
+        "Paste my last message.", 0, "PREVIOUS", cfg)
+    assert decision["kind"] == "text"
+    assert decision["paste"] == "Paste my last message."
+    assert flow.match_paste_last(
+        "paste my last message", {"mode": "full"}) is True
+
+
+def test_recycled_hwnd_with_a_different_pid_copies():
+    """The same HWND number with a different process is a new window.
+
+    Delivery requires hwnd, pid, tid, class name, and IsWindow. Any miss
+    copies and does not paste.
+    """
+    import flow
+    bridge = _Win(fg=1, windows=[1])
+    bridge.identities = {
+        1: {"hwnd": 1, "pid": 99, "tid": 7, "class_name": "Edit"},
+    }
+    target = {"hwnd": 1, "pid": 10, "tid": 7, "class_name": "Edit"}
+    result, pasted, copied = _switch(bridge, target)
+    assert result["action"] == "copy"
+    assert result["pasted"] is False
+    assert result["message"] == flow.SWITCHED_WINDOW
+    assert pasted == []
+    assert copied == ["Hello"]
+
+    bridge.identities[1]["pid"] = 10
+    result, pasted, copied = _switch(bridge, target)
+    assert result["action"] == "current"
+    assert pasted == [1]
+    assert copied == []
+
+    bridge.windows.discard(1)
+    result, pasted, copied = _switch(bridge, target)
+    assert result["action"] == "copy"
+    assert pasted == []
+    assert copied == ["Hello"]
+
+    bridge.windows.add(1)
+    bridge.identities[1] = {
+        "hwnd": 1, "pid": 10, "tid": 8, "class_name": "Edit"}
+    result, pasted, copied = _switch(bridge, target)
+    assert result["action"] == "copy"
+    assert pasted == []
+
+    bridge.identities[1] = {
+        "hwnd": 1, "pid": 10, "tid": 7, "class_name": "Notepad"}
+    result, pasted, copied = _switch(bridge, target)
+    assert result["action"] == "copy"
+    assert pasted == []
+    assert copied == ["Hello"]
+
+
+def test_summary_sticky_copy_failure_does_not_say_copied(monkeypatch):
+    """Validation sees B. The user is back on A before the copy, and the
+    input guard asks to copy. A failed copy must not say the summary was
+    copied.
+    """
+    import numpy as np
+    import flow
+    f = _flow(monkeypatch)
+    f.cfg["min_duration_s"] = 0
+    f.cfg["sticky_target"] = True
+    fg = {"v": 22}
+    ticks = {"v": 1000}
+
+    class Bridge:
+        def foreground(self):
+            fg["v"] = 11
+            ticks["v"] = 5000
+            return 11
+
+        def is_window(self, hwnd):
+            return True
+
+        def is_minimized(self, hwnd):
+            return False
+
+        def identity(self, hwnd):
+            return {"hwnd": int(hwnd), "pid": 1, "tid": 2, "class_name": "Edit"}
+
+    f.targets = Bridge()
+    monkeypatch.setattr(flow, "foreground_hwnd", lambda: fg["v"])
+    monkeypatch.setattr(flow, "foreground_window", lambda: "Editor")
+    monkeypatch.setattr(flow, "wait_modifiers_up", lambda *a, **k: True)
+    monkeypatch.setattr(flow, "_last_input_tick", lambda: ticks["v"])
+    monkeypatch.setattr(flow, "_copy_clipboard", lambda text, expect_gen=None: False)
+    monkeypatch.setattr(flow.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(f, "mic_is_deaf", lambda _a: False)
+    monkeypatch.setattr(
+        f, "transcribe_and_store", lambda *a, **k: ("hello there friend", {}))
+    monkeypatch.setattr(flow, "llm_summarize", lambda *a, **k: "SHORT")
+    keys = _record_keys(monkeypatch)
+    said = []
+    f.overlay = types.SimpleNamespace(set=lambda item: said.append(item))
+    streamer = types.SimpleNamespace(
+        typed_len=0, stop=lambda: None, committed_text="",
+        committed_samples=0, saved_clip="OLD", clip_gen=1,
+        restore_clipboard=lambda *a, **k: None)
+    f.process(np.ones(32, dtype=np.float32), streamer=streamer, summary=True,
+              take_hwnd=11, input_tick=1000)
+    says = [item[1] for item in said
+            if isinstance(item, tuple) and item and item[0] == "say"]
+    assert flow.SWITCHED_WINDOW_UNCOPIED in says
+    assert all("copied" not in s.lower() for s in says)
+    assert f.last_text == "SHORT"
+    assert keys == []
+
+
+def test_summary_guard_copy_failure_message_is_not_copied():
+    import flow
+    bridge = _Win(fg=1)
+    result, pasted, copied = _switch(
+        bridge, {"hwnd": 1}, copy_ok=False,
+        on_current=lambda: ("copy", "Summary copied"))
+    assert result["copied"] is False
+    assert result["message"] == flow.SWITCHED_WINDOW_UNCOPIED
+    assert "copied" not in result["message"].lower()
+    assert pasted == []
+    assert copied == ["Hello"]

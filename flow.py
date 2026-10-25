@@ -641,12 +641,24 @@ def normalize_voice_phrase(text):
     return " ".join("".join(kept).split())
 
 
+def _paste_last_active(cfg):
+    """False in client mode. The server transcript is ordinary text there.
+
+    Cleanup on the server can turn filler into a paste-last phrase. The
+    client has no pre-cleanup text, so it does not run the command.
+    """
+    return not (isinstance(cfg, dict) and cfg.get("mode") == "client")
+
+
 def match_paste_last(text, cfg=None):
     """True when the whole transcript is a paste-last command.
 
     The comparison is the normalized transcript against a normalized phrase.
     A longer sentence that only contains the phrase is not a command.
+    Client mode never matches: the transcript is ordinary text.
     """
+    if not _paste_last_active(cfg):
+        return False
     norm = normalize_voice_phrase(text)
     if not norm:
         return False
@@ -662,7 +674,10 @@ def paste_last_held(text, cfg=None):
     sentence is ordinary text and may be typed. Holding the prefix is what
     keeps a short command off the screen. If any of it was typed anyway,
     the finished take is ordinary text — see apply_paste_last.
+    Client mode does not hold. The words are typed like any other text.
     """
+    if not _paste_last_active(cfg):
+        return False
     words = normalize_voice_phrase(text).split()
     if not words:
         return False
@@ -2007,8 +2022,9 @@ def focused_control_hwnd():
         return 0
 
 
-# Copy-on-switch. Paste captures one foreground HWND at press. It does not
-# read the focused control and it does not move focus.
+# Copy-on-switch. Paste captures the foreground identity at press: hwnd,
+# process id, thread id, and window class. It does not read the focused
+# control and it does not move focus.
 SWITCHED_WINDOW = "You switched windows — press Ctrl+V to paste"
 SWITCHED_WINDOW_UNCOPIED = "Text saved — use Copy last dictation"
 PASTE_LAST_EMPTY = "No dictation to paste yet"
@@ -2029,11 +2045,84 @@ def captured_hwnd(take_hwnd):
     """Foreground HWND captured at press.
 
     A pair left by an older build is (hwnd, focus). The focus half is
-    ignored. Paste does not capture the focused control.
+    ignored. Paste does not capture the focused control. A full identity
+    dict or a 4-tuple keeps the hwnd in the first field.
     """
+    if isinstance(take_hwnd, dict):
+        return int(take_hwnd.get("hwnd") or 0)
     if isinstance(take_hwnd, (tuple, list)):
         return int(take_hwnd[0] or 0) if take_hwnd else 0
     return int(take_hwnd or 0)
+
+
+def read_window_identity(hwnd):
+    """(hwnd, pid, tid, class name) for `hwnd`.
+
+    pid and tid come from one GetWindowThreadProcessId call. The class
+    name is GetClassNameW. A hwnd that cannot be read still returns the
+    number, with pid, tid and class left empty so delivery will not
+    treat it as the original window.
+    """
+    hwnd = int(hwnd or 0)
+    empty = {"hwnd": hwnd, "pid": 0, "tid": 0, "class_name": ""}
+    if hwnd <= 0:
+        empty["hwnd"] = 0
+        return empty
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        # Prototypes, not user32.*.argtypes: that would change the shared
+        # windll stubs other helpers already call.
+        get_tid = ctypes.WINFUNCTYPE(
+            wintypes.DWORD, wintypes.HWND, ctypes.POINTER(wintypes.DWORD))(
+            ("GetWindowThreadProcessId", user32))
+        get_class = ctypes.WINFUNCTYPE(
+            ctypes.c_int, wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)(
+            ("GetClassNameW", user32))
+        pid = wintypes.DWORD(0)
+        tid = int(get_tid(hwnd, ctypes.byref(pid)) or 0)
+        buf = ctypes.create_unicode_buffer(256)
+        n = int(get_class(hwnd, buf, 256) or 0)
+        return {
+            "hwnd": hwnd,
+            "pid": int(pid.value),
+            "tid": tid,
+            "class_name": buf.value if n else "",
+        }
+    except Exception:
+        return empty
+
+
+def normalize_paste_target(value):
+    """Identity dict used at delivery.
+
+    A full capture has hwnd, pid, tid and class_name. An int, or an older
+    (hwnd, focus) pair, is hwnd-only and does not invent a process id.
+    """
+    if isinstance(value, dict):
+        hwnd = int(value.get("hwnd") or 0)
+        if any(k in value for k in ("pid", "tid", "class_name")):
+            name = value.get("class_name")
+            return {
+                "hwnd": hwnd,
+                "pid": int(value.get("pid") or 0),
+                "tid": int(value.get("tid") or 0),
+                "class_name": "" if name is None else str(name),
+            }
+        return {"hwnd": hwnd}
+    if isinstance(value, (tuple, list)):
+        if len(value) >= 4:
+            name = value[3]
+            return {
+                "hwnd": int(value[0] or 0),
+                "pid": int(value[1] or 0),
+                "tid": int(value[2] or 0),
+                "class_name": "" if name is None else str(name),
+            }
+        hwnd = int(value[0] or 0) if value else 0
+        return {"hwnd": hwnd}
+    return {"hwnd": int(value or 0)}
 
 
 class TargetBridge:
@@ -2080,21 +2169,75 @@ class TargetBridge:
         except Exception:
             return False
 
+    def identity(self, hwnd):
+        """pid, tid and class name of `hwnd` right now."""
+        return read_window_identity(hwnd)
+
+
+def _identity_strict(target):
+    """True when press stored pid, tid and class, not only an hwnd."""
+    return all(k in (target or {}) for k in ("pid", "tid", "class_name"))
+
+
+def target_matches(target, bridge):
+    """True when the foreground is still the window captured at press.
+
+    No hwnd matches: the caller pastes as today. Hwnd-only captures match
+    the number and refuse a minimized window. A full identity also requires
+    IsWindow and the same pid, tid and class name. A recycled HWND fails
+    that check and the caller copies.
+    """
+    target = target or {}
+    hwnd = int(target.get("hwnd") or 0)
+    if not hwnd:
+        return True
+    try:
+        now = int(bridge.foreground() or 0)
+    except Exception:
+        return False
+    if now != hwnd:
+        return False
+    try:
+        if bridge.is_minimized(hwnd):
+            return False
+    except Exception:
+        return False
+    if not _identity_strict(target):
+        return True
+    try:
+        if not bridge.is_window(hwnd):
+            return False
+    except Exception:
+        return False
+    try:
+        live = bridge.identity(hwnd)
+    except Exception:
+        return False
+    if not isinstance(live, dict):
+        return False
+    return (
+        int(live.get("pid") or 0) == int(target.get("pid") or 0)
+        and int(live.get("tid") or 0) == int(target.get("tid") or 0)
+        and str(live.get("class_name") or "") == str(target.get("class_name") or "")
+    )
+
 
 def sticky_deliver(text, target, bridge, paste, copy, *,
                    enabled=True, on_current=None):
-    """Paste `text` into the foreground window captured at press, or copy it.
+    """Paste `text` into the window captured at press, or copy it.
 
-    Same foreground HWND, and that window is not minimized: call `paste`.
+    Same foreground identity, and that window is not minimized: call `paste`.
     A different tab or field in that same window is not detectable.
-    Nothing extra happens.
+    Nothing extra happens. `paste` rechecks the identity after its own
+    clipboard retries, immediately before it injects keys.
 
-    A different foreground — the original was closed, minimized, or the user
-    switched — does not paste and does not move focus. A minimized window
-    copies even when its HWND number is still foreground. `copy` puts the
-    text on the clipboard.
+    A different foreground — the original was closed, minimized, recycled,
+    or the user switched — does not paste and does not move focus. A
+    minimized window copies even when its HWND number is still foreground.
+    `copy` puts the text on the clipboard.
     The overlay is SWITCHED_WINDOW when that copy lands, and
-    SWITCHED_WINDOW_UNCOPIED when it does not.
+    SWITCHED_WINDOW_UNCOPIED when it does not. A summary copy that fails
+    uses the same uncopied line, never a "copied" line.
 
     `on_current` runs only while the foreground still matches. Return
     "paste", or ("copy", message). Summary uses it for modifiers and for
@@ -2116,29 +2259,38 @@ def sticky_deliver(text, target, bridge, paste, copy, *,
             "generation": None,
         }
 
+    def _from_paste(produced):
+        # paste() rechecked after the clipboard work. A switch in that gap
+        # already left the text on the clipboard, or copied nothing.
+        if (isinstance(produced, tuple) and len(produced) == 2
+                and produced[0] == "switched"):
+            copied_ok = bool(produced[1])
+            message = (SWITCHED_WINDOW if copied_ok
+                       else SWITCHED_WINDOW_UNCOPIED)
+            return _copied(message, copied_ok)
+        return _current(produced)
+
     if not enabled:
-        return _current(paste())
+        return _from_paste(paste())
     hwnd = int((target or {}).get("hwnd") or 0)
     if not hwnd:
-        return _current(paste())
-    now = int(bridge.foreground() or 0)
-    # A matching foreground is the window the user still has in front, so
-    # paste as today. IsIconic is the extra check: a minimized window is not
-    # a safe paste target even if the HWND number still matches. A closed
-    # window is no longer foreground, and that difference copies below.
-    minimized = False
-    if now == hwnd:
-        try:
-            minimized = bool(bridge.is_minimized(hwnd))
-        except Exception:
-            minimized = True
-    if now == hwnd and not minimized:
+        return _from_paste(paste())
+    # Hwnd, pid, tid and class, plus IsWindow. A minimized window is not a
+    # safe paste target even when the HWND number still matches. A recycled
+    # HWND fails the pid check and copies below.
+    if target_matches(target, bridge):
         if on_current is not None:
             decision = on_current()
             if decision != "paste":
                 _kind, message = decision
-                return _copied(message, copy())
-        return _current(paste())
+                try:
+                    copied_ok = copy()
+                except Exception:
+                    copied_ok = False
+                if not copied_ok:
+                    message = SWITCHED_WINDOW_UNCOPIED
+                return _copied(message, copied_ok)
+        return _from_paste(paste())
     try:
         copied = copy()
     except Exception:
@@ -2522,15 +2674,38 @@ def _copy_clipboard(text, expect_gen=None):
     return False
 
 
-def paste_text(text, mode, restore=True):
+def _injection_allowed(confirm):
+    """False when the foreground is no longer the captured window.
+
+    A confirm that raises is a mismatch: do not inject into an unknown
+    window.
+    """
+    if confirm is None:
+        return True
+    try:
+        return bool(confirm())
+    except Exception:
+        return False
+
+
+def paste_text(text, mode, restore=True, confirm=None):
     """Paste `text`. Returns the clipboard generation this write produced.
 
     The generation is the value `_copy_clipboard` captured in the same lock
     as the copy. Callers that restore afterwards pass it back. A typed paste
     and a failed copy return None.
+
+    `confirm` runs immediately before any key injection. That is after the
+    clipboard copy, including its retries, and after the 20 ms settle, and
+    again before the typing fallback. False means the foreground changed:
+    no keys are sent. A copy that already landed stays on the clipboard
+    and the previous clipboard is not restored. The return is
+    ``("switched", copied)``.
     """
     print(f"[paste] mode={mode} target window: {foreground_window()!r}")
     if mode == "type":
+        if not _injection_allowed(confirm):
+            return ("switched", False)
         keyboard.write(text)
         return None
     old = None
@@ -2543,11 +2718,20 @@ def paste_text(text, mode, restore=True):
     if not written:
         # The transcript still has to land at the cursor. Typing is slower
         # but it does not depend on the clipboard. keyboard.write turns a
-        # newline into Enter, which would send the message.
+        # newline into Enter, which would send the message. A window change
+        # during the retries skips that typing and leaves the keys unsent.
+        if not _injection_allowed(confirm):
+            print("[paste] foreground changed; not typing into the new window")
+            return ("switched", False)
         print("[paste] clipboard unavailable; typing the dictation instead")
         keyboard.write(text.replace("\r\n", " ").replace("\n", " ").replace("\r", " "))
         return None
     time.sleep(0.02)
+    if not _injection_allowed(confirm):
+        # The copy, including any retry, and the settle, are done. The
+        # text stays where it was copied. Do not ctrl+v and do not restore.
+        print("[paste] foreground changed; leaving the text on the clipboard")
+        return ("switched", True)
     keyboard.press("ctrl")
     keyboard.press("v")
     time.sleep(0.03)
@@ -2585,7 +2769,8 @@ class Flow:
         self._latch_owner = None   # "local" while a local take owns the gesture
         self._latch_pending = None # committed with recording=True, under the lock
         self._take_hwnd = 0        # foreground window when the take opened
-        self._paste_target = None  # hwnd the open job pastes into
+        self._take_identity = {"hwnd": 0}
+        self._paste_target = None  # identity the open job pastes into
         self._paste_on_current = None
         self._paste_retained = False  # copy-on-switch left text for Ctrl+V
         self._input_tick = None    # GetLastInputInfo after our own injections
@@ -2967,12 +3152,13 @@ class Flow:
                 rewrite_capture = None
             if rewrite and release_hwnd is None:
                 release_hwnd = int(foreground_hwnd() or 0)
-            hwnd = captured_hwnd(take_hwnd)
+            target = normalize_paste_target(take_hwnd)
             # release_hwnd stays last so a queued rewrite can still read it
-            # from the end of the tuple.
+            # from the end of the tuple. `target` is the press identity:
+            # hwnd, or hwnd plus pid, tid and class.
             self._job_q.put(("dictate", (
                 audio, streamer, released_at, summary, rewrite,
-                full_samples, discarded, committed_at_release, hwnd,
+                full_samples, discarded, committed_at_release, target,
                 input_tick, rewrite_capture, release_hwnd)))
 
     def _job_loop(self):
@@ -3124,8 +3310,10 @@ class Flow:
                     self.rewrite_take = False
                     self.latched = False
                     self._latched_shown = None
-                    # One GetForegroundWindow. The focused control is not read.
+                    # One GetForegroundWindow, then pid, tid and class for that
+                    # hwnd. The focused control is not read.
                     self._take_hwnd = foreground_hwnd()
+                    self._take_identity = read_window_identity(self._take_hwnd)
                     pending = getattr(self, "_latch_pending", None)
                     self._latch_pending = None
                     if (mode == "dictate" and pending
@@ -3330,7 +3518,9 @@ class Flow:
             summary = getattr(self, "summary_take", False)
             rewrite = getattr(self, "rewrite_take", False)
             mode = self.active_mode
-            hwnd = getattr(self, "_take_hwnd", 0) or 0
+            hwnd = getattr(self, "_take_identity", None)
+            if not isinstance(hwnd, dict):
+                hwnd = {"hwnd": int(getattr(self, "_take_hwnd", 0) or 0)}
             self.recording = False
             self._record_started_at = None
             self._clear_owner_on_release(key)
@@ -3557,7 +3747,16 @@ class Flow:
         bridge = getattr(self, "targets", None) or TargetBridge()
 
         def paste():
-            return paste_text(text, mode, restore=restore)
+            def confirm():
+                # Flag off, or no captured hwnd: paste into whatever is
+                # in front. Otherwise the identity is checked again after
+                # the clipboard retries and the 20 ms settle.
+                if not sticky_enabled(self.cfg):
+                    return True
+                if not int((target or {}).get("hwnd") or 0):
+                    return True
+                return target_matches(target, bridge)
+            return paste_text(text, mode, restore=restore, confirm=confirm)
 
         def copy():
             return _copy_clipboard(text)
@@ -3866,8 +4065,9 @@ class Flow:
                 rewrite=False, full_samples=None, discarded=0,
                 committed_at_release=None, take_hwnd=0, input_tick=None,
                 rewrite_capture=None, release_hwnd=None):
-        take_hwnd = captured_hwnd(take_hwnd)
-        self._paste_target = {"hwnd": take_hwnd}
+        target = normalize_paste_target(take_hwnd)
+        take_hwnd = int(target.get("hwnd") or 0)
+        self._paste_target = target
         self._paste_on_current = None
         self._paste_retained = False
         stop = threading.Event()
@@ -4107,9 +4307,10 @@ class Flow:
                                             message = (result.get("message")
                                                        or SWITCHED_WINDOW)
                                         else:
-                                            message = (result.get("message")
-                                                       or ("Summary ready — use Copy "
-                                                           "last dictation"))
+                                            # A failed copy must not say the
+                                            # summary was copied. The text is
+                                            # in last_text for the tray.
+                                            message = SWITCHED_WINDOW_UNCOPIED
                                         if self.overlay:
                                             self.overlay.set(("say", message))
                                     text = ""

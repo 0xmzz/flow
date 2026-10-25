@@ -426,7 +426,7 @@ def test_paste_exception_keeps_last_text_and_the_thread(monkeypatch):
     monkeypatch.setattr(flow.Flow, "transcribe_and_store",
                         lambda self, audio, **kw: ("hello world", {}))
 
-    def boom(text, mode, restore=True):
+    def boom(text, mode, restore=True, confirm=None):
         assert f.last_text == "hello world", "remember the text before pasting"
         raise RuntimeError("Error calling OpenClipboard")
 
@@ -939,7 +939,7 @@ def test_replacement_error_still_pastes_and_stores(monkeypatch, tmp_path, capsys
         flow.Flow, "decode",
         lambda self, audio, **k: [types.SimpleNamespace(text="ship the report")])
     monkeypatch.setattr(flow, "paste_text",
-                        lambda text, mode, restore=True: pasted.append(text))
+                        lambda text, mode, restore=True, confirm=None: pasted.append(text))
 
     def boom(text, cfg):
         raise TypeError("bad replacement")
