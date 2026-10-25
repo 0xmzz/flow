@@ -3191,7 +3191,8 @@ def test_astra_r9_2_failed_summary_copy_keeps_the_text(monkeypatch):
     assert attempts["n"] == before + 10
     assert state["clip"] == "UNRELATED CLIPBOARD"
     assert f.last_text == "SHORTER"
-    assert ("say", "Summary ready — use Copy last dictation") in said
+    assert ("say", flow.SWITCHED_WINDOW_UNCOPIED) in said
+    assert ("say", "Summary ready — use Copy last dictation") not in said
     assert ("say", "Summary copied — window changed") not in said
     assert ("say", "Summary copied — paste to replace") not in said
     assert pasted == []
@@ -3493,57 +3494,32 @@ def test_paste_last_live_typed_phrase_is_not_a_command(monkeypatch):
 
 
 class _Win:
-    """Fake Win32 layer for sticky-target decisions."""
+    """Fake Win32 layer for copy-on-switch decisions."""
 
-    def __init__(self, fg, cls="", windows=None, minimized=None,
-                 length=0, sel=(0, 0), grow=True, accept_focus=True):
+    def __init__(self, fg, windows=None, minimized=None):
         self.fg = fg
-        self.cls = cls
-        self.windows = set(windows or [])
+        self.windows = set([fg] if windows is None else windows)
         self.minimized = set(minimized or [])
-        self.length = length
-        self.sel = sel
-        self.grow = grow
-        self.accept_focus = accept_focus
         self.forces = []
-        self.replaces = []
 
     def foreground(self):
         return self.fg
 
-    def class_name(self, hwnd):
-        return self.cls if hwnd else ""
-
     def is_window(self, hwnd):
-        return hwnd in self.windows
+        return int(hwnd or 0) in self.windows
 
     def is_minimized(self, hwnd):
-        return hwnd in self.minimized
+        return int(hwnd or 0) in self.minimized
 
-    def text_length(self, hwnd):
-        if hwnd not in self.windows and hwnd != 5:
-            return None
-        return self.length
+    def force_foreground(self, *args, **kwargs):
+        raise AssertionError("copy-on-switch must not move the foreground")
 
-    def selection_span(self, hwnd):
-        return self.sel
-
-    def replace_selection(self, hwnd, text):
-        self.replaces.append((hwnd, text))
-        if self.grow:
-            sel = max(0, self.sel[1] - self.sel[0])
-            self.length = self.length - sel + len(text)
-        return True
-
-    def force_foreground(self, hwnd, focus=0):
-        self.forces.append((hwnd, focus))
-        if not self.accept_focus:
-            return False
-        self.fg = hwnd
-        return True
+    def replace_selection(self, *args, **kwargs):
+        raise AssertionError("copy-on-switch must not write into a control")
 
 
-def _sticky(bridge, target, text="Hello", enabled=True, wait=None, on_current=None):
+def _switch(bridge, target, text="Hello", enabled=True, copy_ok=True,
+            on_current=None):
     import flow
     pasted = []
     copied = []
@@ -3554,174 +3530,367 @@ def _sticky(bridge, target, text="Hello", enabled=True, wait=None, on_current=No
 
     def copy():
         copied.append(text)
-        return True
+        return 3 if copy_ok else False
 
     result = flow.sticky_deliver(
         text, target, bridge, paste, copy,
-        enabled=enabled, on_current=on_current,
-        wait_modifiers=(lambda: True) if wait is None else wait,
-        settle=lambda: None)
+        enabled=enabled, on_current=on_current)
     return result, pasted, copied
 
 
-def test_sticky_same_window_pastes_as_today():
-    """Same HWND, including a different control: paste. Tabs are invisible."""
+def test_copy_on_switch_same_window_pastes_as_today():
+    """Same HWND pastes. A different tab in that window is not detectable."""
     import flow
-    bridge = _Win(fg=1, cls="Edit", windows=[1], length=2)
-    result, pasted, copied = _sticky(bridge, {"hwnd": 1, "focus": 99})
+    bridge = _Win(fg=1)
+    result, pasted, copied = _switch(bridge, {"hwnd": 1, "focus": 99})
     assert result["action"] == "current"
     assert result["pasted"] is True
-    assert pasted == [1]
-    assert copied == []
-    assert bridge.replaces == []
-    assert bridge.forces == []
-    assert flow.DEFAULTS["sticky_target"] is True
-    assert flow._STICKY_SETTLE_S == 0.06
-
-
-@pytest.mark.parametrize("cls", ["Edit", "RichEdit20W", "RICHEDIT50W"])
-def test_sticky_quiet_insert_succeeds_for_classic_edits(cls):
-    import flow
-    bridge = _Win(fg=2, cls=cls, windows=[1, 5], length=4, sel=(0, 0))
-    result, pasted, copied = _sticky(bridge, {"hwnd": 1, "focus": 5}, text="Hello")
-    assert result["action"] == "quiet"
-    assert result["pasted"] is True
-    assert pasted == []
-    assert copied == []
-    assert bridge.replaces == [(5, "Hello")]
-    assert bridge.forces == []
-    assert bridge.length == 9
-    assert flow.classic_edit_class(cls) is True
-    assert flow.classic_edit_class("Button") is False
-    assert flow.classic_edit_class("EDIT") is False
-
-
-def test_sticky_quiet_insert_accepts_an_equal_length_replacement():
-    """Replacing a selection of the same length keeps WM_GETTEXTLENGTH."""
-    bridge = _Win(fg=2, cls="Edit", windows=[1, 5], length=8, sel=(2, 6))
-    result, pasted, copied = _sticky(bridge, {"hwnd": 1, "focus": 5}, text="WXYZ")
-    assert result["action"] == "quiet"
-    assert pasted == []
-    assert copied == []
-    assert bridge.length == 8
-    assert bridge.forces == []
-
-
-def test_sticky_quiet_failure_falls_through_to_switch_back():
-    """Length did not move, so the edit ignored the message. Switch and paste."""
-    bridge = _Win(fg=2, cls="Edit", windows=[1, 5], length=4, grow=False)
-    result, pasted, copied = _sticky(bridge, {"hwnd": 1, "focus": 5}, text="Hello")
-    assert result["action"] == "switch"
-    assert result["pasted"] is True
-    assert bridge.replaces == [(5, "Hello")]
-    assert pasted == [1]
-    assert copied == []
-    assert bridge.forces[0] == (1, 5)
-    assert bridge.forces[-1] == (2, 0)
-    assert bridge.fg == 2
-
-
-def test_sticky_switch_back_pastes_then_restores_the_user_window():
-    """Non-edit control: no quiet insert. Focus, paste, settle, restore."""
-    waits = []
-    bridge = _Win(fg=8, cls="Chrome_RenderWidgetHostHWND", windows=[1])
-    result, pasted, copied = _sticky(
-        bridge, {"hwnd": 1, "focus": 5},
-        wait=lambda: waits.append(1) or True)
-    assert result["action"] == "switch"
     assert result["generation"] == 9
     assert pasted == [1]
     assert copied == []
-    assert bridge.replaces == []
-    assert waits == [1]
-    assert bridge.forces == [(1, 5), (8, 0)]
-    assert bridge.fg == 8
+    assert bridge.forces == []
+    assert flow.DEFAULTS["sticky_target"] is True
+    assert flow.SWITCHED_WINDOW == "You switched windows — press Ctrl+V to paste"
+    assert flow.SWITCHED_WINDOW_UNCOPIED == (
+        "Text saved — use Copy last dictation")
+    assert not hasattr(flow, "quiet_insert")
+    assert not hasattr(flow, "classic_edit_class")
+    assert not hasattr(flow.TargetBridge, "force_foreground")
+    assert not hasattr(flow.TargetBridge, "replace_selection")
 
 
-def test_sticky_focus_refusal_copies_and_does_not_paste():
+def test_copy_on_switch_different_window_copies_and_does_not_paste():
+    """A different foreground is copied. Nothing is typed or focused."""
     import flow
-    bridge = _Win(fg=8, cls="Button", windows=[1], accept_focus=False)
-    result, pasted, copied = _sticky(bridge, {"hwnd": 1, "focus": 5})
+    bridge = _Win(fg=8, windows=[1, 8])
+
+    def refuse():
+        raise AssertionError("a different window must not consult on_current")
+
+    result, pasted, copied = _switch(
+        bridge, {"hwnd": 1}, on_current=refuse)
     assert result["action"] == "copy"
     assert result["pasted"] is False
+    assert result["copied"] is True
+    assert result["message"] == flow.SWITCHED_WINDOW
     assert pasted == []
     assert copied == ["Hello"]
-    assert result["message"] == flow.STICKY_UNAVAILABLE
-    assert bridge.forces == [(1, 5)]
-    assert bridge.fg == 8
-
-
-def test_sticky_confirm_mismatch_copies_and_does_not_paste():
-    """SetForegroundWindow reported success but the foreground did not move."""
-    import flow
-
-    class _Lie(_Win):
-        def force_foreground(self, hwnd, focus=0):
-            self.forces.append((hwnd, focus))
-            return True
-
-    bridge = _Lie(fg=8, cls="Button", windows=[1])
-    result, pasted, copied = _sticky(bridge, {"hwnd": 1, "focus": 0})
-    assert result["action"] == "copy"
-    assert pasted == []
-    assert copied == ["Hello"]
-    assert result["message"] == flow.STICKY_UNAVAILABLE
-
-
-def test_sticky_modifier_timeout_copies_and_restores():
-    bridge = _Win(fg=8, cls="Button", windows=[1])
-    result, pasted, copied = _sticky(
-        bridge, {"hwnd": 1, "focus": 5}, wait=lambda: False)
-    assert result["action"] == "copy"
-    assert pasted == []
-    assert copied == ["Hello"]
-    assert bridge.forces[0] == (1, 5)
-    assert bridge.forces[-1] == (8, 0)
-    assert bridge.fg == 8
-
-
-def test_sticky_original_window_gone_or_minimized_copies_only():
-    import flow
-    gone = _Win(fg=8, cls="Edit", windows=[], length=1)
-    result, pasted, copied = _sticky(gone, {"hwnd": 1, "focus": 0})
-    assert result["action"] == "copy"
-    assert pasted == []
-    assert copied == ["Hello"]
-    assert gone.forces == []
-    assert gone.replaces == []
-    assert result["message"] == flow.STICKY_UNAVAILABLE
-
-    minimized = _Win(fg=8, cls="Button", windows=[1], minimized=[1])
-    result, pasted, copied = _sticky(minimized, {"hwnd": 1, "focus": 0})
-    assert result["action"] == "copy"
-    assert pasted == []
-    assert minimized.forces == []
-    assert result["message"] == flow.STICKY_UNAVAILABLE
-
-
-def test_sticky_off_pastes_into_whatever_is_foreground():
-    bridge = _Win(fg=8, cls="Edit", windows=[1])
-    result, pasted, copied = _sticky(
-        bridge, {"hwnd": 1, "focus": 5}, enabled=False)
-    assert result["action"] == "current"
-    assert pasted == [8]
-    assert copied == []
-    assert bridge.replaces == []
     assert bridge.forces == []
 
 
-def test_press_captures_focus_and_the_job_keeps_release_hwnd_last(monkeypatch):
+def test_copy_on_switch_copy_failure_keeps_the_text_message():
+    import flow
+    bridge = _Win(fg=8, windows=[1, 8])
+    result, pasted, copied = _switch(
+        bridge, {"hwnd": 1}, copy_ok=False)
+    assert result["action"] == "copy"
+    assert result["pasted"] is False
+    assert result["copied"] is False
+    assert result["message"] == flow.SWITCHED_WINDOW_UNCOPIED
+    assert pasted == []
+    assert copied == ["Hello"]
+
+
+def test_copy_on_switch_gone_or_minimized_window_copies():
+    """A closed window is no longer foreground. A minimized one copies too."""
+    import flow
+    gone = _Win(fg=8, windows=[])
+    result, pasted, copied = _switch(gone, {"hwnd": 1})
+    assert result["action"] == "copy"
+    assert result["message"] == flow.SWITCHED_WINDOW
+    assert pasted == []
+    assert copied == ["Hello"]
+    assert gone.forces == []
+
+    nowhere = _Win(fg=0, windows=[])
+    result, pasted, copied = _switch(nowhere, {"hwnd": 1})
+    assert result["action"] == "copy"
+    assert pasted == []
+    assert copied == ["Hello"]
+
+    minimized = _Win(fg=1, windows=[1], minimized=[1])
+    result, pasted, copied = _switch(minimized, {"hwnd": 1})
+    assert result["action"] == "copy"
+    assert result["message"] == flow.SWITCHED_WINDOW
+    assert pasted == []
+    assert copied == ["Hello"]
+    assert minimized.forces == []
+
+
+def test_copy_on_switch_off_pastes_into_whatever_is_foreground():
+    bridge = _Win(fg=8, windows=[1, 8])
+
+    def refuse():
+        raise AssertionError("flag off must not inspect the captured window")
+
+    result, pasted, copied = _switch(
+        bridge, {"hwnd": 1}, enabled=False, on_current=refuse)
+    assert result["action"] == "current"
+    assert pasted == [8]
+    assert copied == []
+    assert bridge.forces == []
+
+
+def test_copy_on_switch_without_a_captured_hwnd_pastes():
+    bridge = _Win(fg=8, windows=[])
+    result, pasted, copied = _switch(bridge, {"hwnd": 0})
+    assert result["action"] == "current"
+    assert pasted == [8]
+    assert copied == []
+
+
+def test_copy_on_switch_same_window_still_honours_summary_guards():
+    """Modifiers and a newer input tick still refuse a same-window summary."""
+    bridge = _Win(fg=1)
+    result, pasted, copied = _switch(
+        bridge, {"hwnd": 1}, on_current=lambda: ("copy", "Summary copied"))
+    assert result["action"] == "copy"
+    assert result["message"] == "Summary copied"
+    assert pasted == []
+    assert copied == ["Hello"]
+
+
+def _wire_paste(monkeypatch, f, bridge):
+    """Real paste path, with keyboard and clipboard injection recorded."""
+    import flow
+    monkeypatch.setattr(flow.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(f, "mic_is_deaf", lambda _a: False)
+    monkeypatch.setattr(flow, "foreground_window", lambda: "Editor")
+    monkeypatch.setattr(flow, "foreground_hwnd", lambda: bridge.fg)
+    sent = []
+    pasted = []
+    copied = []
+    monkeypatch.setattr(flow.keyboard, "send", lambda *a, **k: sent.append(a))
+    monkeypatch.setattr(
+        flow, "paste_text", lambda *a, **k: pasted.append(a[0]) or 4)
+    monkeypatch.setattr(
+        flow, "_copy_clipboard",
+        lambda text, expect_gen=None: copied.append(text) or 7)
+    f.targets = bridge
+    said = []
+    f.overlay = types.SimpleNamespace(set=lambda item: said.append(item))
+    return sent, pasted, copied, said
+
+
+def test_press_captures_only_the_foreground_hwnd(monkeypatch):
+    """One GetForegroundWindow at press. The focused control is not read."""
     import flow
     f = _flow(monkeypatch)
-    monkeypatch.setattr(flow, "foreground_hwnd", lambda: 11)
-    monkeypatch.setattr(flow, "focused_control_hwnd", lambda: 42)
+    calls = {"n": 0}
+
+    def fg():
+        calls["n"] += 1
+        return 11
+
+    def focus():
+        raise AssertionError("focused control must not be captured at press")
+
+    monkeypatch.setattr(flow, "foreground_hwnd", fg)
+    monkeypatch.setattr(flow, "focused_control_hwnd", focus)
     f.on_press("dictate", key="right ctrl")
+    assert calls["n"] == 1
     assert f._take_hwnd == 11
-    assert f._take_focus == 42
+    assert not hasattr(f, "_take_focus")
     f.on_release("right ctrl")
     kind, args = f._job_q.get_nowait()
     assert kind == "dictate"
-    assert args[8] == (11, 42)
+    assert args[8] == 11
+    assert not isinstance(args[8], tuple)
     assert args[-2] is None
-    hwnd, focus = flow.unpack_take_target(args[8])
-    assert (hwnd, focus) == (11, 42)
+    assert flow.captured_hwnd((11, 42)) == 11
+
+
+def test_final_paste_same_window_pastes_and_switched_window_copies(monkeypatch):
+    """Final paste uses the captured HWND. A switch copies and injects no keys."""
+    import numpy as np
+    import flow
+    f = _flow(monkeypatch)
+    f.cfg["min_duration_s"] = 0
+    f.cfg["sticky_target"] = True
+    bridge = _Win(fg=11)
+    sent, pasted, copied, said = _wire_paste(monkeypatch, f, bridge)
+    monkeypatch.setattr(
+        f, "transcribe_and_store", lambda *a, **k: ("Hello", {}))
+    audio = np.ones(32, dtype=np.float32)
+    restored = []
+    streamer = types.SimpleNamespace(
+        typed_len=0, stop=lambda: None, committed_text="",
+        committed_samples=0, saved_clip="USER CLIP", clip_gen=1,
+        restore_clipboard=lambda *a, **k: restored.append("USER CLIP"))
+    f.process(audio, streamer=streamer, take_hwnd=11)
+    assert pasted == ["Hello"]
+    assert copied == []
+    assert sent == []
+    assert ("say", flow.SWITCHED_WINDOW) not in said
+
+    bridge.fg = 22
+    bridge.windows.add(22)
+    pasted.clear()
+    copied.clear()
+    said.clear()
+    restored.clear()
+    streamer.saved_clip = "USER CLIP"
+    f.process(audio, streamer=streamer, take_hwnd=11)
+    assert pasted == []
+    assert sent == []
+    assert copied == ["Hello"]
+    assert ("say", flow.SWITCHED_WINDOW) in said
+    assert restored == []
+    assert streamer.saved_clip is None
+    assert f.last_text == "Hello"
+
+
+def test_final_paste_copy_failure_and_minimized_window(monkeypatch):
+    import numpy as np
+    import flow
+    f = _flow(monkeypatch)
+    f.cfg["min_duration_s"] = 0
+    f.cfg["sticky_target"] = True
+    bridge = _Win(fg=22, windows=[11, 22])
+    sent, pasted, copied, said = _wire_paste(monkeypatch, f, bridge)
+    monkeypatch.setattr(
+        flow, "_copy_clipboard", lambda text, expect_gen=None: False)
+    monkeypatch.setattr(
+        f, "transcribe_and_store", lambda *a, **k: ("Hello", {}))
+    audio = np.ones(32, dtype=np.float32)
+    f.process(audio, streamer=None, take_hwnd=11)
+    assert pasted == []
+    assert sent == []
+    assert ("say", flow.SWITCHED_WINDOW_UNCOPIED) in said
+    assert f.last_text == "Hello"
+
+    said.clear()
+    bridge.fg = 11
+    bridge.minimized.add(11)
+    monkeypatch.setattr(
+        flow, "_copy_clipboard",
+        lambda text, expect_gen=None: copied.append(text) or 7)
+    f.process(audio, streamer=None, take_hwnd=11)
+    assert pasted == []
+    assert sent == []
+    assert copied == ["Hello"]
+    assert ("say", flow.SWITCHED_WINDOW) in said
+
+
+def test_final_paste_flag_off_pastes_wherever_the_foreground_is(monkeypatch):
+    import numpy as np
+    import flow
+    f = _flow(monkeypatch)
+    f.cfg["min_duration_s"] = 0
+    f.cfg["sticky_target"] = False
+    bridge = _Win(fg=22, windows=[11, 22])
+    sent, pasted, copied, said = _wire_paste(monkeypatch, f, bridge)
+    monkeypatch.setattr(
+        f, "transcribe_and_store", lambda *a, **k: ("Hello", {}))
+    f.process(np.ones(32, dtype=np.float32), take_hwnd=11)
+    assert pasted == ["Hello"]
+    assert copied == []
+    assert sent == []
+    assert ("say", flow.SWITCHED_WINDOW) not in said
+
+
+def test_untyped_summary_switched_window_copies_and_does_not_paste(monkeypatch):
+    import numpy as np
+    import flow
+    f = _flow(monkeypatch)
+    f.cfg["min_duration_s"] = 0
+    f.cfg["sticky_target"] = True
+    bridge = _Win(fg=22, windows=[11, 22])
+    sent, pasted, copied, said = _wire_paste(monkeypatch, f, bridge)
+    monkeypatch.setattr(flow, "wait_modifiers_up", lambda *a, **k: True)
+    monkeypatch.setattr(flow, "_last_input_tick", lambda: 1000)
+    monkeypatch.setattr(
+        f, "transcribe_and_store", lambda *a, **k: ("hello there friend", {}))
+    monkeypatch.setattr(flow, "llm_summarize", lambda *a, **k: "SHORT")
+    streamer = types.SimpleNamespace(
+        typed_len=0, stop=lambda: None, committed_text="",
+        committed_samples=0, saved_clip="USER CLIP", clip_gen=1,
+        restore_clipboard=lambda *a, **k: copied.append("RESTORED"))
+    f.process(np.ones(32, dtype=np.float32), streamer=streamer, summary=True,
+              take_hwnd=11, input_tick=1000)
+    assert pasted == []
+    assert sent == []
+    assert copied == ["SHORT"]
+    assert ("say", flow.SWITCHED_WINDOW) in said
+    assert f.last_text == "SHORT"
+
+
+def _decoded_take(monkeypatch, heard, *, cleanup, last, cleaned_out):
+    """Run one local take whose decoder returns `heard`."""
+    import numpy as np
+    import flow
+    f = _flow(monkeypatch)
+    f.cfg["min_duration_s"] = 0
+    f.cfg["model"] = "fake"
+    f.cfg["device"] = "cpu"
+    f.cfg["vocab"] = []
+    f.cfg["replacements"] = {}
+    f.cfg["normalize_gain"] = False
+    f.cfg["trusted_devices"] = []
+    f.cfg["cleanup"] = {"enabled": cleanup, "mode": "all", "min_words": 1}
+    f.cfg["sticky_target"] = False
+    f.last_text = last
+    monkeypatch.setattr(flow.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(f, "mic_is_deaf", lambda _a: False)
+    monkeypatch.setattr(flow, "foreground_window", lambda: "Gmail - Inbox")
+    monkeypatch.setattr(flow, "foreground_hwnd", lambda: 11)
+    calls = []
+
+    def llm(text, cfg, window=None):
+        calls.append(text)
+        return cleaned_out
+
+    monkeypatch.setattr(flow, "llm_cleanup", llm)
+    f.decode = lambda *a, **k: [types.SimpleNamespace(text=heard)]
+    pasted = []
+    monkeypatch.setattr(f, "_safe_paste", lambda *a, **k: pasted.append(a[0]) or 4)
+    said = []
+    f.overlay = types.SimpleNamespace(set=lambda item: said.append(item))
+    rows = []
+
+    class _Store:
+        def add(self, raw, **kwargs):
+            rows.append((raw, dict(kwargs)))
+
+    f.store = _Store()
+    f.process(np.ones(32, dtype=np.float32), take_hwnd=11)
+    return f, pasted, rows, calls, said
+
+
+def test_paste_last_identity_is_fixed_before_cleanup(monkeypatch):
+    """Cleanup may turn filler into a command. That output is not a command.
+
+    A transcript that is already the command is decided before cleanup, so
+    cleanup is not called and cannot rewrite the command away.
+    """
+    f, pasted, rows, calls, _said = _decoded_take(
+        monkeypatch, "Um, paste my last message.",
+        cleanup=True, last="PREVIOUS", cleaned_out="Paste my last message.")
+    assert calls == ["Um, paste my last message."]
+    assert pasted == ["Paste my last message."]
+    assert f.last_text == "Paste my last message."
+    assert rows[0][0] == "Um, paste my last message."
+    assert rows[0][1]["cleaned"] == "Paste my last message."
+
+    f, pasted, rows, calls, _said = _decoded_take(
+        monkeypatch, "Paste my last message.",
+        cleanup=True, last="PREVIOUS",
+        cleaned_out="Totally different sentence now")
+    assert calls == []
+    assert pasted == ["PREVIOUS"]
+    assert f.last_text == "PREVIOUS"
+    assert rows[0][0] == "Paste my last message."
+    assert rows[0][1]["cleaned"] == "Paste my last message."
+
+
+def test_paste_last_does_not_overwrite_raw_history(monkeypatch):
+    """Scratch-that may leave a paste-last phrase. Raw stays the pre-scratch text."""
+    heard = "Delete this sentence. Scratch that. Paste my last message."
+    f, pasted, rows, calls, _said = _decoded_take(
+        monkeypatch, heard, cleanup=False, last="PREVIOUS", cleaned_out=heard)
+    assert calls == []
+    assert pasted == ["PREVIOUS"]
+    assert f.last_text == "PREVIOUS"
+    assert rows[0][0] == heard
+    assert rows[0][1]["cleaned"] == "Paste my last message."
+    assert rows[0][1]["source"] == "pc-hotkey"
