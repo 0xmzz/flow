@@ -4312,3 +4312,14 @@ def test_summary_guard_copy_failure_message_is_not_copied():
     assert "copied" not in result["message"].lower()
     assert pasted == []
     assert copied == ["Hello"]
+
+
+def test_failed_identity_query_copies_instead_of_matching():
+    """Zero pid/tid or an empty class (a failed query) never counts as a match."""
+    bridge = _Win(fg=1, windows=[1])
+    bridge.identities = {1: {"hwnd": 1, "pid": 0, "tid": 0, "class_name": ""}}
+    target = {"hwnd": 1, "pid": 0, "tid": 0, "class_name": ""}
+    result, pasted, copied = _switch(bridge, target)
+    assert result["action"] == "copy"
+    assert pasted == []
+    assert copied == ["Hello"]

@@ -2215,6 +2215,11 @@ def target_matches(target, bridge):
         return False
     if not isinstance(live, dict):
         return False
+    # A failed identity query reads as zeros / empty; two failures must not
+    # "match". Unknown identity copies instead of pasting.
+    if not (int(target.get("pid") or 0) and int(target.get("tid") or 0)
+            and target.get("class_name")):
+        return False
     return (
         int(live.get("pid") or 0) == int(target.get("pid") or 0)
         and int(live.get("tid") or 0) == int(target.get("tid") or 0)
