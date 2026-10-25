@@ -42,7 +42,10 @@ class StreamSession:
         self.flow = flow
         self.last_seen = time.time()
         self.partial_served = False
-        self.worker = StreamWorker(flow, live=False, source=self.source)
+        # Thin-client output is baseline. Voice edits ("scratch that") on
+        # this worker rewrite a prefix the client has already typed.
+        self.worker = StreamWorker(
+            flow, live=False, source=self.source, voice_edits=False)
         self.worker.start()
 
     def add_audio(self, raw):

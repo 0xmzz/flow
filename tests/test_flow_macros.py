@@ -1912,3 +1912,223 @@ def test_astra_r3_8_vscode_whole_line_is_a_selection(monkeypatch):
     text, _saved, problem = flow.capture_selection()
     assert problem is None
     assert text == "selected line\n"
+
+
+# --- Astra round-4 ----------------------------------------------------------
+
+
+def _selection_state(monkeypatch, flow, f, sleep=None):
+    """Clipboard, focus and tick doubles for a rewrite capture."""
+    state = {
+        "tick": 1000,
+        "clip": "previous",
+        "selection": "Selected words",
+        "hwnd": 11,
+        "focus": 5,
+    }
+    monkeypatch.setattr(flow, "wait_modifiers_up", lambda *a, **k: True)
+    monkeypatch.setattr(flow, "foreground_window", lambda: "Editor")
+    monkeypatch.setattr(flow, "_last_input_tick", lambda: state["tick"])
+    monkeypatch.setattr(flow, "foreground_hwnd", lambda: state["hwnd"])
+    monkeypatch.setattr(flow, "focused_control_hwnd", lambda: state["focus"])
+    monkeypatch.setattr(flow.pyperclip, "paste", lambda: state["clip"])
+    monkeypatch.setattr(flow.pyperclip, "copy", lambda text: state.__setitem__("clip", text))
+
+    def send(keys):
+        if keys == "ctrl+c":
+            state["tick"] += 50
+            state["clip"] = state["selection"]
+
+    monkeypatch.setattr(flow.keyboard, "send", send)
+    monkeypatch.setattr(flow.time, "sleep", sleep or (lambda _s: None))
+    return state
+
+
+def test_astra_r4_1_asr_selection_change_is_not_the_target(monkeypatch):
+    """Select A, release, then select B while ASR runs. Do not paste over B."""
+    import numpy as np
+    import flow
+    f = _flow(monkeypatch)
+    f.cfg["min_duration_s"] = 0
+    said, pasted = [], []
+    f.overlay = types.SimpleNamespace(set=lambda item: said.append(item))
+    monkeypatch.setattr(f, "_safe_paste", lambda *a, **k: pasted.append(a))
+    monkeypatch.setattr(f, "_restore_clip", lambda *a, **k: None)
+    monkeypatch.setattr(f, "mic_is_deaf", lambda _a: False)
+    state = _selection_state(monkeypatch, flow, f)
+    seen = {}
+
+    def transcribe(*_a, **_k):
+        state["selection"] = "Unrelated text"
+        state["tick"] += 10
+        return ("make it short", {})
+
+    def rewrite(_instruction, selection, _cfg):
+        seen["selection"] = selection
+        return "Brief."
+
+    monkeypatch.setattr(f, "transcribe_and_store", transcribe)
+    monkeypatch.setattr(flow, "llm_rewrite", rewrite)
+    f.process(np.ones(32, dtype=np.float32), rewrite=True, take_hwnd=11)
+    assert seen["selection"] == "Selected words"
+    assert pasted == []
+    assert state["selection"] == "Unrelated text"
+    assert state["clip"] == "Brief."
+    assert ("say", "Rewrite copied — selection changed") in said
+
+
+def test_astra_r4_1_move_during_verify_wait_does_not_paste(monkeypatch):
+    """A selection change during the verification copy's wait is not pasted over."""
+    import numpy as np
+    import flow
+    f = _flow(monkeypatch)
+    f.cfg["min_duration_s"] = 0
+    said, pasted = [], []
+    f.overlay = types.SimpleNamespace(set=lambda item: said.append(item))
+    monkeypatch.setattr(f, "_safe_paste", lambda *a, **k: pasted.append(a))
+    monkeypatch.setattr(f, "_restore_clip", lambda *a, **k: None)
+    monkeypatch.setattr(f, "mic_is_deaf", lambda _a: False)
+    sleeps = {"n": 0}
+
+    def sleep(s):
+        if s == 0.08:
+            sleeps["n"] += 1
+            if sleeps["n"] == 2:
+                state["selection"] = "Unrelated text"
+                state["focus"] = 77
+                state["tick"] += 25
+
+    state = _selection_state(monkeypatch, flow, f, sleep=sleep)
+    seen = {}
+
+    def rewrite(_instruction, selection, _cfg):
+        seen["selection"] = selection
+        return "Brief."
+
+    monkeypatch.setattr(f, "transcribe_and_store",
+                        lambda *_a, **_k: ("make it short", {}))
+    monkeypatch.setattr(flow, "llm_rewrite", rewrite)
+    f.process(np.ones(32, dtype=np.float32), rewrite=True, take_hwnd=11)
+    assert sleeps["n"] >= 2
+    assert seen["selection"] == "Selected words"
+    assert state["selection"] == "Unrelated text"
+    assert state["focus"] == 77
+    assert pasted == []
+    assert state["clip"] == "Brief."
+    assert ("say", "Rewrite copied — selection changed") in said
+
+
+def test_astra_r4_2_remote_session_scratch_stays_baseline(monkeypatch):
+    """Drop me. / Scratch that. Keep this. through session publish and client delta.
+
+    The thin-client screen stays the unedited text. A local hands-free
+    worker still applies scratch-that.
+    """
+    import flow
+    import streaming
+    f = _flow(monkeypatch)
+    pasted = []
+    monkeypatch.setattr(flow.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(flow.pyperclip, "copy", lambda text: pasted.append(text))
+    monkeypatch.setattr(flow.keyboard, "send", lambda *a, **k: None)
+
+    def quiet_start(self):
+        self._wake.clear()
+        self._active = True
+
+    monkeypatch.setattr(flow.StreamWorker, "start", quiet_start)
+    session = streaming.StreamSession(f, "phone")
+    assert session.worker.voice_edits is False
+    session.worker._commit_phrase("Drop me.", 160, [])
+    client = flow.ClientStreamer(f)
+    client.committed = session.add_audio(b"\x00\x00")
+    client._type_delta()
+    session.worker._commit_phrase("Scratch that. Keep this.", 160, [])
+    client.committed = session.add_audio(b"\x00\x00")
+    client._type_delta()
+    screen = "".join(p for p in pasted if isinstance(p, str))
+    assert screen == "Drop me. Scratch that. Keep this."
+    assert "Drop me.s." not in screen
+    assert client.committed[client.typed:] == ""
+
+    local = flow.StreamWorker(f, live=False)
+    local._active = True
+    assert local.voice_edits is True
+    local._commit_phrase("Drop me.", 160, [])
+    local._commit_phrase("Scratch that. Keep this.", 160, [])
+    assert local.committed_text == "Keep this."
+
+
+def test_astra_r4_3_stop_does_not_arm_the_next_short_take(monkeypatch):
+    """Taps 0.00-0.10 and 0.30-0.40 latch. Stop 0.45-0.46. 0.65-0.75 does not."""
+    import flow
+    f = _flow(monkeypatch)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(flow.time, "monotonic", lambda: clock["t"])
+
+    def tap(down_at, up_at):
+        clock["t"] = down_at
+        f._on_key(_ev("right ctrl", flow.keyboard.KEY_DOWN))
+        _play_ctrl(f)
+        clock["t"] = up_at
+        f._on_key(_ev("right ctrl", flow.keyboard.KEY_UP))
+        _play_ctrl(f)
+
+    tap(0.00, 0.10)
+    assert f.recording is False and f.latched is False
+    tap(0.30, 0.40)
+    assert f.latched is True and f.recording is True
+    tap(0.45, 0.46)
+    assert f.latched is False and f.recording is False
+    assert f._latch.get("prev_up_at") is None
+    assert f._latch.get("prev_press_s") is None
+    tap(0.65, 0.75)
+    assert f.latched is False
+    assert f.recording is False
+    assert f._latch.get("phase") == "idle"
+
+
+def test_astra_r4_4_older_restore_does_not_overwrite_a_retained_summary(monkeypatch):
+    """A rewrite's 0.6s restore must not replace a later copied summary."""
+    import numpy as np
+    import threading
+    import flow
+    f = _flow(monkeypatch)
+    f.cfg["min_duration_s"] = 0
+    said = []
+    f.overlay = types.SimpleNamespace(set=lambda item: said.append(item))
+    monkeypatch.setattr(f, "mic_is_deaf", lambda _a: False)
+    monkeypatch.setattr(flow.keyboard, "press", lambda *_a, **_k: None)
+    monkeypatch.setattr(flow.keyboard, "release", lambda *_a, **_k: None)
+    gate = threading.Event()
+
+    def sleep(s):
+        if s and s >= 0.5:
+            assert gate.wait(2)
+
+    state = _selection_state(monkeypatch, flow, f, sleep=sleep)
+    state["clip"] = "ORIGINAL"
+    monkeypatch.setattr(f, "transcribe_and_store",
+                        lambda *_a, **_k: ("be brief", {}))
+    monkeypatch.setattr(flow, "llm_rewrite", lambda *_a, **_k: "Brief.")
+    f.process(np.ones(32, dtype=np.float32), rewrite=True, take_hwnd=11)
+    assert state["clip"] == "Brief."
+
+    monkeypatch.setattr(f, "transcribe_and_store",
+                        lambda *_a, **_k: ("hello there friend", {}))
+    monkeypatch.setattr(flow, "llm_summarize", lambda *_a, **_k: "SUMMARY")
+    streamer = types.SimpleNamespace(
+        typed_len=5, typed_chars=5, stop=lambda: None,
+        committed_text="hello", committed_samples=0,
+        saved_clip="ORIGINAL",
+        restore_clipboard=lambda: state.__setitem__("clip", "RESTORED"))
+    f.process(np.ones(32, dtype=np.float32), streamer=streamer, summary=True,
+              take_hwnd=11, input_tick=state["tick"])
+    assert state["clip"] == "SUMMARY"
+    assert ("say", "Summary copied — paste to replace") in said
+    gate.set()
+    # Let the delayed restore observe the newer generation and return.
+    import time as time_mod
+    time_mod.sleep(0.2)
+    assert state["clip"] == "SUMMARY"
+    assert streamer.saved_clip is None
