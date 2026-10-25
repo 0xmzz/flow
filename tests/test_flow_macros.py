@@ -30,10 +30,13 @@ def _flow(monkeypatch, recording=False):
         "paste_mode": "clipboard",
         "server": {"token": "t"},
         "overlay": {"enabled": True, "hints": True},
+        # Product default is off. These tests opt in.
+        "rewrite": {"enabled": True},
     }
     f._pressed_keys = set()
     f._active_ptt_key = None
     f._take_key = None
+    f._owner_up_queued = None
     f._key_lock = threading.Lock()
     f._key_seen_at = {}
     f._os_up_streak = 0
@@ -508,6 +511,11 @@ def test_hints_default_on_and_only_the_plain_recording_shows_them():
     assert ctx == "→ Notepad"
     assert hint == flow._HINT_LINE
     assert "scratch that" in hint
+    assert "Alt rewrite" not in hint
+    assert flow.DEFAULTS["rewrite"] == {"enabled": False}
+    enabled_hint = flow.overlay_hint_line({"rewrite": {"enabled": True}})
+    assert "Alt rewrite" in enabled_hint
+    assert flow.rec_overlay(None, "→ Notepad", True, enabled_hint)[2] == enabled_hint
     assert flow.rec_overlay(None, "→ Notepad", False)[2] == ""
     assert flow.rec_overlay("summary", "", True)[2] == ""
     assert flow.rec_overlay("rewrite", "", True) == (
@@ -2765,3 +2773,218 @@ def test_astra_r7_5_early_rewrite_returns_restore_the_capture(monkeypatch):
               rewrite_capture=arm())
     assert state["clip"] == "ORIGINAL"
     assert captures["n"] == 0
+
+
+def test_astra_r8_1_disabled_alt_never_captures_a_selection(monkeypatch):
+    """Rewrite off: alt during a take does not capture or touch the clipboard.
+
+    Alt pressed first stays a command. The hint line drops Alt rewrite.
+    A rewrite=True job is also a no-op while the flag is off.
+    """
+    import numpy as np
+    import flow
+    assert flow.DEFAULTS["rewrite"]["enabled"] is False
+    assert "Alt rewrite" not in flow._HINT_LINE
+    f = _flow(monkeypatch)
+    f.cfg["rewrite"] = {"enabled": False}
+    f.cfg["min_duration_s"] = 0
+    clock = {"t": 20.0}
+    monkeypatch.setattr(flow.time, "monotonic", lambda: clock["t"])
+    said = []
+    f.overlay = types.SimpleNamespace(set=lambda item: said.append(item))
+    calls = {"n": 0}
+    writes = []
+
+    def capture():
+        calls["n"] += 1
+        raise AssertionError("capture_selection while rewrite is disabled")
+
+    def copy(*args, **kwargs):
+        writes.append(args)
+        raise AssertionError("clipboard write while rewrite is disabled")
+
+    monkeypatch.setattr(flow, "capture_selection", capture)
+    monkeypatch.setattr(flow, "_copy_clipboard", copy)
+    monkeypatch.setattr(flow.pyperclip, "copy", lambda text: writes.append(text))
+    monkeypatch.setattr(flow.pyperclip, "paste", lambda: "USER CLIPBOARD")
+    monkeypatch.setattr(flow, "paste_text", lambda *a, **k: None)
+    monkeypatch.setattr(flow, "foreground_window", lambda: "Editor")
+    monkeypatch.setattr(flow, "foreground_hwnd", lambda: 7)
+    monkeypatch.setattr(flow.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(f, "mic_is_deaf", lambda _a: False)
+    monkeypatch.setattr(f, "transcribe_and_store", lambda *a, **k: ("hello", {}))
+
+    def at(t, name, kind):
+        clock["t"] = t
+        f._on_key(_ev(name, kind))
+        _play_ctrl(f)
+
+    at(20.0, "right alt", flow.keyboard.KEY_DOWN)
+    assert f.recording is True
+    assert f.active_mode == "command"
+    assert f.rewrite_take is False
+    at(20.5, "right alt", flow.keyboard.KEY_UP)
+    assert f.recording is False
+    assert calls["n"] == 0
+
+    at(22.0, "right ctrl", flow.keyboard.KEY_DOWN)
+    assert f.recording is True
+    assert f.active_mode == "dictate"
+    assert f.rewrite_take is False
+    before = list(said)
+    for name in ("left alt", "right alt", "alt"):
+        clock["t"] += 0.05
+        f._on_key(_ev(name, flow.keyboard.KEY_DOWN))
+        assert _queued(f) == []
+        assert f.rewrite_take is False
+        assert said == before
+    f._enable_rewrite()
+    assert f.rewrite_take is False
+    assert said == before
+    assert calls["n"] == 0
+    assert writes == []
+    at(22.6, "right ctrl", flow.keyboard.KEY_UP)
+    assert f.recording is False
+    jobs = []
+    while True:
+        try:
+            jobs.append(f._job_q.get_nowait())
+        except queue.Empty:
+            break
+    assert [job[0] for job in jobs] == ["command", "dictate"]
+    assert jobs[1][1][4] is False
+    f.process(*jobs[1][1])
+    assert calls["n"] == 0
+    assert writes == []
+    f.process(np.ones(1600, dtype=np.float32), rewrite=True)
+    assert calls["n"] == 0
+    assert writes == []
+    assert f.rewrite_take is False
+
+
+def test_astra_r8_2_ctrl_down_between_handle_up_and_release_is_accepted(monkeypatch):
+    """Right ctrl down after _handle_up starts, before on_release, is queued.
+
+    The release marker stays until the alt claim is cleared, and both change
+    under the same lock. A lock release must not show the marker gone while
+    alt still owns the take.
+    """
+    import flow
+    f = _flow(monkeypatch)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(flow.time, "monotonic", lambda: clock["t"])
+
+    class _Watch:
+        def __init__(self):
+            self._inner = threading.Lock()
+            self.splits = []
+            self._before = (None, None)
+
+        def __enter__(self):
+            self._inner.acquire()
+            self._before = (
+                getattr(f, "_take_key", None),
+                getattr(f, "_owner_up_queued", None),
+            )
+            return self
+
+        def __exit__(self, *exc):
+            take = getattr(f, "_take_key", None)
+            marker = getattr(f, "_owner_up_queued", None)
+            _before_take, before_marker = self._before
+            if before_marker == "right alt" and marker is None and take == "right alt":
+                self.splits.append((before_marker, take, marker))
+            self._inner.release()
+            return False
+
+    watch = _Watch()
+    f._key_lock = watch
+
+    def event(name, kind, t, drain=True):
+        clock["t"] = t
+        f._on_key(_ev(name, kind))
+        if drain:
+            _play_ctrl(f)
+
+    event("right alt", flow.keyboard.KEY_DOWN, 0.0)
+    assert f.recording is True
+    assert f._take_key == "right alt"
+    event("right alt", flow.keyboard.KEY_UP, 0.10, drain=False)
+    assert f._owner_up_queued == "right alt"
+    assert f._take_key == "right alt"
+    seen = {}
+    real = f.on_release
+
+    def release(key=None):
+        assert f._owner_up_queued == "right alt"
+        assert f._take_key == "right alt"
+        seen["marker_at_down"] = f._owner_up_queued
+        seen["owner_at_down"] = f._take_key
+        clock["t"] = 0.20
+        f._on_key(_ev("right ctrl", flow.keyboard.KEY_DOWN))
+        seen["queued"] = _queued(f)
+        f.on_release = real
+        real(key)
+
+    f.on_release = release
+    _play_ctrl(f)
+    assert ("down", "dictate", "right ctrl") in seen["queued"]
+    assert seen["marker_at_down"] == "right alt"
+    assert seen["owner_at_down"] == "right alt"
+    assert watch.splits == []
+    assert f.recording is True
+    assert f._take_key == "right ctrl"
+    assert f._owner_up_queued is None
+    event("right ctrl", flow.keyboard.KEY_UP, 0.80)
+    assert f.recording is False
+    assert f._take_key is None
+    assert f._owner_up_queued is None
+    assert watch.splits == []
+    kinds = []
+    while True:
+        try:
+            kinds.append(f._job_q.get_nowait()[0])
+        except queue.Empty:
+            break
+    assert kinds == ["command", "dictate"]
+
+
+def test_astra_r8_5_scratch_that_updates_stored_cleaned(monkeypatch):
+    """Scratch-that edits the stored cleaned text. raw stays the decoder text."""
+    import numpy as np
+    import flow
+    f = _flow(monkeypatch)
+    f.cfg["min_duration_s"] = 0
+    f.cfg["cleanup"] = {"enabled": False}
+    f.cfg["trusted_devices"] = ["android-bubble"]
+    f.cfg["model"] = "fake"
+    f.cfg["device"] = "cpu"
+    f.cfg["vocab"] = []
+    f.cfg["replacements"] = {}
+    heard = "Drop me. Scratch that. Keep this."
+    rows = []
+
+    def decode(_audio, beam_size=None, prompt=None, word_timestamps=False):
+        return [types.SimpleNamespace(text=heard)]
+
+    f.decode = decode
+
+    class _Store:
+        def add(self, raw, **kwargs):
+            rows.append((raw, dict(kwargs)))
+            return {"id": "row"}
+
+    f.store = _Store()
+    monkeypatch.setattr(f, "mic_is_deaf", lambda _a: False)
+    monkeypatch.setattr(flow, "foreground_window", lambda: "Editor")
+    monkeypatch.setattr(flow.time, "sleep", lambda _s: None)
+    pasted = []
+    monkeypatch.setattr(
+        flow, "paste_text",
+        lambda text, mode, restore=True: pasted.append(text))
+    f.process(np.ones(1600, dtype=np.float32))
+    assert len(rows) == 1
+    raw, kwargs = rows[0]
+    assert raw == heard
+    assert kwargs["cleaned"] == "Keep this."
+    assert pasted == ["Keep this."]

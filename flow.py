@@ -172,6 +172,9 @@ DEFAULTS = {
     # Bool still accepted (older config.json). hints is the third pill line.
     "overlay": {"enabled": True, "hints": True},
     "voice_edits": {"scratch": ["scratch that"]},
+    # Selection rewrite (alt during a take). Off: alt does not capture or
+    # touch the clipboard. The path stays; tests set enabled true.
+    "rewrite": {"enabled": False},
     "save_last_audio": False,      # debug: write each recording to last.wav for tuning
     # ASR tuning — the VAD gate is what drops quiet/whispered audio; keep it on
     # but permissive so whispers reach the decoder. (Verified via research pass.)
@@ -1436,12 +1439,13 @@ class Overlay:
     COLORS = {"rec": "#e0524d", "work": "#f0b428", "say": "#3ec97e",
               "live": "#4f8ee8"}
 
-    def __init__(self, level_fn=None, hints=True):
+    def __init__(self, level_fn=None, hints=True, hint_line=None):
         import queue
         self._q = queue.Queue()
         self._empty = queue.Empty
         self._level_fn = level_fn or (lambda: 0.0)
         self.hints = hints
+        self._hint_line = hint_line
         threading.Thread(target=self._run, daemon=True).start()
 
     def set(self, state):
@@ -1578,7 +1582,7 @@ class Overlay:
                                 s[1] if isinstance(s, tuple) and len(s) > 1
                                 else "")
                         status_text, ctx_text, hint_text = rec_overlay(
-                            flag, raw_ctx, self.hints)
+                            flag, raw_ctx, self.hints, self._hint_line)
                         status.config(text=status_text)
                         context.config(text=ctx_text)
                         if hint_text:
@@ -1923,9 +1927,30 @@ def _transcribing_label(elapsed):
     return f"Transcribing… ({whole}s)"
 
 
-_HINT_LINE = (
-    "⇧ to the point · Alt rewrite · double-tap hands-free · \"scratch that\""
-)
+def _rewrite_enabled(cfg):
+    """Selection rewrite is off unless this config opts in.
+
+    A missing block uses DEFAULTS, which ships disabled.
+    """
+    if not isinstance(cfg, dict):
+        cfg = DEFAULTS
+    block = cfg.get("rewrite")
+    if not isinstance(block, dict):
+        block = DEFAULTS.get("rewrite") or {}
+    return bool(block.get("enabled", False))
+
+
+def overlay_hint_line(cfg=None):
+    """Third pill line. 'Alt rewrite' is absent while rewrite is off."""
+    rewrite = "Alt rewrite · " if _rewrite_enabled(cfg) else ""
+    return (
+        "⇧ to the point · "
+        + rewrite
+        + "double-tap hands-free · \"scratch that\""
+    )
+
+
+_HINT_LINE = overlay_hint_line(None)
 
 
 def _overlay_flags(cfg):
@@ -1959,12 +1984,13 @@ def format_latched_context(seconds, words):
     return f"{format_elapsed(seconds)} · {n} {unit}"
 
 
-def rec_overlay(flag, context, hints_enabled):
+def rec_overlay(flag, context, hints_enabled, hint_line=None):
     """Status, context, hint for the recording pill.
 
     The hint is a plain hold-to-talk affordance. Summary, rewrite and
     hands-free already use the status line, so a third line there would
-    only crowd a narrow window.
+    only crowd a narrow window. `hint_line` None is the disabled default,
+    which does not mention Alt rewrite.
     """
     if flag == "summary":
         return ("Listening · to the point", "Summarizing when you let go", "")
@@ -1972,7 +1998,8 @@ def rec_overlay(flag, context, hints_enabled):
         return ("Listening · rewrite selection", "", "")
     if flag == "handsfree":
         return ("Hands-free · tap right ctrl to stop", context or "00:00", "")
-    return ("Listening", context or "", _HINT_LINE if hints_enabled else "")
+    line = _HINT_LINE if hint_line is None else hint_line
+    return ("Listening", context or "", line if hints_enabled else "")
 
 
 def latch_step(state, event, now):
@@ -2293,8 +2320,10 @@ class Flow:
         self._take_key = None  # key that owns the open take; its up may end it
         self._take_gen = 0     # generation of that claim; a later press bumps it
         self._owner_token = None  # (key, gen) of the current claim
-        # Owner key whose up is on the ctrl queue and not drained yet.
+        # Owner key whose up is queued and whose claim is not cleared yet.
         # An ordinary take treats that as released. A latch does not.
+        # The marker and the claim change together under _key_lock. Clearing
+        # the marker first rejects the next key in that window.
         self._owner_up_queued = None
         # Hook thread and the ctrl-loop watchdog both touch these. The lock is
         # held only for the set update — _on_key must stay non-blocking.
@@ -2330,7 +2359,8 @@ class Flow:
         self.tray = None
         _ov_on, _ov_hints = _overlay_flags(self.cfg)
         self.overlay = (Overlay(level_fn=lambda: self.recorder.level,
-                                hints=_ov_hints)
+                                hints=_ov_hints,
+                                hint_line=overlay_hint_line(self.cfg))
                         if _ov_on else None)
         self.model = None
         self.live_worker = None
@@ -2653,6 +2683,9 @@ class Flow:
         elif mode == "command":
             self._job_q.put(("command", (audio,)))
         else:
+            if rewrite and not _rewrite_enabled(self.cfg):
+                rewrite = False
+                rewrite_capture = None
             if rewrite and release_hwnd is None:
                 release_hwnd = int(foreground_hwnd() or 0)
             self._job_q.put(("dictate", (
@@ -2701,44 +2734,63 @@ class Flow:
         with lock:
             return _do()
 
+    def _clear_take_owner_locked(self, key, gen):
+        """Drop this claim and its release marker. Caller holds `_key_lock`.
+
+        A newer generation is left in place, marker included.
+        """
+        if getattr(self, "_take_key", None) != key:
+            return False
+        if getattr(self, "_take_gen", None) != gen:
+            return False
+        self._take_key = None
+        if getattr(self, "_owner_token", None) == (key, gen):
+            self._owner_token = None
+        if getattr(self, "_owner_up_queued", None) == key:
+            self._owner_up_queued = None
+        return True
+
     def _clear_take_owner(self, key, gen):
         """Drop this press's claim. A newer generation is left in place."""
         if key is None or gen is None:
             return False
         lock = getattr(self, "_key_lock", None)
-
-        def _do():
-            if getattr(self, "_take_key", None) != key:
-                return False
-            if getattr(self, "_take_gen", None) != gen:
-                return False
-            self._take_key = None
-            if getattr(self, "_owner_token", None) == (key, gen):
-                self._owner_token = None
-            return True
-
         if lock is None:
-            return _do()
+            return self._clear_take_owner_locked(key, gen)
         with lock:
-            return _do()
+            return self._clear_take_owner_locked(key, gen)
 
     def _clear_owner_on_release(self, key):
         """End ownership for this release without wiping a later press.
 
         Callers that do not know the key (watchdog, direct on_release) clear
         the open take. A keyed release clears only the claim it still owns.
+        The release marker stays until that claim is cleared. Both change
+        under `_key_lock`, so a down in this window still sees the marker.
         """
-        if key is None:
-            self._take_key = None
-            self._owner_token = None
-            return
-        token = getattr(self, "_owner_token", None)
-        if token is None:
-            if getattr(self, "_take_key", None) == key:
+        lock = getattr(self, "_key_lock", None)
+
+        def _do():
+            if key is None:
                 self._take_key = None
-            return
-        if token[0] == key:
-            self._clear_take_owner(token[0], token[1])
+                self._owner_token = None
+                self._owner_up_queued = None
+                return
+            token = getattr(self, "_owner_token", None)
+            if token is None:
+                if getattr(self, "_take_key", None) == key:
+                    self._take_key = None
+                    if getattr(self, "_owner_up_queued", None) == key:
+                        self._owner_up_queued = None
+                return
+            if token[0] == key:
+                self._clear_take_owner_locked(token[0], token[1])
+
+        if lock is None:
+            _do()
+        else:
+            with lock:
+                _do()
 
     def on_press(self, mode="dictate", key=None):
         stop_speech()
@@ -2901,8 +2953,11 @@ class Flow:
         open. Live typing stops so it cannot replace the selection. Alt
         pressed first stays whatever that key did before rewrite existed
         (command mode when it is the command hotkey). Client mode has no
-        rewrite. A press that arrives before recording is recording is ignored.
+        rewrite. Disabled rewrite ignores the key. A press that arrives
+        before recording is recording is ignored.
         """
+        if not _rewrite_enabled(self.cfg):
+            return
         if self.cfg.get("mode") == "client":
             print("[rewrite] ignored in client mode")
             return
@@ -3255,6 +3310,7 @@ class Flow:
     def _bind_rewrite_target(self):
         """Capture the rewrite target before transcription.
 
+        Disabled rewrite does not read or write the clipboard.
         Returns (target, abort_message). Modifiers must be up within 1.5s.
         If they are not, the rewrite is aborted with the existing message
         and nothing is copied from the selection. `target` holds the text,
@@ -3262,6 +3318,8 @@ class Flow:
         own write, and the hwnd, focus and input stamp taken after Flow's
         own Ctrl+C.
         """
+        if not _rewrite_enabled(self.cfg):
+            return None, None
         capture_selection.generation = None
         got = capture_selection()
         gen = getattr(capture_selection, "generation", None)
@@ -3310,6 +3368,7 @@ class Flow:
                            target=None):
         """Leave a rewrite on the clipboard. Never inserts it.
 
+        Disabled rewrite returns before any clipboard access.
         The selection is the capture in `target`, taken on the job worker
         before transcription. Direct callers capture here. Success leaves
         the rewritten text on the clipboard and the
@@ -3321,6 +3380,8 @@ class Flow:
         existing message. `retain`, when passed, collects the copied text
         so this job does not restore a streamer's clipboard over it.
         """
+        if not _rewrite_enabled(self.cfg):
+            return None
         saved = None
         saved_gen = None
         restore = False
@@ -3428,6 +3489,10 @@ class Flow:
                 # Generation the final paste wrote, captured with that write.
                 # Cleanup of a streamed take uses this, not an older clip_gen.
                 paste_gen = None
+                if rewrite and not _rewrite_enabled(self.cfg):
+                    # No capture, no sentinel write, no rewrite cleanup.
+                    rewrite = False
+                    rewrite_capture = None
                 if rewrite and rewrite_capture is not None:
                     (rewrite_target, rewrite_abort,
                      rewrite_saved, rewrite_gen) = self._bind_supplied_rewrite(
@@ -3518,6 +3583,11 @@ class Flow:
                     persist=False, full_samples=full_samples,
                     keep_audio=not discarded)
                 text, live_typed = self._apply_voice_edit(text, live_typed)
+                # Voice edits run after the row is built. Store what was
+                # pasted. raw stays the decoder text.
+                _pending = (meta or {}).get("pending") if meta else None
+                if isinstance(_pending, dict):
+                    _pending["cleaned"] = text
                 if rewrite:
                     if rewrite_abort or not rewrite_target:
                         if rewrite_abort and self.overlay:
@@ -4134,10 +4204,14 @@ class Flow:
             # Alt during an open server-mode dictation is rewrite, the same
             # way shift is summary. Alt pressed first is not rewritten into
             # a chord: it stays the command hotkey when that is how it is
-            # configured. Client mode has no rewrite.
+            # configured. Client mode has no rewrite. Disabled rewrite
+            # leaves the key alone: no mode change and no clipboard.
+            cfg = getattr(self, "cfg", None)
             if (down and name in _REWRITE_KEYS and recording
                     and active == "dictate"
-                    and self.cfg.get("mode") != "client"
+                    and isinstance(cfg, dict)
+                    and cfg.get("mode") != "client"
+                    and _rewrite_enabled(cfg)
                     and not getattr(self, "rewrite_take", False)
                     and not getattr(self, "summary_take", False)):
                 self._ctrl_q.put(("rewrite", None))
@@ -4371,26 +4445,12 @@ class Flow:
             return False
         return getattr(self, "_owner_up_queued", None) == owner
 
-    def _drop_queued_owner_release(self, key):
-        """This up is being drained. It no longer releases the next key."""
-        lock = getattr(self, "_key_lock", None)
-
-        def _do():
-            if key is not None and getattr(self, "_owner_up_queued", None) == key:
-                self._owner_up_queued = None
-
-        if lock is None:
-            _do()
-        else:
-            with lock:
-                _do()
-
     def _handle_up(self, mode, when, key=None):
         """Key-up from the ctrl loop.
 
         Client mode is the pre-latch hotkey: down starts, up ends.
+        The release marker stays set until on_release clears the claim.
         """
-        self._drop_queued_owner_release(key)
         if mode == "dictate" and self.cfg.get("mode") != "client":
             self._latch_event("up", when, key=key)
         elif key is None:
