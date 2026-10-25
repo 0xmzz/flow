@@ -2539,9 +2539,11 @@ def test_astra_r6_3_failed_start_clears_only_that_press(monkeypatch):
 
 
 def test_astra_r6_4_queued_rewrite_uses_the_release_selection(monkeypatch):
-    """Capture runs when the job is submitted, not when it later starts.
+    """The ctrl thread records the release HWND and does not capture.
 
-    A at release, then B selected while the job waits: the model sees A.
+    Capture runs on the job worker, with the other clipboard transactions.
+    The same window rewrites whatever is selected when that job captures.
+    A different foreground window cancels and leaves the clipboard alone.
     """
     import numpy as np
     import flow
@@ -2549,15 +2551,30 @@ def test_astra_r6_4_queued_rewrite_uses_the_release_selection(monkeypatch):
     f.cfg["min_duration_s"] = 0
     monkeypatch.setattr(f, "mic_is_deaf", lambda _a: False)
     state = _selection_state(monkeypatch, flow, f)
+    state["hwnd"] = 11
     state["selection"] = "A at release"
+    state["clip"] = "ORIGINAL"
+    said = []
+    f.overlay = types.SimpleNamespace(set=lambda item: said.append(item))
     calls = {"n": 0}
+    waits = {"n": 0}
+    phase = {"at": "submit"}
     real = flow.capture_selection
 
     def wrapped():
+        if phase["at"] == "submit":
+            raise AssertionError("control thread captured the selection")
         calls["n"] += 1
         return real()
 
+    def wait(*_a, **_k):
+        if phase["at"] == "submit":
+            raise AssertionError("control thread waited on modifiers")
+        waits["n"] += 1
+        return True
+
     monkeypatch.setattr(flow, "capture_selection", wrapped)
+    monkeypatch.setattr(flow, "wait_modifiers_up", wait)
     seen = []
     monkeypatch.setattr(f, "transcribe_and_store",
                         lambda *_a, **_k: ("be brief", {}))
@@ -2565,10 +2582,186 @@ def test_astra_r6_4_queued_rewrite_uses_the_release_selection(monkeypatch):
                         lambda _instruction, selection, _cfg: seen.append(selection) or "Brief.")
     f._submit_job("dictate", np.ones(32, dtype=np.float32), None, None,
                   rewrite=True)
-    assert calls["n"] == 1
-    state["selection"] = "B after release"
+    assert calls["n"] == 0
+    assert state["clip"] == "ORIGINAL"
     kind, args = f._job_q.get_nowait()
     assert kind == "dictate"
+    assert args[-2] is None
+    assert args[-1] == 11
+    phase["at"] = "job"
+    state["selection"] = "B after release"
     f.process(*args)
     assert calls["n"] == 1
-    assert seen == ["A at release"]
+    assert seen == ["B after release"]
+    assert state["clip"] == "Brief."
+
+    said.clear()
+    phase["at"] = "submit"
+    state["hwnd"] = 11
+    state["clip"] = "ORIGINAL"
+    state["selection"] = "A at release"
+    before = calls["n"]
+    f._submit_job("dictate", np.ones(32, dtype=np.float32), None, None,
+                  rewrite=True)
+    assert calls["n"] == before
+    assert state["clip"] == "ORIGINAL"
+    kind, args = f._job_q.get_nowait()
+    assert args[-1] == 11
+    phase["at"] = "job"
+    state["hwnd"] = 99
+    state["selection"] = "B after release"
+    waited = waits["n"]
+    f.process(*args)
+    assert calls["n"] == before
+    assert waits["n"] == waited
+    assert state["clip"] == "ORIGINAL"
+    assert seen == ["B after release"]
+    assert ("say", "Selection changed — rewrite cancelled") in said
+
+
+def test_astra_r7_3_queued_owner_release_accepts_the_next_key(monkeypatch):
+    """Alt up, then ctrl down/up, queued before the ctrl thread drains.
+
+    The observed release of an ordinary owner lets the next key through,
+    so both the command job and the dictation hold are queued. A latched
+    take still rejects a secondary key.
+    """
+    import flow
+    f = _flow(monkeypatch)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(flow.time, "monotonic", lambda: clock["t"])
+
+    def event(name, kind, t, drain=True):
+        clock["t"] = t
+        f._on_key(_ev(name, kind))
+        if drain:
+            _play_ctrl(f)
+
+    event("right alt", flow.keyboard.KEY_DOWN, 0.0)
+    assert f.recording is True
+    assert f.active_mode == "command"
+    assert f._take_key == "right alt"
+    assert f.latched is False
+    event("right alt", flow.keyboard.KEY_UP, 0.10, drain=False)
+    event("right ctrl", flow.keyboard.KEY_DOWN, 0.30, drain=False)
+    event("right ctrl", flow.keyboard.KEY_UP, 0.40, drain=False)
+    queued = _queued(f)
+    assert queued == [
+        ("up", "command", "right alt"),
+        ("down", "dictate", "right ctrl"),
+        ("up", "dictate", "right ctrl"),
+    ]
+    _play_ctrl(f)
+    kinds = []
+    while True:
+        try:
+            kinds.append(f._job_q.get_nowait()[0])
+        except queue.Empty:
+            break
+    assert kinds == ["command", "dictate"]
+    assert f.recording is False
+    assert f._take_key is None
+
+    event("right ctrl", flow.keyboard.KEY_DOWN, 2.00)
+    event("right ctrl", flow.keyboard.KEY_UP, 2.10)
+    event("right ctrl", flow.keyboard.KEY_DOWN, 2.30)
+    event("right ctrl", flow.keyboard.KEY_UP, 2.40)
+    assert f.recording is True
+    assert f.latched is True
+    assert f._take_key == "right ctrl"
+    assert f._job_q.qsize() == 1
+    event("right shift", flow.keyboard.KEY_DOWN, 2.50)
+    assert f.summary_take is True
+    event("right alt", flow.keyboard.KEY_DOWN, 2.55, drain=False)
+    event("right alt", flow.keyboard.KEY_UP, 2.60, drain=False)
+    assert _queued(f) == []
+    assert f.recording is True
+    assert f.latched is True
+    assert f.summary_take is True
+    assert f._take_key == "right ctrl"
+    assert f._job_q.qsize() == 1
+
+
+def test_astra_r7_4_streamed_tail_restores_the_original_clipboard(monkeypatch):
+    """Live 'Hello' plus the final ' world' puts the user's clipboard back."""
+    import numpy as np
+    import flow
+    f = _flow(monkeypatch)
+    f.cfg["min_duration_s"] = 0
+    f.cfg["paste_mode"] = "clipboard"
+    monkeypatch.setattr(f, "mic_is_deaf", lambda _a: False)
+    monkeypatch.setattr(flow.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(flow, "foreground_window", lambda: "Editor")
+    monkeypatch.setattr(flow.keyboard, "press", lambda *_a, **_k: None)
+    monkeypatch.setattr(flow.keyboard, "release", lambda *_a, **_k: None)
+    monkeypatch.setattr(flow.keyboard, "send", lambda *_a, **_k: None)
+    state = {"clip": "ORIGINAL"}
+    copied = []
+
+    def copy(text):
+        state["clip"] = text
+        copied.append(text)
+
+    monkeypatch.setattr(flow.pyperclip, "paste", lambda: state["clip"])
+    monkeypatch.setattr(flow.pyperclip, "copy", copy)
+    worker = flow.StreamWorker(f, live=True)
+    assert worker.saved_clip == "ORIGINAL"
+    worker._active = True
+    worker.committed_text = "Hello"
+    worker.typed_len = 0
+    worker.type_chunk()
+    assert state["clip"] == "Hello"
+    assert worker.typed_len == len("Hello")
+    monkeypatch.setattr(
+        f, "transcribe_and_store", lambda *_a, **_k: ("Hello world", {}))
+    f.process(np.ones(32, dtype=np.float32), streamer=worker,
+              committed_at_release=("Hello", 0))
+    assert " world" in copied
+    assert state["clip"] == "ORIGINAL"
+
+
+def test_astra_r7_5_early_rewrite_returns_restore_the_capture(monkeypatch):
+    """A supplied rewrite capture is restored on a short take and a deaf mic."""
+    import numpy as np
+    import flow
+    f = _flow(monkeypatch)
+    state = {"clip": "ORIGINAL"}
+    monkeypatch.setattr(flow.pyperclip, "paste", lambda: state["clip"])
+    monkeypatch.setattr(
+        flow.pyperclip, "copy", lambda text: state.__setitem__("clip", text))
+    monkeypatch.setattr(flow.time, "sleep", lambda _s: None)
+    captures = {"n": 0}
+
+    def capture():
+        captures["n"] += 1
+        raise AssertionError("early return must not capture")
+
+    monkeypatch.setattr(flow, "capture_selection", capture)
+
+    def arm():
+        gen = flow._copy_clipboard("SELECTED")
+        assert type(gen) is int
+        assert state["clip"] == "SELECTED"
+        return ({"text": "SELECTED", "saved": "ORIGINAL", "gen": gen}, None)
+
+    f.cfg["min_duration_s"] = 5
+    monkeypatch.setattr(f, "mic_is_deaf", lambda _a: False)
+    f.process(np.ones(16, dtype=np.float32), rewrite=True,
+              rewrite_capture=arm())
+    assert state["clip"] == "ORIGINAL"
+    assert captures["n"] == 0
+
+    f.cfg["min_duration_s"] = 0
+    monkeypatch.setattr(f, "mic_is_deaf", lambda _a: True)
+    f.process(np.ones(1600, dtype=np.float32), rewrite=True,
+              rewrite_capture=arm())
+    assert state["clip"] == "ORIGINAL"
+    assert captures["n"] == 0
+
+    monkeypatch.setattr(f, "mic_is_deaf", lambda _a: False)
+    monkeypatch.setattr(
+        f, "transcribe_and_store", lambda *_a, **_k: ("", {}))
+    f.process(np.ones(1600, dtype=np.float32), rewrite=True,
+              rewrite_capture=arm())
+    assert state["clip"] == "ORIGINAL"
+    assert captures["n"] == 0

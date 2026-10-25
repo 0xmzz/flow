@@ -1224,9 +1224,11 @@ class StreamWorker:
         """
         if not text:
             return
-        if not _copy_clipboard(text):
+        written = _copy_clipboard(text)
+        if not written:
             raise RuntimeError("clipboard copy failed")
-        self.clip_gen = _clipboard_generation()
+        self.clip_gen = (written if type(written) is int
+                         else _clipboard_generation())
         time.sleep(0.02)
         keyboard.send("ctrl+v")
 
@@ -1323,9 +1325,11 @@ class ClientStreamer:
         if not chunk:
             return
         try:
-            if not _copy_clipboard(chunk):
+            written = _copy_clipboard(chunk)
+            if not written:
                 raise RuntimeError("clipboard copy failed")
-            self.clip_gen = _clipboard_generation()
+            self.clip_gen = (written if type(written) is int
+                             else _clipboard_generation())
             time.sleep(0.02)
             keyboard.send("ctrl+v")  # user is already holding ctrl — paste is safe
             self.typed = len(self.committed)
@@ -2187,10 +2191,13 @@ def _clipboard_generation():
 
 
 def _copy_clipboard(text, expect_gen=None):
-    """Copy `text`, retrying on any failure. True on success, never raises.
+    """Copy `text`, retrying on any failure. Never raises.
 
+    Returns the clipboard generation after this write, taken under the same
+    lock as the copy. A restore of this write passes that value back.
     `expect_gen` is a delayed restore's generation. None skips the check.
     A newer write returns None and does not copy. False is a failed copy.
+    Callers that only need success can use the result as a boolean.
     """
     global _clip_gen
     last = None
@@ -2203,7 +2210,8 @@ def _copy_clipboard(text, expect_gen=None):
                     return None
                 pyperclip.copy(text)
                 _clip_gen += 1
-            return True
+                written = _clip_gen
+            return written
         except Exception as e:
             last = e
     print(f"[paste] clipboard copy failed after "
@@ -2212,23 +2220,30 @@ def _copy_clipboard(text, expect_gen=None):
 
 
 def paste_text(text, mode, restore=True):
+    """Paste `text`. Returns the clipboard generation this write produced.
+
+    The generation is the value `_copy_clipboard` captured in the same lock
+    as the copy. Callers that restore afterwards pass it back. A typed paste
+    and a failed copy return None.
+    """
     print(f"[paste] mode={mode} target window: {foreground_window()!r}")
     if mode == "type":
         keyboard.write(text)
-        return
+        return None
     old = None
     if restore:
         try:
             old = pyperclip.paste()
         except Exception:
             pass
-    if not _copy_clipboard(text):
+    written = _copy_clipboard(text)
+    if not written:
         # The transcript still has to land at the cursor. Typing is slower
         # but it does not depend on the clipboard. keyboard.write turns a
         # newline into Enter, which would send the message.
         print("[paste] clipboard unavailable; typing the dictation instead")
         keyboard.write(text.replace("\r\n", " ").replace("\n", " ").replace("\r", " "))
-        return
+        return None
     time.sleep(0.02)
     keyboard.press("ctrl")
     keyboard.press("v")
@@ -2237,7 +2252,7 @@ def paste_text(text, mode, restore=True):
     keyboard.release("ctrl")
     print("[paste] ctrl+v sent")
     if old is not None:
-        gen = _clipboard_generation()
+        gen = written if type(written) is int else _clipboard_generation()
 
         def restore(gen=gen):
             time.sleep(0.6)
@@ -2245,6 +2260,7 @@ def paste_text(text, mode, restore=True):
             if wrote is False:
                 print("[paste] could not restore the previous clipboard")
         threading.Thread(target=restore, daemon=True).start()
+    return written if type(written) is int else None
 
 
 class Flow:
@@ -2277,6 +2293,9 @@ class Flow:
         self._take_key = None  # key that owns the open take; its up may end it
         self._take_gen = 0     # generation of that claim; a later press bumps it
         self._owner_token = None  # (key, gen) of the current claim
+        # Owner key whose up is on the ctrl queue and not drained yet.
+        # An ordinary take treats that as released. A latch does not.
+        self._owner_up_queued = None
         # Hook thread and the ctrl-loop watchdog both touch these. The lock is
         # held only for the set update — _on_key must stay non-blocking.
         self._key_lock = threading.Lock()
@@ -2619,26 +2638,27 @@ class Flow:
     def _submit_job(self, mode, audio, streamer, hermes_context,
                     released_at=None, summary=False, rewrite=False,
                     full_samples=None, discarded=0, committed_at_release=None,
-                    take_hwnd=0, input_tick=None, rewrite_capture=None):
+                    take_hwnd=0, input_tick=None, rewrite_capture=None,
+                    release_hwnd=None):
         """Hand a finished take to the single worker. Press order is paste order.
 
-        A rewrite captures the selection here, on the ctrl thread at release,
-        after the same modifier wait capture_selection already performs.
-        The text, saved clipboard and generation ride on the job. process()
-        does not capture again, so a selection made while this job waits is
-        not the one the model sees.
+        A rewrite does not capture here. This runs on the ctrl thread, so it
+        only reads the foreground HWND. Capture waits on modifiers and the
+        clipboard, and process() does that on the job worker, one clipboard
+        transaction at a time. A window that is no longer in front cancels
+        the rewrite.
         """
         if mode == "hermes":
             self._job_q.put(("hermes", (audio, hermes_context)))
         elif mode == "command":
             self._job_q.put(("command", (audio,)))
         else:
-            if rewrite and rewrite_capture is None:
-                rewrite_capture = self._bind_rewrite_target()
+            if rewrite and release_hwnd is None:
+                release_hwnd = int(foreground_hwnd() or 0)
             self._job_q.put(("dictate", (
                 audio, streamer, released_at, summary, rewrite,
                 full_samples, discarded, committed_at_release, take_hwnd,
-                input_tick, rewrite_capture)))
+                input_tick, rewrite_capture, release_hwnd)))
 
     def _job_loop(self):
         while True:
@@ -3137,11 +3157,15 @@ class Flow:
             self.last_text = text
 
     def _safe_paste(self, text, mode, restore=True):
-        """Paste, but never let a clipboard/typing error kill this thread."""
+        """Paste, but never let a clipboard/typing error kill this thread.
+
+        Returns the clipboard generation `paste_text` wrote, or None when
+        nothing was written.
+        """
         if not text:
-            return
+            return None
         try:
-            paste_text(text, mode, restore=restore)
+            return paste_text(text, mode, restore=restore)
         except Exception as e:
             print(f"[paste] failed, dictation kept in memory: {e}")
             if self.overlay:
@@ -3149,6 +3173,7 @@ class Flow:
                     "say",
                     "Couldn't paste that dictation. "
                     "Tray menu: Copy last dictation."))
+            return None
 
     def _copy_last_dictation(self):
         text = getattr(self, "last_text", "") or ""
@@ -3263,13 +3288,31 @@ class Flow:
         captured["gen"] = gen
         return captured, None
 
+    def _bind_supplied_rewrite(self, rewrite_capture):
+        """Saved clipboard and generation from a capture already in hand.
+
+        No clipboard access and no waits. process() binds this before any
+        early return so a short take, a deaf mic, or an empty transcript
+        still puts the user's clipboard back.
+        """
+        target = None
+        abort = None
+        if isinstance(rewrite_capture, tuple) and len(rewrite_capture) == 2:
+            target, abort = rewrite_capture
+        saved = None
+        gen = None
+        if isinstance(target, dict) and not abort:
+            saved = target.get("saved")
+            gen = target.get("gen")
+        return target, abort, saved, gen
+
     def _rewrite_selection(self, instruction, take_hwnd=0, retain=None,
                            target=None):
         """Leave a rewrite on the clipboard. Never inserts it.
 
-        The selection is the sentinel copy taken at release, before
-        transcription, when `target` is passed. Direct callers capture
-        here. Success leaves the rewritten text on the clipboard and the
+        The selection is the capture in `target`, taken on the job worker
+        before transcription. Direct callers capture here. Success leaves
+        the rewritten text on the clipboard and the
         overlay tells the user to press Ctrl+V. There is no ctrl+v and no
         delayed restore. The user pastes, so `take_hwnd` is not checked.
 
@@ -3362,7 +3405,7 @@ class Flow:
     def process(self, audio, streamer=None, released_at=None, summary=False,
                 rewrite=False, full_samples=None, discarded=0,
                 committed_at_release=None, take_hwnd=0, input_tick=None,
-                rewrite_capture=None):
+                rewrite_capture=None, release_hwnd=None):
         stop = threading.Event()
         started = time.monotonic() if released_at is None else released_at
         watcher = threading.Thread(
@@ -3377,8 +3420,26 @@ class Flow:
                 # Clipboard saved by a rewrite capture, and the generation
                 # recorded right after that capture's own write. The finally
                 # restores only while that generation is still current.
+                # Bound before any early return when the capture was supplied.
                 rewrite_saved = None
                 rewrite_gen = None
+                rewrite_target = None
+                rewrite_abort = None
+                # Generation the final paste wrote, captured with that write.
+                # Cleanup of a streamed take uses this, not an older clip_gen.
+                paste_gen = None
+                if rewrite and rewrite_capture is not None:
+                    (rewrite_target, rewrite_abort,
+                     rewrite_saved, rewrite_gen) = self._bind_supplied_rewrite(
+                         rewrite_capture)
+
+                def _note_paste(payload, mode, restore):
+                    nonlocal paste_gen
+                    wrote = self._safe_paste(payload, mode, restore=restore)
+                    if type(wrote) is int:
+                        paste_gen = wrote
+                    return wrote
+
                 # Inside the try: whatever fails from here on, the finally
                 # stops the "Transcribing… (Ns)" ticker.
                 self.set_icon("work")
@@ -3401,11 +3462,11 @@ class Flow:
                         self._remember(text)
                         remainder = (text or "")[typed:]
                         if remainder:
-                            self._safe_paste(remainder, "clipboard",
-                                             restore=typed == 0)
+                            _note_paste(remainder, "clipboard", typed == 0)
                         if typed:
                             time.sleep(0.3)
-                            gen = getattr(streamer, "clip_gen", None)
+                            gen = (paste_gen if type(paste_gen) is int
+                                   else getattr(streamer, "clip_gen", None))
                             try:
                                 if gen is None:
                                     streamer.restore_clipboard()
@@ -3416,7 +3477,7 @@ class Flow:
                     else:
                         text = self.client_transcribe(audio, "/transcribe")
                         self._remember(text)
-                        self._safe_paste(text, self.cfg["paste_mode"])
+                        _note_paste(text, self.cfg["paste_mode"], True)
                     return
                 join_s = 0.0
                 if streamer:
@@ -3435,20 +3496,22 @@ class Flow:
                     committed = (streamer.committed_text, streamer.committed_samples)
                 else:
                     committed = ("", 0)
-                # Selection captured at release, before this job waited.
-                # Direct callers that did not capture yet still bind here.
-                # A later failure restores that clipboard from the finally.
-                rewrite_target = None
-                rewrite_abort = None
-                if rewrite:
-                    if rewrite_capture is None:
+                # Capture on this worker, in line with every other clipboard
+                # copy and paste. The ctrl thread only stored the foreground
+                # HWND at release. A different window cancels the rewrite
+                # and this job does not touch the clipboard. A capture that
+                # was already supplied is bound above, before any return.
+                if rewrite and rewrite_capture is None:
+                    now = int(foreground_hwnd() or 0)
+                    released = int(release_hwnd or 0)
+                    if released and now and released != now:
+                        rewrite_abort = (
+                            "Selection changed — rewrite cancelled")
+                    else:
                         rewrite_capture = self._bind_rewrite_target()
-                    if (isinstance(rewrite_capture, tuple)
-                            and len(rewrite_capture) == 2):
-                        rewrite_target, rewrite_abort = rewrite_capture
-                    if rewrite_target is not None and not rewrite_abort:
-                        rewrite_saved = rewrite_target.get("saved")
-                        rewrite_gen = rewrite_target.get("gen")
+                        (rewrite_target, rewrite_abort,
+                         rewrite_saved, rewrite_gen) = (
+                             self._bind_supplied_rewrite(rewrite_capture))
                 text, meta = self.transcribe_and_store(
                     audio, source="pc-hotkey", window=foreground_window(),
                     committed=committed, skip_cleanup=live_typed > 0,
@@ -3531,19 +3594,17 @@ class Flow:
                             # Part of the text is already on screen — flush the rest.
                             remainder = apply_replacements(
                                 text[live_typed:], self.cfg)
-                            self._safe_paste(remainder, "clipboard",
-                                             restore=False)
+                            _note_paste(remainder, "clipboard", False)
                         elif text:
-                            self._safe_paste(apply_replacements(text, self.cfg),
-                                             self.cfg["paste_mode"])
+                            _note_paste(apply_replacements(text, self.cfg),
+                                        self.cfg["paste_mode"], True)
                     except Exception as e:
                         print(f"[paste] replacements failed, pasting the "
                               f"transcript unchanged: {e}")
                         if text and live_typed:
-                            self._safe_paste(text[live_typed:], "clipboard",
-                                             restore=False)
+                            _note_paste(text[live_typed:], "clipboard", False)
                         elif text:
-                            self._safe_paste(text, self.cfg["paste_mode"])
+                            _note_paste(text, self.cfg["paste_mode"], True)
                     paste_s = time.monotonic() - p0
                     stages = {
                         "queue_wait": round(queue_s, 3),
@@ -3582,7 +3643,11 @@ class Flow:
                     else:
                         restore = getattr(streamer, "restore_clipboard", None)
                         if restore:
-                            gen = getattr(streamer, "clip_gen", None)
+                            # The final paste's generation, taken with that
+                            # write. Fall back to the streamer's own record
+                            # when this job did not paste a tail.
+                            gen = (paste_gen if type(paste_gen) is int
+                                   else getattr(streamer, "clip_gen", None))
                             try:
                                 if gen is None:
                                     restore()
@@ -3994,8 +4059,10 @@ class Flow:
             # A key that does not own the open take cannot adopt it. Its up
             # then has nothing to release. Right alt during a latched summary,
             # or a customized command key during a latch, stays a rejected
-            # secondary press.
-            if self._active_ptt_key is None and owner not in (None, name):
+            # secondary press. An ordinary take whose owner-up is already
+            # queued has released: the next key is accepted, as at 9762188.
+            if (self._active_ptt_key is None and owner not in (None, name)
+                    and not self._ordinary_owner_release_queued(name)):
                 pass
             elif self._active_ptt_key is None:
                 self._active_ptt_key = name
@@ -4025,9 +4092,14 @@ class Flow:
                 self._os_up_streak = 0
                 # Only the key that owns the take. A rejected secondary press
                 # that managed to sit in _active_ptt_key must not end it.
+                # The next key of an ordinary take whose owner-up is already
+                # queued is released too, or its down would have no up.
                 owner = getattr(self, "_take_key", None)
-                if owner in (None, name):
+                if (owner in (None, name)
+                        or self._ordinary_owner_release_queued(name)):
                     release = True
+                    if owner == name and not getattr(self, "latched", False):
+                        self._owner_up_queued = name
         if release:
             self._stamp_ptt(time.monotonic())
             self._ctrl_q.put(("up", mode, name))
@@ -4285,11 +4357,40 @@ class Flow:
                 self.streamer.live = False
         self._show_latched()
 
+    def _ordinary_owner_release_queued(self, name):
+        """True when an ordinary take's owner-up is queued and `name` is another key.
+
+        The ctrl thread has not drained that up, so `_take_key` still names
+        the owner. A latched take keeps its owner: the key is up on purpose.
+        Caller holds `_key_lock`.
+        """
+        if getattr(self, "latched", False):
+            return False
+        owner = getattr(self, "_take_key", None)
+        if owner in (None, name):
+            return False
+        return getattr(self, "_owner_up_queued", None) == owner
+
+    def _drop_queued_owner_release(self, key):
+        """This up is being drained. It no longer releases the next key."""
+        lock = getattr(self, "_key_lock", None)
+
+        def _do():
+            if key is not None and getattr(self, "_owner_up_queued", None) == key:
+                self._owner_up_queued = None
+
+        if lock is None:
+            _do()
+        else:
+            with lock:
+                _do()
+
     def _handle_up(self, mode, when, key=None):
         """Key-up from the ctrl loop.
 
         Client mode is the pre-latch hotkey: down starts, up ends.
         """
+        self._drop_queued_owner_release(key)
         if mode == "dictate" and self.cfg.get("mode") != "client":
             self._latch_event("up", when, key=key)
         elif key is None:
