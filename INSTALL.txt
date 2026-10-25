@@ -1,0 +1,24 @@
+Flow - local push-to-talk dictation (runs entirely on your PC, nothing goes online)
+
+Install
+  1. Unzip this folder (or git clone https://github.com/0xmzz/flow) anywhere.
+  2. Right-click install.ps1 -> "Run with PowerShell".
+     Optional: for automatic tidy-up of dictations (punctuation, filler words) via a
+     small local AI model, run instead in PowerShell from this folder:
+       powershell -ExecutionPolicy Bypass -File install.ps1 -Cleanup
+  3. Wait - first install downloads ~5-6 GB (CUDA libraries + speech model).
+
+Use
+  Hold F8, speak, release   -> text is typed wherever your cursor is.
+  F9                        -> toggle hands-free voice commands (say "flow, ..." first)
+  Hold Right Alt            -> one spoken command
+
+  Mic icon in the system tray = running (grey idle, red listening).
+  Starts automatically when you log in. Desktop shortcut "Flow" restarts it.
+
+Settings / troubleshooting
+  Folder:     %LOCALAPPDATA%\Flow
+  Settings:   config.json (hotkeys, "vocab" list for names it mishears)
+  Mic check:  %LOCALAPPDATA%\Flow\.venv\Scripts\python.exe flow.py --devices
+  Logs:       flow.log, data\flow-crash.log
+  Needs a recent NVIDIA driver.

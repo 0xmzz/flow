@@ -77,8 +77,20 @@ means the fast paths and workflows still work.
 
 ## Install
 
+One step, on Windows with an NVIDIA GPU (see `INSTALL.txt`):
+
 ```powershell
-git clone <repo> flow; cd flow
+git clone https://github.com/0xmzz/flow; cd flow
+powershell -ExecutionPolicy Bypass -File install.ps1   # add -Cleanup for local LLM tidy-up
+```
+
+It installs Python 3.12, the CUDA wheels and the speech model into
+`%LOCALAPPDATA%\Flow`, adds a desktop shortcut and autostart, and launches.
+
+Manual install:
+
+```powershell
+git clone https://github.com/0xmzz/flow; cd flow
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
 .venv\Scripts\python flow.py --setup
