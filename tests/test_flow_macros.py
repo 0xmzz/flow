@@ -2988,3 +2988,276 @@ def test_astra_r8_5_scratch_that_updates_stored_cleaned(monkeypatch):
     assert raw == heard
     assert kwargs["cleaned"] == "Keep this."
     assert pasted == ["Keep this."]
+
+
+# --- Astra round-9 ----------------------------------------------------------
+
+
+def test_astra_r9_1_watchdog_release_queues_the_next_key(monkeypatch):
+    """Right alt down and up during watchdog release of right ctrl are queued.
+
+    The owner-release marker is published in the same lock hold as the drop
+    and stays until that claim clears. The record cap does the same. A
+    latched watchdog disarm does not publish the marker and does not stop.
+    """
+    import flow
+    f = _flow(monkeypatch)
+    f.cfg["rewrite"] = {"enabled": False}
+    clock = {"t": 0.0}
+    monkeypatch.setattr(flow.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(flow, "_os_key_down", lambda vk: False)
+
+    class _Watch:
+        def __init__(self):
+            self._inner = threading.Lock()
+            self.splits = []
+            self._before_active = None
+
+        def __enter__(self):
+            self._inner.acquire()
+            self._before_active = getattr(f, "_active_ptt_key", None)
+            return self
+
+        def __exit__(self, *exc):
+            active = getattr(f, "_active_ptt_key", None)
+            marker = getattr(f, "_owner_up_queued", None)
+            take = getattr(f, "_take_key", None)
+            if (self._before_active == "right ctrl" and active is None
+                    and marker is None and take == "right ctrl"
+                    and not getattr(f, "latched", False)):
+                self.splits.append((self._before_active, active, marker, take))
+            self._inner.release()
+            return False
+
+    watch = _Watch()
+    f._key_lock = watch
+
+    def event(name, kind, t, drain=True):
+        clock["t"] = t
+        f._on_key(_ev(name, kind))
+        if drain:
+            _play_ctrl(f)
+
+    def release_during(key=None):
+        assert f._owner_up_queued == "right ctrl"
+        assert f._take_key == "right ctrl"
+        assert f._active_ptt_key is None
+        clock["t"] = clock["t"] + 0.2
+        f._on_key(_ev("right alt", flow.keyboard.KEY_DOWN))
+        clock["t"] = clock["t"] + 0.1
+        f._on_key(_ev("right alt", flow.keyboard.KEY_UP))
+        seen["queued"] = _queued(f)
+        assert f._owner_up_queued == "right ctrl"
+        assert f._take_key == "right ctrl"
+        f.on_release = real
+        real(key)
+
+    seen = {}
+    real = f.on_release
+    event("right ctrl", flow.keyboard.KEY_DOWN, 0.0)
+    assert f.recording is True
+    assert f._take_key == "right ctrl"
+    assert f._active_ptt_key == "right ctrl"
+    f.on_release = release_during
+    f._poll_key_watchdog()
+    assert f._active_ptt_key == "right ctrl"
+    assert seen == {}
+    f._poll_key_watchdog()
+    assert seen["queued"] == [
+        ("down", "command", "right alt"),
+        ("up", "command", "right alt"),
+    ]
+    assert f.recording is False
+    assert f._take_key is None
+    assert f._owner_up_queued is None
+    assert watch.splits == []
+
+    while True:
+        try:
+            f._ctrl_q.get_nowait()
+        except queue.Empty:
+            break
+    f._ptt_times.clear()
+
+    seen.clear()
+    event("right ctrl", flow.keyboard.KEY_DOWN, 5.0)
+    assert f.recording is True
+    assert f._take_key == "right ctrl"
+    f._record_started_at = 0.0
+    clock["t"] = 700.0
+    f.on_release = release_during
+    f._poll_record_cap()
+    assert seen["queued"] == [
+        ("down", "command", "right alt"),
+        ("up", "command", "right alt"),
+    ]
+    assert f.recording is False
+    assert f._take_key is None
+    assert f._owner_up_queued is None
+    assert watch.splits == []
+
+    while True:
+        try:
+            f._ctrl_q.get_nowait()
+        except queue.Empty:
+            break
+    f._ptt_times.clear()
+    event("right ctrl", flow.keyboard.KEY_DOWN, 10.0)
+    event("right ctrl", flow.keyboard.KEY_UP, 10.1)
+    event("right ctrl", flow.keyboard.KEY_DOWN, 10.3)
+    event("right ctrl", flow.keyboard.KEY_UP, 10.4)
+    assert f.latched is True
+    assert f.recording is True
+    f._pressed_keys.add("right ctrl")
+    f._active_ptt_key = "right ctrl"
+    f._owner_up_queued = None
+    f._os_up_streak = 0
+
+    def refuse(*_a, **_k):
+        raise AssertionError("latched watchdog disarm must not release")
+
+    f.on_release = refuse
+    f._poll_key_watchdog()
+    f._poll_key_watchdog()
+    assert f.recording is True
+    assert f.latched is True
+    assert f._active_ptt_key is None
+    assert "right ctrl" not in f._pressed_keys
+    assert f._owner_up_queued is None
+    assert f._take_key == "right ctrl"
+    assert watch.splits == []
+
+
+def test_astra_r9_2_failed_summary_copy_keeps_the_text(monkeypatch):
+    """Ten clipboard failures leave the summary in memory.
+
+    The overlay says to use Copy last dictation. It does not say the
+    summary was copied. The clipboard stays UNRELATED CLIPBOARD.
+    """
+    import numpy as np
+    import flow
+    f = _flow(monkeypatch)
+    f.cfg["min_duration_s"] = 0
+    monkeypatch.setattr(flow.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(f, "mic_is_deaf", lambda _a: False)
+    monkeypatch.setattr(f, "transcribe_and_store",
+                        lambda *a, **k: ("hello there friend", {}))
+    summary = {"text": "SHORT"}
+    monkeypatch.setattr(flow, "llm_summarize", lambda *a, **k: summary["text"])
+    monkeypatch.setattr(flow, "foreground_window", lambda: "Editor")
+    hwnd = {"v": 11}
+    monkeypatch.setattr(flow, "foreground_hwnd", lambda: hwnd["v"])
+    monkeypatch.setattr(flow, "wait_modifiers_up", lambda *a, **k: True)
+    monkeypatch.setattr(flow, "_last_input_tick", lambda: 1000)
+    monkeypatch.setattr(flow.keyboard, "send", lambda *a, **k: None)
+    state = {"clip": "UNRELATED CLIPBOARD"}
+    attempts = {"n": 0}
+
+    def copy(_text):
+        attempts["n"] += 1
+        raise OSError("clipboard busy")
+
+    monkeypatch.setattr(flow.pyperclip, "copy", copy)
+    monkeypatch.setattr(flow.pyperclip, "paste", lambda: state["clip"])
+    said = []
+    f.overlay = types.SimpleNamespace(set=lambda item: said.append(item))
+    pasted = []
+    monkeypatch.setattr(f, "_safe_paste", lambda *a, **k: pasted.append(a))
+    streamer = types.SimpleNamespace(
+        typed_len=7, typed_chars=7, stop=lambda: None,
+        committed_text="hello t", committed_samples=0,
+        saved_clip="UNRELATED CLIPBOARD", clip_gen=None,
+        restore_clipboard=lambda *a, **k: None)
+    audio = np.ones(32, dtype=np.float32)
+    f.process(audio, streamer=streamer, summary=True, take_hwnd=11,
+              input_tick=1000)
+    assert attempts["n"] == 10
+    assert state["clip"] == "UNRELATED CLIPBOARD"
+    assert flow.pyperclip.paste() == "UNRELATED CLIPBOARD"
+    assert f.last_text == "SHORT"
+    assert ("say", "Summary ready — use Copy last dictation") in said
+    assert ("say", "Summary copied — paste to replace") not in said
+    assert pasted == []
+
+    said.clear()
+    pasted.clear()
+    summary["text"] = "SHORTER"
+    hwnd["v"] = 99
+    streamer.typed_len = 0
+    streamer.typed_chars = 0
+    before = attempts["n"]
+    f.process(audio, streamer=streamer, summary=True, take_hwnd=11,
+              input_tick=1000)
+    assert attempts["n"] == before + 10
+    assert state["clip"] == "UNRELATED CLIPBOARD"
+    assert f.last_text == "SHORTER"
+    assert ("say", "Summary ready — use Copy last dictation") in said
+    assert ("say", "Summary copied — window changed") not in said
+    assert ("say", "Summary copied — paste to replace") not in said
+    assert pasted == []
+
+
+def test_astra_r9_3_streaming_scratch_keeps_the_raw_transcript(monkeypatch):
+    """Ghost/hands-free scratch edits cleaned text and leaves raw intact.
+
+    Commit `Drop me.` then `Scratch that. Keep this.` Raw history keeps
+    the pre-edit transcript frozen at release. Cleaned text is `Keep this.`
+    """
+    import numpy as np
+    import flow
+    f = _flow(monkeypatch)
+    f.cfg["min_duration_s"] = 0
+    f.cfg["cleanup"] = {"enabled": False}
+    f.cfg["trusted_devices"] = ["android-bubble"]
+    f.cfg["model"] = "fake"
+    f.cfg["device"] = "cpu"
+    f.cfg["vocab"] = []
+    f.cfg["replacements"] = {}
+    f.cfg["normalize_gain"] = False
+    monkeypatch.setattr(f, "mic_is_deaf", lambda _a: False)
+    monkeypatch.setattr(flow, "foreground_window", lambda: "Editor")
+    monkeypatch.setattr(flow.time, "sleep", lambda _s: None)
+    pasted = []
+    monkeypatch.setattr(
+        flow, "paste_text",
+        lambda text, mode, restore=True: pasted.append(text))
+
+    def decode(*_a, **_k):
+        raise AssertionError("committed audio is not a tail")
+
+    f.decode = decode
+    rows = []
+
+    class _Store:
+        def add(self, raw, **kwargs):
+            rows.append((raw, dict(kwargs)))
+            return {"id": "row"}
+
+    f.store = _Store()
+    rec = _recorder(monkeypatch)
+    rec._recording = True
+    rec._chunks = [np.ones((1600, 1), dtype=np.float32)]
+    f.recorder = rec
+    worker = flow.StreamWorker(f, live=False)
+    worker._active = True
+    worker.source = types.SimpleNamespace(_buf_lock=None)
+    worker._commit_phrase("Drop me.", 800, [])
+    worker._commit_phrase("Scratch that. Keep this.", 800, [])
+    assert worker.committed_text == "Keep this."
+    assert worker.committed_raw == "Drop me. Scratch that. Keep this."
+    audio, committed = f._capture_take(worker)
+    assert worker._frozen == ("Keep this.", 1600)
+    assert worker._frozen_raw == "Drop me. Scratch that. Keep this."
+    assert committed == (
+        "Keep this.", 1600, "Drop me. Scratch that. Keep this.")
+    worker._commit_phrase("Nope.", 10, [])
+    assert worker.committed_raw == "Drop me. Scratch that. Keep this."
+    assert worker._frozen_raw == "Drop me. Scratch that. Keep this."
+    f.process(audio, streamer=worker, committed_at_release=committed,
+              full_samples=rec.last_full_samples,
+              discarded=rec.last_discarded)
+    assert len(rows) == 1
+    raw, kwargs = rows[0]
+    assert raw == "Drop me. Scratch that. Keep this."
+    assert kwargs["cleaned"] == "Keep this."
+    assert pasted == ["Keep this."]

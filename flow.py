@@ -938,6 +938,10 @@ class Recorder:
                           int(getattr(streamer, "committed_samples", 0) or 0))
                 try:
                     streamer._frozen = frozen
+                    # Same lock as the edited text. A later scratch cannot
+                    # rewrite the transcript history stores as raw.
+                    if hasattr(streamer, "committed_raw"):
+                        streamer._frozen_raw = streamer.committed_raw
                 except Exception:
                     pass
             else:
@@ -974,6 +978,9 @@ class StreamWorker:
         self.flow = flow
         self.source = source or flow.recorder  # anything with .snapshot()
         self.committed_text = ""
+        # Phrases before scratch-that. Raw history freezes this at release.
+        # `committed_text` is the edited transcript.
+        self.committed_raw = ""
         self.committed_samples = 0
         self.live = live         # paste committed words while still recording
         self.typed_len = 0       # chars of committed_text already pasted
@@ -1130,6 +1137,8 @@ class StreamWorker:
                 return False
             if not self._generation_ok():
                 return False
+            self.committed_raw = (
+                getattr(self, "committed_raw", "") + " " + phrase).strip()
             self.committed_text = (self.committed_text + " " + phrase).strip()
             self.committed_samples += int(sample_at)
             self._prev = rest_prev
@@ -2911,22 +2920,53 @@ class Flow:
         self.streamer._gen = gen
         self.streamer.start()
 
+    def _attach_frozen_raw(self, streamer, frozen):
+        """Pair the sealed pre-edit transcript with the edited commit.
+
+        `capture()` stores both under one lock. A 2-tuple stays a 2-tuple
+        when there is no separate pre-edit text, so older callers still
+        unpack `(text, samples)`.
+        """
+        if streamer is None or not isinstance(frozen, tuple) or len(frozen) < 2:
+            return frozen
+        if len(frozen) >= 3:
+            return frozen
+        raw = getattr(streamer, "_frozen_raw", None)
+        if raw is None:
+            raw = getattr(streamer, "committed_raw", None)
+        if raw is None:
+            return frozen
+        text = frozen[0] or ""
+        if raw == text or (raw == "" and text):
+            return frozen
+        return (frozen[0], frozen[1], raw)
+
     def _capture_take(self, streamer):
         """Audio plus the commit offsets, or stop() when the recorder is a fake."""
         cap = getattr(self.recorder, "capture", None)
         if cap is not None:
             try:
-                return cap(streamer)
+                audio, frozen = cap(streamer)
             except TypeError:
                 pass
+            else:
+                return audio, self._attach_frozen_raw(streamer, frozen)
         audio = self.recorder.stop()
         if streamer is None:
             return audio, ("", 0)
         frozen = getattr(streamer, "_frozen", None)
         if frozen is None:
-            frozen = (getattr(streamer, "committed_text", "") or "",
-                      int(getattr(streamer, "committed_samples", 0) or 0))
-        return audio, frozen
+            text = getattr(streamer, "committed_text", "") or ""
+            samples = int(getattr(streamer, "committed_samples", 0) or 0)
+            frozen = (text, samples)
+            raw = getattr(streamer, "committed_raw", None)
+            if raw is not None:
+                try:
+                    streamer._frozen = frozen
+                    streamer._frozen_raw = raw
+                except Exception:
+                    pass
+        return audio, self._attach_frozen_raw(streamer, frozen)
 
     def _enable_summary(self):
         """Shift during a dictation take: stop live typing.
@@ -3146,7 +3186,13 @@ class Flow:
         if self.cfg.get("normalize_gain"):
             peak = float(np.abs(audio).max()) or 1.0
             audio = (audio / peak * 0.95).astype(np.float32)
-        committed_text, committed_samples = committed
+        committed_text, committed_samples = committed[0], committed[1]
+        # The third element is the pre-edit committed transcript, frozen at
+        # release. Absent means the edited text is also the raw prefix.
+        if len(committed) > 2 and committed[2] is not None:
+            committed_raw = committed[2]
+        else:
+            committed_raw = committed_text
         # Unknown remote devices (e.g. a family member's thin client) are
         # PRIVATE by default: transcript stored for their history page, but no
         # audio archive and the Hermes sweep skips it. Decided FIRST, before
@@ -3170,7 +3216,9 @@ class Flow:
         # touches only the new tail — committed text is already on screen
         # when live-typing, and process() slices text[live_typed:].
         tail_raw = " ".join(s.text.strip() for s in segs).strip()
-        raw = (committed_text + " " + tail_raw).strip()
+        # raw keeps the pre-edit committed transcript. `text` starts from
+        # the edited prefix, so a streaming scratch is cleaned, not raw.
+        raw = (committed_raw + " " + tail_raw).strip()
         text = (committed_text + " " + strip_hallucinations(tail_raw)).strip()
         asr_t = time.time() - t0
         cleanup_s = 0.0
@@ -3558,7 +3606,10 @@ class Flow:
                 if committed_at_release is not None:
                     committed = committed_at_release
                 elif streamer is not None:
-                    committed = (streamer.committed_text, streamer.committed_samples)
+                    committed = self._attach_frozen_raw(
+                        streamer,
+                        (getattr(streamer, "committed_text", "") or "",
+                         int(getattr(streamer, "committed_samples", 0) or 0)))
                 else:
                     committed = ("", 0)
                 # Capture on this worker, in line with every other clipboard
@@ -3623,14 +3674,17 @@ class Flow:
                             pending["cleaned"] = short
                         if live_typed:
                             # Already on screen. Never backspace it. The
-                            # summary waits on the clipboard.
+                            # summary waits on the clipboard. A failed copy
+                            # stays in last_text; the line must not say paste.
                             if self._copy_kept_result(short, None):
                                 retain_clip = True
+                                message = "Summary copied — paste to replace"
+                            else:
+                                message = ("Summary ready — use Copy "
+                                           "last dictation")
                             self._remember(short)
                             if self.overlay:
-                                self.overlay.set((
-                                    "say",
-                                    "Summary copied — paste to replace"))
+                                self.overlay.set(("say", message))
                             text = ""
                             live_typed = 0
                         else:
@@ -3640,6 +3694,9 @@ class Flow:
                                 _kind, message = decision
                                 if self._copy_kept_result(short, None):
                                     retain_clip = True
+                                else:
+                                    message = ("Summary ready — use Copy "
+                                               "last dictation")
                                 self._remember(short)
                                 if self.overlay:
                                     self.overlay.set(("say", message))
@@ -4124,6 +4181,10 @@ class Flow:
                     self._active_ptt_key = None
                     self._os_up_streak = 0
                     missed_up = True
+                    # The synthesized up has not reached on_release yet.
+                    # Publish the marker with the drop, or the next key is
+                    # rejected while this owner is still claimed.
+                    self._publish_owner_release_locked()
             self._pressed_keys.add(name)
             owner = getattr(self, "_take_key", None)
             # A key that does not own the open take cannot adopt it. Its up
@@ -4235,16 +4296,38 @@ class Flow:
         except Exception as e:
             print(f"[hotkey] listener error: {e}")
 
+    def _publish_owner_release_locked(self):
+        """Note that the held key is being dropped. Caller holds `_key_lock`.
+
+        The marker stays until ownership clears. A latched take is not an
+        ordinary release: the watchdog forgets a stuck key without ending
+        the take, and that disarm must not publish this marker.
+        """
+        if getattr(self, "latched", False):
+            return
+        owner = getattr(self, "_take_key", None)
+        if owner:
+            self._owner_up_queued = owner
+
+    def _drop_held_key_locked(self):
+        """Forget the PTT key we think is held. Caller holds `_key_lock`.
+
+        The owner-release marker is published in this same hold, and it
+        stays until ownership clears.
+        """
+        name = self._active_ptt_key
+        if name:
+            self._pressed_keys.discard(name)
+            self._key_seen_at.pop(name, None)
+        self._active_ptt_key = None
+        self._os_up_streak = 0
+        self._publish_owner_release_locked()
+        return name
+
     def _drop_held_key(self):
         """Forget the PTT key we think is held. Caller runs the release path."""
         with self._key_lock:
-            name = self._active_ptt_key
-            if name:
-                self._pressed_keys.discard(name)
-                self._key_seen_at.pop(name, None)
-            self._active_ptt_key = None
-            self._os_up_streak = 0
-            return name
+            return self._drop_held_key_locked()
 
     def _poll_key_watchdog(self):
         """Synthesize KEY_UP when the OS says the held PTT key is up, twice.
@@ -4274,10 +4357,7 @@ class Flow:
             self._os_up_streak += 1
             if self._os_up_streak < _KEY_UP_POLLS:
                 return
-            self._pressed_keys.discard(name)
-            self._key_seen_at.pop(name, None)
-            self._active_ptt_key = None
-            self._os_up_streak = 0
+            name = self._drop_held_key_locked()
         print(f"[hotkey] {name!r} still marked held but the OS reports it up; "
               "releasing")
         self.on_release()
