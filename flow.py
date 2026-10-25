@@ -171,7 +171,18 @@ DEFAULTS = {
     "pre_roll_s": 0.4,             # mic ring buffer prepended on press
     # Bool still accepted (older config.json). hints is the third pill line.
     "overlay": {"enabled": True, "hints": True},
-    "voice_edits": {"scratch": ["scratch that"]},
+    "voice_edits": {
+        "scratch": ["scratch that"],
+        # Whole-take only. A longer sentence that contains one is ordinary text.
+        "paste_last": [
+            "paste my last message",
+            "paste last message",
+            "paste that again",
+            "paste my last dictation",
+        ],
+    },
+    # Final paste follows the window that was focused at press.
+    "sticky_target": True,
     # Selection rewrite (alt during a take). Off: alt does not capture or
     # touch the clipboard. The path stays; tests set enabled true.
     "rewrite": {"enabled": False},
@@ -597,6 +608,103 @@ def voice_edit_keeping_screen(text, typed_len, cfg=None):
         text = nxt
         typed_len = len(protected)
     return text, typed_len
+
+
+def _paste_last_phrases(cfg=None):
+    """Phrases that mean "paste the previous dictation".
+
+    A config that sets the key, including to an empty list, wins. A missing
+    key uses DEFAULTS.
+    """
+    block = None
+    if isinstance(cfg, dict):
+        block = cfg.get("voice_edits")
+    if isinstance(block, dict) and "paste_last" in block:
+        return [p for p in (block.get("paste_last") or []) if p]
+    return list(DEFAULTS["voice_edits"]["paste_last"])
+
+
+def normalize_voice_phrase(text):
+    """Lower-case, drop punctuation, collapse whitespace.
+
+    "Paste my last message!" and "paste my last message" compare equal.
+    A hyphen is punctuation, so it is removed and does not become a space:
+    "paste-my-last-message" does not match the command.
+    """
+    if not text:
+        return ""
+    kept = []
+    for ch in str(text).lower():
+        if ch.isalnum() or ch.isspace():
+            kept.append(ch)
+    return " ".join("".join(kept).split())
+
+
+def match_paste_last(text, cfg=None):
+    """True when the whole transcript is a paste-last command.
+
+    The comparison is the normalized transcript against a normalized phrase.
+    A longer sentence that only contains the phrase is not a command.
+    """
+    norm = normalize_voice_phrase(text)
+    if not norm:
+        return False
+    phrases = {normalize_voice_phrase(p) for p in _paste_last_phrases(cfg)}
+    return norm in phrases
+
+
+def paste_last_held(text, cfg=None):
+    """True when live typing must not put this commit on screen.
+
+    The whole committed transcript is a paste-last command, or a word
+    prefix of one ("paste my" before "paste my last message"). A longer
+    sentence is ordinary text and may be typed. Holding the prefix is what
+    keeps a short command off the screen. If any of it was typed anyway,
+    the finished take is ordinary text — see apply_paste_last.
+    """
+    words = normalize_voice_phrase(text).split()
+    if not words:
+        return False
+    for phrase in _paste_last_phrases(cfg):
+        pw = normalize_voice_phrase(phrase).split()
+        if not pw:
+            continue
+        if words == pw or (len(words) < len(pw) and words == pw[:len(words)]):
+            return True
+    return False
+
+
+def apply_paste_last(text, live_typed, last_text="", cfg=None):
+    """Decide whether this finished take pastes the previous dictation.
+
+    Rule: the command counts only when the whole final transcript matches
+    and nothing from this take was live-typed (`live_typed` == 0). A
+    live-typed commit leaves those words on screen, so the take is ordinary
+    dictation and nothing is deleted. The spoken phrase is `history`. It
+    does not replace `last_text`. An empty previous dictation sets `empty`
+    and pastes nothing.
+
+    `text` is the transcript after strip_hallucinations and scratch-that.
+    That is the text which would otherwise be pasted.
+    """
+    text = text or ""
+    last_text = last_text or ""
+    typed = int(live_typed or 0)
+    if typed > 0 or not match_paste_last(text, cfg):
+        return {
+            "kind": "text",
+            "paste": text,
+            "history": text,
+            "last_text": text or last_text,
+            "empty": False,
+        }
+    return {
+        "kind": "command",
+        "paste": last_text,
+        "history": text,
+        "last_text": last_text,
+        "empty": not bool(last_text),
+    }
 
 
 def resolve_profile(cfg, window):
@@ -1183,7 +1291,13 @@ class StreamWorker:
             return
         if not self._generation_ok():
             return
-        if self.live and self.typed_len < len(self.committed_text):
+        # A paste-last command is held off the screen on purpose. Drop its
+        # audio anyway so the final decode does not transcribe it twice.
+        # Any other untyped live commit stays in the buffer until it lands.
+        held = (getattr(self, "voice_edits", True)
+                and paste_last_held(
+                    self.committed_text, getattr(self.flow, "cfg", None)))
+        if self.live and self.typed_len < len(self.committed_text) and not held:
             return
         drop = getattr(self.source, "discard_prefix", None)
         if drop is None:
@@ -1219,6 +1333,14 @@ class StreamWorker:
         start = self.typed_len
         chunk = self.committed_text[start:]
         if not chunk:
+            return
+        # The phrase is still only a paste-last command, or a word prefix of
+        # one. Leave it untyped. If a later commit grows past the command,
+        # that commit types from here. If this commit was typed anyway, the
+        # finished take is ordinary text and is not a paste-last command.
+        if (getattr(self, "voice_edits", True)
+                and paste_last_held(
+                    self.committed_text, getattr(self.flow, "cfg", None))):
             return
         try:
             pasted = apply_replacements(chunk, self.flow.cfg)
@@ -1335,6 +1457,10 @@ class ClientStreamer:
     def _type_delta(self):
         chunk = self.committed[self.typed:]
         if not chunk:
+            return
+        # Same hold as the local streamer: a paste-last command stays off
+        # the screen until the take proves it is a longer sentence.
+        if paste_last_held(self.committed, getattr(self.flow, "cfg", None)):
             return
         try:
             written = _copy_clipboard(chunk)
@@ -1880,6 +2006,368 @@ def focused_control_hwnd():
         return 0
 
 
+# WM_GETTEXTLENGTH, EM_GETSEL, EM_REPLACESEL. Quiet insert verifies the
+# length change. EM_GETSEL supplies the selection the length delta replaces.
+_WM_GETTEXTLENGTH = 0x000E
+_EM_GETSEL = 0x00B0
+_EM_REPLACESEL = 0x00C2
+_VK_MENU = 0x12
+_KEYEVENTF_KEYUP = 0x0002
+# Focus switch plus this settle is the sticky budget. The modifier wait is
+# the same 1.5s cap as summary paste and is not part of this budget.
+_STICKY_SETTLE_S = 0.06
+STICKY_UNAVAILABLE = "Copied — the box you started in isn't available"
+PASTE_LAST_EMPTY = "No dictation to paste yet"
+
+
+def sticky_enabled(cfg):
+    """True unless this config turns sticky paste off.
+
+    A missing key uses DEFAULTS, which ships on.
+    """
+    if not isinstance(cfg, dict) or "sticky_target" not in cfg:
+        return bool(DEFAULTS.get("sticky_target", True))
+    return bool(cfg.get("sticky_target"))
+
+
+def classic_edit_class(name):
+    """Win32 edit controls that accept EM_REPLACESEL.
+
+    Exact "Edit", or a RichEdit / RICHEDIT50W class. Anything else, including
+    a browser renderer, is not a quiet-insert target.
+    """
+    if not name or not isinstance(name, str):
+        return False
+    if name == "Edit":
+        return True
+    return name.upper().startswith("RICHEDIT")
+
+
+def _wchar_len(text):
+    """UTF-16 code units. WM_GETTEXTLENGTH counts those, not Unicode scalars."""
+    return len((text or "").encode("utf-16-le")) // 2
+
+
+def unpack_take_target(take_hwnd, take_focus=0):
+    """Foreground HWND and focused control captured when the take opened.
+
+    The job tuple stores them as one pair so the release HWND stays the last
+    argument. A bare integer is an older caller that did not capture focus.
+    """
+    if isinstance(take_hwnd, (tuple, list)):
+        hwnd = int(take_hwnd[0] or 0) if take_hwnd else 0
+        focus = int(take_hwnd[1] or 0) if len(take_hwnd) > 1 else int(take_focus or 0)
+        return hwnd, focus
+    return int(take_hwnd or 0), int(take_focus or 0)
+
+
+class TargetBridge:
+    """Win32 calls sticky paste needs. Tests replace the instance.
+
+    Same foreground window, different browser tab or field: the HWND does
+    not change, and nothing here can see the tab. Callers paste as today.
+    """
+
+    def __init__(self):
+        self._user32 = None
+        self._kernel32 = None
+
+    def _libs(self):
+        if self._user32 is None:
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            user32.SendMessageW.argtypes = [
+                wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+            user32.SendMessageW.restype = ctypes.c_ssize_t
+            user32.IsWindow.argtypes = [wintypes.HWND]
+            user32.IsWindow.restype = wintypes.BOOL
+            user32.IsIconic.argtypes = [wintypes.HWND]
+            user32.IsIconic.restype = wintypes.BOOL
+            user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+            user32.SetForegroundWindow.restype = wintypes.BOOL
+            user32.SetFocus.argtypes = [wintypes.HWND]
+            user32.SetFocus.restype = wintypes.HWND
+            user32.GetClassNameW.argtypes = [
+                wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+            user32.GetClassNameW.restype = ctypes.c_int
+            user32.AttachThreadInput.argtypes = [
+                wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+            user32.AttachThreadInput.restype = wintypes.BOOL
+            user32.GetWindowThreadProcessId.argtypes = [
+                wintypes.HWND, ctypes.c_void_p]
+            user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+            user32.keybd_event.argtypes = [
+                wintypes.BYTE, wintypes.BYTE, wintypes.DWORD, ctypes.c_ulonglong]
+            kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+            self._user32 = user32
+            self._kernel32 = kernel32
+        return self._user32, self._kernel32
+
+    def foreground(self):
+        """Foreground HWND. Goes through foreground_hwnd so tests can patch it."""
+        return int(foreground_hwnd() or 0)
+
+    def class_name(self, hwnd):
+        try:
+            user32, _kernel = self._libs()
+            buf = __import__("ctypes").create_unicode_buffer(256)
+            n = user32.GetClassNameW(int(hwnd), buf, 256)
+            if not n:
+                return ""
+            return buf.value
+        except Exception:
+            return ""
+
+    def is_window(self, hwnd):
+        hwnd = int(hwnd or 0)
+        if hwnd <= 0:
+            return False
+        try:
+            user32, _kernel = self._libs()
+            return bool(user32.IsWindow(hwnd))
+        except Exception:
+            return False
+
+    def is_minimized(self, hwnd):
+        hwnd = int(hwnd or 0)
+        if hwnd <= 0:
+            return False
+        try:
+            user32, _kernel = self._libs()
+            return bool(user32.IsIconic(hwnd))
+        except Exception:
+            return False
+
+    def text_length(self, hwnd):
+        """WM_GETTEXTLENGTH, or None when the control cannot be read."""
+        hwnd = int(hwnd or 0)
+        if hwnd <= 0 or not self.is_window(hwnd):
+            return None
+        try:
+            user32, _kernel = self._libs()
+            return int(user32.SendMessageW(hwnd, _WM_GETTEXTLENGTH, 0, 0))
+        except Exception:
+            return None
+
+    def selection_span(self, hwnd):
+        """EM_GETSEL as (start, end), or None when it cannot be read."""
+        hwnd = int(hwnd or 0)
+        if hwnd <= 0:
+            return None
+        try:
+            import ctypes
+            user32, _kernel = self._libs()
+            start = ctypes.c_ulong()
+            end = ctypes.c_ulong()
+            user32.SendMessageW(
+                hwnd, _EM_GETSEL,
+                ctypes.addressof(start), ctypes.addressof(end))
+            return int(start.value), int(end.value)
+        except Exception:
+            return None
+
+    def replace_selection(self, hwnd, text):
+        """EM_REPLACESEL with undo. False when the message was not sent."""
+        hwnd = int(hwnd or 0)
+        if hwnd <= 0:
+            return False
+        try:
+            import ctypes
+            user32, _kernel = self._libs()
+            buf = ctypes.create_unicode_buffer(text or "")
+            user32.SendMessageW(
+                hwnd, _EM_REPLACESEL, 1, ctypes.addressof(buf))
+            return True
+        except Exception:
+            return False
+
+    def force_foreground(self, hwnd, focus=0):
+        """Bring `hwnd` forward and focus the captured control.
+
+        AttachThreadInput, then SetForegroundWindow. If the foreground is
+        still not `hwnd`, tap ALT once and try SetForegroundWindow again.
+        SetFocus targets the captured control. True only when
+        GetForegroundWindow() is `hwnd` afterwards.
+        """
+        hwnd = int(hwnd or 0)
+        focus = int(focus or 0)
+        if hwnd <= 0:
+            return False
+        user32 = kernel32 = None
+        attached = []
+        try:
+            user32, kernel32 = self._libs()
+            my_tid = int(kernel32.GetCurrentThreadId() or 0)
+            current = self.foreground()
+            fg_tid = 0
+            if current:
+                fg_tid = int(user32.GetWindowThreadProcessId(current, None) or 0)
+            tgt_tid = int(user32.GetWindowThreadProcessId(hwnd, None) or 0)
+
+            def attach(a, b):
+                if a and b and a != b and user32.AttachThreadInput(a, b, True):
+                    attached.append((a, b))
+
+            attach(my_tid, fg_tid)
+            attach(my_tid, tgt_tid)
+            user32.SetForegroundWindow(hwnd)
+            if self.foreground() != hwnd:
+                user32.keybd_event(_VK_MENU, 0, 0, 0)
+                user32.keybd_event(_VK_MENU, 0, _KEYEVENTF_KEYUP, 0)
+                user32.SetForegroundWindow(hwnd)
+            if focus:
+                user32.SetFocus(focus)
+            return self.foreground() == hwnd
+        except Exception:
+            return False
+        finally:
+            if user32 is not None:
+                for a, b in attached:
+                    try:
+                        user32.AttachThreadInput(a, b, False)
+                    except Exception:
+                        pass
+
+
+def quiet_insert(bridge, hwnd, text):
+    """Insert `text` with EM_REPLACESEL. No focus change.
+
+    Success is WM_GETTEXTLENGTH moving by len(text) minus the selection.
+    A length that does not move means the control ignored the message.
+    A length that moves by some other amount is kept, so a second paste
+    cannot write the dictation twice. Returns False without sending when
+    the length or the selection cannot be read.
+    """
+    if not text or not hwnd:
+        return False
+    before = bridge.text_length(hwnd)
+    if before is None:
+        return False
+    span = None
+    getter = getattr(bridge, "selection_span", None)
+    if not getter:
+        return False
+    try:
+        span = getter(hwnd)
+    except Exception:
+        span = None
+    if not span or len(span) != 2:
+        return False
+    if span[0] is None or span[1] is None:
+        return False
+    sel = max(0, int(span[1]) - int(span[0]))
+    if sel > int(before):
+        return False
+    try:
+        sent = bridge.replace_selection(hwnd, text)
+    except Exception:
+        return False
+    if sent is False:
+        return False
+    after = bridge.text_length(hwnd)
+    if after is None:
+        return False
+    expected = int(before) - sel + _wchar_len(text)
+    if int(after) == expected:
+        return True
+    return int(after) != int(before)
+
+
+def sticky_deliver(text, target, bridge, paste, copy, *,
+                   enabled=True, on_current=None, wait_modifiers=None,
+                   settle=None):
+    """Paste `text` into the window captured at press.
+
+    Same foreground HWND: call `paste` (clipboard or typed paste, as today).
+    A different tab or field in that same window is not detectable. Nothing
+    extra happens.
+
+    A different window tries a quiet EM_REPLACESEL into a classic edit
+    (Edit / RichEdit* / RICHEDIT50W). If that fails, and the original
+    window still exists and is not minimized, switch back, confirm the
+    foreground, wait until ctrl/alt/shift are up, paste, settle ~60ms, then
+    restore the user's window. A failed confirm pastes nowhere, copies, and
+    returns STICKY_UNAVAILABLE.
+
+    A restore that fails after a confirmed paste leaves the text in the
+    original box. The paste already happened, so it is not copied again.
+
+    `on_current` runs only while the foreground still matches. Return
+    "paste", or ("copy", message). Summary uses it for modifiers and for
+    input since release. Window changes are handled here.
+
+    `paste` returns a clipboard generation or None. `copy` is truthy when
+    the copy landed. No captured HWND pastes as today: a dictation is not
+    dropped because the target was never read.
+    """
+    def _current(generation=None):
+        return {
+            "action": "current", "pasted": True, "copied": False,
+            "message": None, "generation": generation,
+        }
+
+    def _copied(message, copied):
+        return {
+            "action": "copy", "pasted": False, "copied": bool(copied),
+            "message": message,
+            "generation": None,
+        }
+
+    if not enabled:
+        return _current(paste())
+    hwnd = int((target or {}).get("hwnd") or 0)
+    focus = int((target or {}).get("focus") or 0)
+    if not hwnd:
+        return _current(paste())
+    now = int(bridge.foreground() or 0)
+    if now == hwnd:
+        if on_current is not None:
+            decision = on_current()
+            if decision != "paste":
+                _kind, message = decision
+                return _copied(message, copy())
+        return _current(paste())
+
+    if focus and classic_edit_class(bridge.class_name(focus)):
+        if quiet_insert(bridge, focus, text):
+            return {
+                "action": "quiet", "pasted": True, "copied": False,
+                "message": None, "generation": None,
+            }
+
+    user = now
+    can_switch = bridge.is_window(hwnd) and not bridge.is_minimized(hwnd)
+    switched = False
+    if can_switch:
+        try:
+            brought = bridge.force_foreground(hwnd, focus)
+            switched = brought and int(bridge.foreground() or 0) == hwnd
+            if switched:
+                if wait_modifiers is None:
+                    wait_modifiers = wait_modifiers_up
+                if not wait_modifiers():
+                    switched = False
+                else:
+                    generation = paste()
+                    if settle is None:
+                        time.sleep(_STICKY_SETTLE_S)
+                    else:
+                        settle()
+                    return {
+                        "action": "switch", "pasted": True, "copied": False,
+                        "message": None, "generation": generation,
+                    }
+        finally:
+            if user and user != hwnd and int(bridge.foreground() or 0) != user:
+                try:
+                    bridge.force_foreground(user, 0)
+                except Exception:
+                    pass
+    return _copied(STICKY_UNAVAILABLE, copy())
+
+
 # Hotkeys we can check against the real OS key state. Anything else
 # (f8, letters, ...) keeps hook-only behaviour: there is no VK to ask.
 _HOTKEY_VK = {
@@ -2318,6 +2806,9 @@ class Flow:
         self._latch_owner = None   # "local" while a local take owns the gesture
         self._latch_pending = None # committed with recording=True, under the lock
         self._take_hwnd = 0        # foreground window when the take opened
+        self._take_focus = 0       # focused control in that window at press
+        self._paste_target = None  # hwnd/focus the open job pastes into
+        self._paste_on_current = None
         self._input_tick = None    # GetLastInputInfo after our own injections
         self._latched_shown = None
         from collections import deque
@@ -2678,7 +3169,7 @@ class Flow:
                     released_at=None, summary=False, rewrite=False,
                     full_samples=None, discarded=0, committed_at_release=None,
                     take_hwnd=0, input_tick=None, rewrite_capture=None,
-                    release_hwnd=None):
+                    release_hwnd=None, take_focus=0):
         """Hand a finished take to the single worker. Press order is paste order.
 
         A rewrite does not capture here. This runs on the ctrl thread, so it
@@ -2697,9 +3188,12 @@ class Flow:
                 rewrite_capture = None
             if rewrite and release_hwnd is None:
                 release_hwnd = int(foreground_hwnd() or 0)
+            hwnd, focus = unpack_take_target(take_hwnd, take_focus)
+            # Pair, not a new trailing argument. release_hwnd stays last so
+            # a queued rewrite can still read it from the end of the tuple.
             self._job_q.put(("dictate", (
                 audio, streamer, released_at, summary, rewrite,
-                full_samples, discarded, committed_at_release, take_hwnd,
+                full_samples, discarded, committed_at_release, (hwnd, focus),
                 input_tick, rewrite_capture, release_hwnd)))
 
     def _job_loop(self):
@@ -2852,6 +3346,7 @@ class Flow:
                     self.latched = False
                     self._latched_shown = None
                     self._take_hwnd = foreground_hwnd()
+                    self._take_focus = focused_control_hwnd()
                     pending = getattr(self, "_latch_pending", None)
                     self._latch_pending = None
                     if (mode == "dictate" and pending
@@ -3057,6 +3552,7 @@ class Flow:
             rewrite = getattr(self, "rewrite_take", False)
             mode = self.active_mode
             hwnd = getattr(self, "_take_hwnd", 0) or 0
+            focus = getattr(self, "_take_focus", 0) or 0
             self.recording = False
             self._record_started_at = None
             self._clear_owner_on_release(key)
@@ -3091,19 +3587,20 @@ class Flow:
             input_tick = self._input_tick
             current = (mode, audio, streamer, summary, rewrite,
                        full_samples, discarded, committed, hermes_context,
-                       hwnd, input_tick)
+                       hwnd, focus, input_tick)
         # The audio array is already detached. Free the mic before the
         # (possibly slow) decode so the next press can record immediately.
         self._release_mic()
         if current is not None:
             (mode, audio, streamer, summary, rewrite, full_samples,
-             discarded, committed, hermes_context, hwnd, input_tick) = current
+             discarded, committed, hermes_context, hwnd, focus,
+             input_tick) = current
             self._submit_job(
                 mode, audio, streamer, hermes_context, time.monotonic(),
                 summary=summary, rewrite=rewrite,
                 full_samples=full_samples, discarded=discarded,
                 committed_at_release=committed, take_hwnd=hwnd,
-                input_tick=input_tick)
+                take_focus=focus, input_tick=input_tick)
 
     def bias_prompt(self, committed=""):
         """initial_prompt = personal vocabulary + committed text so far."""
@@ -3259,16 +3756,57 @@ class Flow:
         if text:
             self.last_text = text
 
+    def _place_sticky(self, text, mode=None, restore=True, on_current=None):
+        """Paste `text` into the target captured at press.
+
+        Clipboard writes stay inside paste_text / _copy_clipboard. A quiet
+        insert does not touch the clipboard. Rewrite does not call this:
+        a rewrite is copied for the user to paste, and that path is unchanged.
+        """
+        if mode is None:
+            mode = self.cfg.get("paste_mode", "clipboard")
+        target = getattr(self, "_paste_target", None) or {"hwnd": 0, "focus": 0}
+        bridge = getattr(self, "targets", None) or TargetBridge()
+
+        def paste():
+            return paste_text(text, mode, restore=restore)
+
+        def copy():
+            return _copy_clipboard(text)
+
+        return sticky_deliver(
+            text, target, bridge, paste, copy,
+            enabled=sticky_enabled(self.cfg),
+            on_current=on_current)
+
     def _safe_paste(self, text, mode, restore=True):
         """Paste, but never let a clipboard/typing error kill this thread.
 
         Returns the clipboard generation `paste_text` wrote, or None when
-        nothing was written.
+        nothing was written. A quiet insert and a copy-only refusal also
+        return None: neither leaves a clipboard generation to restore.
         """
         if not text:
             return None
         try:
-            return paste_text(text, mode, restore=restore)
+            if not sticky_enabled(self.cfg):
+                return paste_text(text, mode, restore=restore)
+            on_current = getattr(self, "_paste_on_current", None)
+            result = self._place_sticky(
+                text, mode, restore=restore, on_current=on_current)
+            if result.get("action") == "copy":
+                if self.overlay:
+                    if result.get("copied"):
+                        self.overlay.set(("say", result.get("message")
+                                          or STICKY_UNAVAILABLE))
+                    else:
+                        self.overlay.set((
+                            "say",
+                            "Couldn't paste that dictation. "
+                            "Tray menu: Copy last dictation."))
+                return None
+            gen = result.get("generation")
+            return gen if type(gen) is int else None
         except Exception as e:
             print(f"[paste] failed, dictation kept in memory: {e}")
             if self.overlay:
@@ -3490,6 +4028,26 @@ class Flow:
         """
         return voice_edit_keeping_screen(text or "", live_typed, self.cfg)
 
+    def _consume_paste_last(self, text, live_typed):
+        """Replace a whole-take paste-last command with the previous dictation.
+
+        Returns (text, live_typed, phrase). `phrase` is None when this take
+        is ordinary text. A command does not write the phrase into last_text.
+        An empty previous dictation shows the overlay and pastes nothing.
+        """
+        decision = apply_paste_last(
+            text or "", live_typed, getattr(self, "last_text", "") or "",
+            self.cfg)
+        if decision["kind"] != "command":
+            return text, live_typed, None
+        if decision["empty"]:
+            print("[voice] paste last, nothing saved")
+            if self.overlay:
+                self.overlay.set(("say", PASTE_LAST_EMPTY))
+            return "", 0, decision["history"]
+        print("[voice] paste last")
+        return decision["paste"], 0, decision["history"]
+
     def _summary_target_ok(self, take_hwnd, input_tick):
         """Whether a summary of an untyped take may be pasted.
 
@@ -3515,6 +4073,9 @@ class Flow:
                 rewrite=False, full_samples=None, discarded=0,
                 committed_at_release=None, take_hwnd=0, input_tick=None,
                 rewrite_capture=None, release_hwnd=None):
+        take_hwnd, take_focus = unpack_take_target(take_hwnd)
+        self._paste_target = {"hwnd": take_hwnd, "focus": take_focus}
+        self._paste_on_current = None
         stop = threading.Event()
         started = time.monotonic() if released_at is None else released_at
         watcher = threading.Thread(
@@ -3572,6 +4133,12 @@ class Flow:
                         text, typed = streamer.finish()
                         if text is None:  # server lost the session mid-flight
                             text, typed = self.client_transcribe(audio, "/transcribe"), 0
+                        text, typed, phrase = self._consume_paste_last(
+                            text, typed)
+                        if phrase is not None:
+                            if text:
+                                _note_paste(text, "clipboard", True)
+                            return
                         self._remember(text)
                         remainder = (text or "")[typed:]
                         if remainder:
@@ -3589,6 +4156,11 @@ class Flow:
                                 streamer.restore_clipboard()
                     else:
                         text = self.client_transcribe(audio, "/transcribe")
+                        text, _typed, phrase = self._consume_paste_last(text, 0)
+                        if phrase is not None:
+                            if text:
+                                _note_paste(text, self.cfg["paste_mode"], True)
+                            return
                         self._remember(text)
                         _note_paste(text, self.cfg["paste_mode"], True)
                     return
@@ -3634,11 +4206,21 @@ class Flow:
                     persist=False, full_samples=full_samples,
                     keep_audio=not discarded)
                 text, live_typed = self._apply_voice_edit(text, live_typed)
-                # Voice edits run after the row is built. Store what was
-                # pasted. raw stays the decoder text.
+                # Voice edits run after the row is built. A paste-last command
+                # stores the spoken phrase and pastes the previous dictation.
+                # last_text is not replaced by the phrase.
+                paste_last_phrase = None
+                if not rewrite and not summary and text:
+                    text, live_typed, paste_last_phrase = self._consume_paste_last(
+                        text, live_typed)
                 _pending = (meta or {}).get("pending") if meta else None
                 if isinstance(_pending, dict):
-                    _pending["cleaned"] = text
+                    if paste_last_phrase is not None:
+                        _pending["raw"] = paste_last_phrase
+                        _pending["cleaned"] = paste_last_phrase
+                        _pending["source"] = "pc-hotkey"
+                    else:
+                        _pending["cleaned"] = text
                 if rewrite:
                     if rewrite_abort or not rewrite_target:
                         if rewrite_abort and self.overlay:
@@ -3692,19 +4274,57 @@ class Flow:
                                 take_hwnd, input_tick)
                             if decision != "paste":
                                 _kind, message = decision
-                                if self._copy_kept_result(short, None):
-                                    retain_clip = True
+                                # The window moved. Try the original box
+                                # before giving up. Modifiers and a newer
+                                # input tick still refuse, inside on_current,
+                                # if the user has come back to that window.
+                                if (message == "Summary copied — window changed"
+                                        and sticky_enabled(self.cfg)):
+                                    # Remember before the paste. A focus or
+                                    # clipboard error must not drop the summary.
+                                    self._remember(short)
+                                    try:
+                                        result = self._place_sticky(
+                                            short,
+                                            on_current=lambda: (
+                                                self._summary_target_ok(
+                                                    take_hwnd, input_tick)))
+                                    except Exception as e:
+                                        print(f"[summary] sticky paste failed: {e}")
+                                        result = {"pasted": False, "copied": False}
+                                    if result.get("pasted"):
+                                        gen = result.get("generation")
+                                        if type(gen) is int:
+                                            paste_gen = gen
+                                    else:
+                                        if result.get("copied"):
+                                            retain_clip = True
+                                            message = (result.get("message")
+                                                       or STICKY_UNAVAILABLE)
+                                        else:
+                                            message = ("Summary ready — use Copy "
+                                                       "last dictation")
+                                        if self.overlay:
+                                            self.overlay.set(("say", message))
+                                    text = ""
+                                    live_typed = 0
                                 else:
-                                    message = ("Summary ready — use Copy "
-                                               "last dictation")
-                                self._remember(short)
-                                if self.overlay:
-                                    self.overlay.set(("say", message))
-                                text = ""
-                                live_typed = 0
+                                    if self._copy_kept_result(short, None):
+                                        retain_clip = True
+                                    else:
+                                        message = ("Summary ready — use Copy "
+                                                   "last dictation")
+                                    self._remember(short)
+                                    if self.overlay:
+                                        self.overlay.set(("say", message))
+                                    text = ""
+                                    live_typed = 0
                             else:
                                 text = short
                                 self._remember(short)
+                                self._paste_on_current = (
+                                    lambda: self._summary_target_ok(
+                                        take_hwnd, input_tick))
                     elif self.overlay:
                         self.overlay.set(("say", "Summary failed — pasted what you said"))
                 if not rewrite and not (summary and not text and retain_clip):
