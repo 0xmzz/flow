@@ -48,13 +48,7 @@ class StreamSession:
     def add_audio(self, raw):
         self.last_seen = time.time()
         self.source.append_pcm16(raw)
-        text = self.worker.committed_text or ""
-        # The client may type this prefix. Later scratch commands must not
-        # delete it out from under that typed text.
-        note = getattr(self.worker, "note_published", None)
-        if note is not None:
-            note(len(text))
-        return text
+        return self.worker.committed_text
 
     def finish(self):
         """Final decode of the uncommitted tail; returns the full text."""
