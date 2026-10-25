@@ -82,14 +82,22 @@ def _idle():
 # --- double-tap latch -------------------------------------------------------
 
 def test_latch_double_tap_then_a_later_press_stops():
+    """Replaces the deferred seal/pending/second machine.
+
+    The first release is an ordinary take. A second press inside the gap is
+    only a candidate; a short release of that press converts it to a latch.
+    """
     import flow
     st = _idle()
     st, act = flow.latch_step(st, "down", 10.0)
     assert act == "start" and st["phase"] == "holding"
+    assert st["candidate"] is False
     st, act = flow.latch_step(st, "up", 10.2)          # tap, under 0.35s
-    assert act == "seal" and st["phase"] == "pending"
+    assert act == "release" and st["phase"] == "idle"
+    assert st["prev_press_s"] == pytest.approx(0.2)
     st, act = flow.latch_step(st, "down", 10.5)        # 0.3s after the release
-    assert act == "second" and st["phase"] == "second"
+    assert act == "start" and st["phase"] == "holding"
+    assert st["candidate"] is True
     st, act = flow.latch_step(st, "up", 10.6)          # short second release latches
     assert act == "latch" and st["phase"] == "latched"
     st, act = flow.latch_step(st, "down", 20.0)        # single tap while latched
@@ -97,16 +105,14 @@ def test_latch_double_tap_then_a_later_press_stops():
 
 
 def test_short_tap_without_a_second_press_releases():
-    """A <0.35s tap that nobody follows still ends the take."""
+    """A <0.35s tap ends at the key-up. Nothing is deferred across a tick."""
     import flow
     st = _idle()
     st, _ = flow.latch_step(st, "down", 1.0)
     st, act = flow.latch_step(st, "up", 1.2)
-    assert act == "seal" and st["phase"] == "pending"
-    st, act = flow.latch_step(st, "tick", 1.2 + flow._LATCH_GAP_S - 0.05)
-    assert act is None
-    st, act = flow.latch_step(st, "tick", 1.2 + flow._LATCH_GAP_S)
     assert act == "release" and st["phase"] == "idle"
+    st, act = flow.latch_step(st, "tick", 1.2 + flow._LATCH_GAP_S)
+    assert act is None and st["phase"] == "idle"
 
 
 def test_hold_releases_immediately_and_borderline_press_does_not_arm():
@@ -120,11 +126,13 @@ def test_hold_releases_immediately_and_borderline_press_does_not_arm():
 
 
 def test_second_press_just_outside_the_gap_restarts():
+    """Replaces the old `restart` action. Outside the gap this is a plain start."""
     import flow
     st, _ = flow.latch_step(_idle(), "down", 0.0)
     st, _ = flow.latch_step(st, "up", 0.1)
     st, act = flow.latch_step(st, "down", 0.1 + flow._LATCH_GAP_S + 0.01)
-    assert act == "restart" and st["phase"] == "holding"
+    assert act == "start" and st["phase"] == "holding"
+    assert st["candidate"] is False
 
 
 def test_single_tap_stops_a_latched_take(monkeypatch):
@@ -143,14 +151,15 @@ def test_single_tap_stops_a_latched_take(monkeypatch):
 
 
 def test_short_tap_on_the_flow_still_releases(monkeypatch):
+    """Replaces the deferred tick. The key-up itself ends the take and queues it."""
     f = _flow(monkeypatch)
     f._latch_event("down", 0.0)
     assert f.recording is True
     f._latch_event("up", 0.2)
-    assert f.recording is True          # waiting to see if it's a double tap
-    f._latch_event("tick", 0.2 + 0.4)
     assert f.recording is False
     assert f._job_q.get_nowait()[0] == "dictate"
+    f._latch_event("tick", 0.2 + 0.4)
+    assert f._job_q.empty()
 
 
 def test_watchdog_ignores_a_latched_take(monkeypatch):
@@ -340,6 +349,8 @@ def test_ctrl_joining_an_alt_take_enqueues_rewrite(monkeypatch):
     f = _flow(monkeypatch, recording=True)
     f.active_mode = "command"
     f._alt_held = True
+    f._active_ptt_key = "right alt"
+    f._pressed_keys.add("right alt")
     f._on_key(_ev("right ctrl", flow.keyboard.KEY_DOWN))
     assert f._ctrl_q.get_nowait() == ("rewrite", None)
 
@@ -712,19 +723,23 @@ def test_astra_4_rewrite_and_summary_refuse_the_wrong_window(monkeypatch):
 
     erased = []
     monkeypatch.setattr(f, "_erase_typed", lambda n: erased.append(n))
+    monkeypatch.setattr(flow, "_last_input_tick", lambda: None)
     streamer = types.SimpleNamespace(typed_chars=12)
     monkeypatch.setattr(flow, "wait_modifiers_up", lambda *a, **k: False)
-    assert f._erase_summary_prefix(streamer, 12, 11) == (0, True)
+    assert f._erase_summary_prefix(streamer, 12, 11) == (
+        12, ("copy", "Summary copied"))
     assert erased == []
-    assert ("say", "Summary pasted — original left in place") in said
+    assert pasted == []
+    assert ("say", "Summary copied") in said
     said.clear()
     monkeypatch.setattr(flow, "wait_modifiers_up", lambda *a, **k: True)
     monkeypatch.setattr(flow, "foreground_hwnd", lambda: 22)
-    assert f._erase_summary_prefix(streamer, 12, 11) == (0, True)
+    assert f._erase_summary_prefix(streamer, 12, 11) == (
+        12, ("copy", "Summary copied — window changed"))
     assert erased == []
-    assert ("say", "Summary pasted — original left in place") in said
+    assert ("say", "Summary copied — window changed") in said
     monkeypatch.setattr(flow, "foreground_hwnd", lambda: 11)
-    assert f._erase_summary_prefix(streamer, 12, 11) == (0, False)
+    assert f._erase_summary_prefix(streamer, 12, 11) == (0, "paste")
     assert erased == [12]
 
 
@@ -781,25 +796,32 @@ def test_astra_6_client_mode_does_not_rewrite_or_live_type_it(monkeypatch):
 
 
 def test_astra_7_latch_confirms_on_the_second_release_not_the_second_down(monkeypatch):
+    """Replaces seal/second/restart. The second down only arms a candidate.
+
+    A release of exactly 0.35s ends the take. A shorter release of that
+    candidate converts it to a latch. A long second press is a normal take.
+    """
     import numpy as np
     import flow
     st = _idle()
     st, _ = flow.latch_step(st, "down", 0.0)
     st, act = flow.latch_step(st, "up", 0.10)
-    assert act == "seal" and st["phase"] == "pending"
+    assert act == "release" and st["phase"] == "idle"
     st, act = flow.latch_step(st, "down", 0.10 + flow._LATCH_GAP_S)
-    assert act == "restart"  # a gap of exactly 0.40s is not a latch
+    assert act == "start" and st["candidate"] is False  # gap of exactly 0.40s
     st = _idle()
     st, _ = flow.latch_step(st, "down", 0.0)
     st, _ = flow.latch_step(st, "up", 0.10)
     st, act = flow.latch_step(st, "down", 0.30)
-    assert act == "second" and st["phase"] == "second"
+    assert act == "start" and st["phase"] == "holding" and st["candidate"] is True
     assert act != "latch"
     # Same float as the threshold, measured from down_at 0, so the compare is exact.
-    border = {"phase": "second", "down_at": 0.0, "up_at": None}
+    border = dict(st)
+    border["down_at"] = 0.0
     held_out, act = flow.latch_step(border, "up", flow._LATCH_MAX_PRESS_S)
     assert act == "release" and held_out["phase"] == "idle"
-    short = {"phase": "second", "down_at": 0.0, "up_at": None}
+    short = dict(st)
+    short["down_at"] = 0.0
     latched, act = flow.latch_step(short, "up", 0.20)
     assert act == "latch" and latched["phase"] == "latched"
 
@@ -810,8 +832,10 @@ def test_astra_7_latch_confirms_on_the_second_release_not_the_second_down(monkey
     f._latch_event("down", 0.0)
     rec._on_audio(np.ones((15, 1), dtype=np.float32))
     f._latch_event("up", 0.10)
+    assert f.recording is False
     f._latch_event("down", 0.20)
-    assert f._latch["phase"] == "second"
+    assert f._latch["phase"] == "holding"
+    assert f._latch["candidate"] is True
     assert f.latched is False
     assert f.recording is True
     rec._on_audio(np.full((12, 1), 4, dtype=np.float32))
@@ -868,11 +892,9 @@ def test_astra_9_remote_session_ignores_and_clears_local_latch(monkeypatch):
     f._latch_event("up", 10.5)
     assert f._latch == before
     assert f.recording is True
-    f._sealed = {"audio": b"x"}
     assert f.remote_cancel() is True
     assert f.latched is False
     assert f._latch["phase"] == "idle"
-    assert f._sealed is None
     assert f.recording is False
     f._latch_event("down", 30.0)
     assert f.recording is True
@@ -1026,6 +1048,12 @@ def test_astra_14_held_modifiers_block_copy_and_paste(monkeypatch):
 
 
 def test_astra_15_short_tap_seals_audio_at_the_first_release(monkeypatch):
+    """Replaces the sealed-gap take. The short tap's job is its own audio.
+
+    A following short press inside the gap becomes hands-free and keeps
+    recording, including the audio of that second press. Nothing is discarded
+    to stitch the two gestures, and no second job is queued until the stop.
+    """
     import numpy as np
     import flow
     f = _flow(monkeypatch)
@@ -1035,16 +1063,11 @@ def test_astra_15_short_tap_seals_audio_at_the_first_release(monkeypatch):
     f._latch_event("down", 0.0)
     rec._on_audio(np.ones((40, 1), dtype=np.float32))
     f._latch_event("up", 0.2)
-    assert f.recording is True
-    assert f._live_buffer is False
-    sealed = np.array(f._sealed["audio"])
-    assert len(sealed) == 40
-    rec._on_audio(np.full((25, 1), 9, dtype=np.float32))
-    f._latch_event("tick", 0.2 + flow._LATCH_GAP_S)
     assert f.recording is False
+    rec._on_audio(np.full((25, 1), 9, dtype=np.float32))
     kind, args = f._job_q.get_nowait()
     assert kind == "dictate"
-    assert np.array_equal(np.asarray(args[0]), sealed)
+    assert np.array_equal(np.asarray(args[0]), np.ones(40, dtype=np.float32))
     assert 9 not in np.asarray(args[0])
     assert f._job_q.empty()
 
@@ -1055,16 +1078,16 @@ def test_astra_15_short_tap_seals_audio_at_the_first_release(monkeypatch):
     f2._latch_event("down", 0.0)
     rec2._on_audio(np.full((40, 1), 1, dtype=np.float32))
     f2._latch_event("up", 0.1)
-    sealed2 = np.array(f2._sealed["audio"])
-    rec2._on_audio(np.full((10, 1), 9, dtype=np.float32))
+    assert f2.recording is False
+    assert f2._job_q.get_nowait()[0] == "dictate"
     f2._latch_event("down", 0.2)
     rec2._on_audio(np.full((10, 1), 8, dtype=np.float32))
     f2._latch_event("up", 0.3)
     assert f2.latched is True
     assert f2.recording is True
+    assert f2._latch["phase"] == "latched"
     snap = rec2.snapshot()
-    assert np.array_equal(snap, sealed2)
-    assert 8 not in snap and 9 not in snap
+    assert np.all(snap == 8)
     assert f2._job_q.empty()
 
 
@@ -1078,3 +1101,518 @@ def test_astra_15_short_tap_seals_audio_at_the_first_release(monkeypatch):
 def test_astra_16_scratch_cuts_from_the_command_position(src, expected):
     import flow
     assert flow.apply_voice_edits(src) == expected
+
+
+def _queued(f):
+    items = []
+    while True:
+        try:
+            items.append(f._ctrl_q.get_nowait())
+        except queue.Empty:
+            break
+    for item in items:
+        f._ctrl_q.put(item)
+    return items
+
+
+def _play_ctrl(f):
+    """Control-thread order: the same branches _ctrl_loop runs, without the poll."""
+    while True:
+        try:
+            action, mode = f._ctrl_q.get_nowait()
+        except queue.Empty:
+            return
+        if action == "rewrite":
+            f._enable_rewrite()
+        elif action == "summary":
+            f._enable_summary()
+        elif action == "down":
+            when = f._pop_ptt_time()
+            if mode == "dictate" and f.cfg.get("mode") != "client":
+                f._latch_event("down", when)
+            else:
+                f.on_press(mode)
+        elif action == "up":
+            when = f._pop_ptt_time()
+            f._handle_up(mode, when)
+        else:
+            f.on_release()
+
+
+# --- Astra round-2b regressions ------------------------------------------------
+# Rewritten in place (deferral removed, not deleted):
+#   test_latch_double_tap_then_a_later_press_stops
+#   test_short_tap_without_a_second_press_releases
+#   test_second_press_just_outside_the_gap_restarts
+#   test_short_tap_on_the_flow_still_releases
+#   test_astra_7_latch_confirms_on_the_second_release_not_the_second_down
+#   test_astra_15_short_tap_seals_audio_at_the_first_release
+#   test_astra_4 summary half (no paste on a refused erase)
+#   test_astra_9 (no sealed blob)
+
+
+def test_astra_r2_1_trim_rebases_the_offset_inside_the_lock(monkeypatch):
+    """Samples 0..9, offset 4. Capture runs as the trim lock drops.
+
+    The frozen offset must already be 0, so the tail is [4..9], not [8, 9].
+    """
+    import numpy as np
+    import flow
+    rec = _recorder(monkeypatch)
+    rec._recording = True
+    rec._chunks = [np.arange(10, dtype=np.float32).reshape(-1, 1)]
+    owner = types.SimpleNamespace(committed_samples=4, committed_text="", _frozen=None)
+    captured = {}
+
+    class _Hook:
+        def __init__(self, inner):
+            self._inner = inner
+            self._fire = True
+
+        def __enter__(self):
+            self._inner.acquire()
+            return self
+
+        def __exit__(self, *exc):
+            self._inner.release()
+            if self._fire:
+                self._fire = False
+                audio, frozen = rec.capture(owner)
+                captured["audio"] = np.array(audio, copy=True)
+                captured["offset"] = frozen[1]
+            return False
+
+    rec._buf_lock = _Hook(rec._buf_lock)
+    assert rec.discard_prefix(4, owner=owner) == 4
+    audio = captured["audio"]
+    offset = captured["offset"]
+    assert np.array_equal(audio, np.arange(4, 10, dtype=np.float32))
+    assert offset == 0
+    assert np.array_equal(audio[offset:], np.arange(4, 10, dtype=np.float32))
+    assert owner.committed_samples == 0
+
+
+def test_astra_r2_2_rewrite_and_summary_verify_the_target(monkeypatch):
+    import numpy as np
+    import flow
+    f = _flow(monkeypatch)
+    said, pasted, copied = [], [], []
+    f.overlay = types.SimpleNamespace(set=lambda state: said.append(state))
+    monkeypatch.setattr(f, "_safe_paste", lambda *a, **k: pasted.append(a))
+    monkeypatch.setattr(f, "_restore_clip", lambda *a, **k: None)
+    monkeypatch.setattr(flow, "wait_modifiers_up", lambda *a, **k: True)
+    monkeypatch.setattr(flow, "_copy_clipboard", lambda text: copied.append(text) or True)
+    monkeypatch.setattr(flow, "llm_rewrite", lambda *a, **k: "Brief.")
+    hwnd = {"v": 11}
+    monkeypatch.setattr(flow, "foreground_hwnd", lambda: hwnd["v"])
+    calls = {"n": 0}
+
+    def capture():
+        calls["n"] += 1
+        return ("Selected words", "previous", None)
+
+    monkeypatch.setattr(flow, "capture_selection", capture)
+
+    def move(*a, **k):
+        hwnd["v"] = 99
+        return "Brief."
+
+    monkeypatch.setattr(flow, "llm_rewrite", move)
+    assert f._rewrite_selection("be brief", take_hwnd=11) == "Brief."
+    assert calls["n"] == 1
+    assert pasted == []
+    assert copied == ["Brief."]
+    assert ("say", "Rewrite copied — window changed") in said
+
+    hwnd["v"] = 11
+    said.clear()
+    copied.clear()
+    pasted.clear()
+    seq = iter([
+        ("Selected words", "previous", None),
+        ("Different words", "previous", None),
+    ])
+    monkeypatch.setattr(flow, "capture_selection", lambda: next(seq))
+    monkeypatch.setattr(flow, "llm_rewrite", lambda *a, **k: "Brief.")
+    assert f._rewrite_selection("be brief", take_hwnd=11) == "Brief."
+    assert pasted == []
+    assert copied == ["Brief."]
+    assert ("say", "Rewrite copied — selection changed") in said
+
+    monkeypatch.setattr(flow.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(f, "mic_is_deaf", lambda audio: False)
+    monkeypatch.setattr(f, "transcribe_and_store",
+                        lambda *a, **k: ("spoken words here", {}))
+    monkeypatch.setattr(flow, "llm_summarize", lambda *a, **k: "SHORT")
+    monkeypatch.setattr(flow, "foreground_window", lambda: "Editor")
+    monkeypatch.setattr(flow, "_last_input_tick", lambda: 5000)
+    erased = []
+    monkeypatch.setattr(f, "_erase_typed", lambda n: erased.append(n))
+    f.cfg["min_duration_s"] = 0
+    streamer = types.SimpleNamespace(
+        typed_len=4, typed_chars=4, stop=lambda: None,
+        committed_text="", committed_samples=0,
+        saved_clip=None, restore_clipboard=lambda: None)
+    said.clear()
+    pasted.clear()
+    copied.clear()
+    audio = np.ones(32, dtype=np.float32)
+    f.process(audio, streamer=streamer, summary=True, take_hwnd=11, input_tick=1000)
+    assert erased == []
+    assert pasted == []
+    assert "SHORT" in copied
+    assert ("say", "Summary copied") in said
+
+    said.clear()
+    pasted.clear()
+    copied.clear()
+    hwnd["v"] = 99
+    monkeypatch.setattr(flow, "_last_input_tick", lambda: None)
+    f.process(audio, streamer=streamer, summary=True, take_hwnd=11, input_tick=None)
+    assert erased == []
+    assert pasted == []
+    assert "SHORT" in copied
+    assert ("say", "Summary copied — window changed") in said
+
+
+def test_astra_r2_3_alt_ctrl_chord_converts_before_recording_starts(monkeypatch):
+    import flow
+    f = _flow(monkeypatch)
+    f.recording = False
+    f._on_key(_ev("right alt", flow.keyboard.KEY_DOWN))
+    f._on_key(_ev("right ctrl", flow.keyboard.KEY_DOWN))
+    assert f._active_ptt_key == "right ctrl"
+    assert f.recording is False
+    assert f._chord_pending is True
+    f._on_key(_ev("right alt", flow.keyboard.KEY_UP))
+    assert ("up", "command") not in _queued(f)
+    f._on_key(_ev("right ctrl", flow.keyboard.KEY_UP))
+    items = _queued(f)
+    assert items == [("down", "command"), ("rewrite", None), ("up", "dictate")]
+    assert items != [("down", "command"), ("up", "command")]
+    _play_ctrl(f)
+    assert f.recording is False
+    kind, args = f._job_q.get_nowait()
+    assert kind == "dictate"
+    assert args[4] is True
+
+    fresh = _flow(monkeypatch)
+    fresh._enable_rewrite()
+    assert fresh._chord_pending is True
+    fresh.on_press("command")
+    assert fresh.recording is True
+    assert fresh.active_mode == "dictate"
+    assert fresh.rewrite_take is True
+
+    client = _flow(monkeypatch)
+    client.cfg["mode"] = "client"
+    client._on_key(_ev("right alt", flow.keyboard.KEY_DOWN))
+    client._on_key(_ev("right ctrl", flow.keyboard.KEY_DOWN))
+    assert client._active_ptt_key == "right alt"
+    client._on_key(_ev("right alt", flow.keyboard.KEY_UP))
+    client._on_key(_ev("right ctrl", flow.keyboard.KEY_UP))
+    assert _queued(client) == [("down", "command"), ("up", "command")]
+    _play_ctrl(client)
+    assert client.recording is False
+    assert client.rewrite_take is False
+    client._enable_rewrite()
+    assert getattr(client, "_chord_pending", False) is False
+    client.on_press("command")
+    assert client.active_mode == "command"
+    assert client.rewrite_take is False
+
+
+def test_astra_r2_4_remote_stop_cannot_clear_a_local_take(monkeypatch):
+    import flow
+    f = _flow(monkeypatch, recording=True)
+    f.active_mode = "remote"
+    f._mic_held = True
+    assert f._mic_lock.acquire(blocking=False)
+
+    class _Gate:
+        def __init__(self, inner):
+            self.inner = inner
+            self.paused = threading.Event()
+            self.go = threading.Event()
+            self._first = True
+            self._mu = threading.Lock()
+
+        def __enter__(self):
+            self.inner.acquire()
+            with self._mu:
+                pause = self._first
+                self._first = False
+            if pause:
+                self.paused.set()
+                assert self.go.wait(3)
+            return self
+
+        def __exit__(self, *exc):
+            self.inner.release()
+            return False
+
+    gate = _Gate(f._session_lock)
+    f._session_lock = gate
+    errors = []
+
+    def stop():
+        try:
+            errors.append(f.remote_stop())
+        except Exception as exc:
+            errors.append(exc)
+
+    remote = threading.Thread(target=stop)
+    remote.start()
+    assert gate.paused.wait(2)
+    started = threading.Event()
+    done = threading.Event()
+
+    def local():
+        started.set()
+        f._latch_event("down", 1000.0)
+        done.set()
+
+    press = threading.Thread(target=local)
+    press.start()
+    assert started.wait(2)
+    time.sleep(0.05)
+    assert not done.is_set()
+    gate.go.set()
+    remote.join(3)
+    press.join(3)
+    assert not remote.is_alive() and not press.is_alive()
+    assert errors == [""]
+    assert f.recording is True
+    assert f._latch["phase"] == "holding"
+    assert f._latch_owner == "local"
+    f._latch_event("up", 1001.0)
+    assert f.recording is False
+    assert f._mic_held is False
+    assert f._job_q.get_nowait()[0] == "dictate"
+
+    held = _flow(monkeypatch, recording=True)
+    held._latch_owner = "local"
+    held._latch = dict(flow._LATCH_IDLE)
+    held._latch["phase"] = "holding"
+    held._clear_latch()
+    assert held._latch["phase"] == "holding"
+    assert held._latch_owner == "local"
+
+
+def test_astra_r2_5_client_release_keeps_the_second_takes_audio(monkeypatch):
+    """Removed by design: client mode has no latch and no hands-free discard."""
+    import numpy as np
+    import flow
+    assert not hasattr(flow.Flow, "_enter_handsfree")
+    f = _flow(monkeypatch)
+    f.cfg["mode"] = "client"
+    rec = _recorder(monkeypatch)
+    rec._stream = types.SimpleNamespace(active=True)
+    f.recorder = rec
+    f._latch_event("down", 0.0)
+    rec._on_audio(np.ones((100, 1), dtype=np.float32))
+    f._latch_event("up", 0.2)
+    assert f.recording is False
+    assert f.latched is False
+    kind, args = f._job_q.get_nowait()
+    assert kind == "dictate"
+    assert np.array_equal(np.asarray(args[0]), np.ones(100, dtype=np.float32))
+    f._latch_event("down", 0.3)
+    rec._on_audio(np.full((50, 1), 2, dtype=np.float32))
+    f._latch_event("up", 0.5)
+    assert f.recording is False
+    kind, args = f._job_q.get_nowait()
+    assert np.all(np.asarray(args[0]) == 2)
+    assert len(args[0]) == 50
+
+
+def test_astra_r2_6_a_short_ctrl_release_lets_the_next_mode_record(monkeypatch):
+    """Removed by design: there is no sealed gap that swallows the next hold."""
+    import numpy as np
+    import flow
+    f = _flow(monkeypatch)
+    rec = _recorder(monkeypatch)
+    rec._stream = types.SimpleNamespace(active=True)
+    f.recorder = rec
+    f._latch_event("down", 0.0)
+    rec._on_audio(np.ones((40, 1), dtype=np.float32))
+    f._latch_event("up", 0.2)
+    assert f.recording is False
+    first = f._job_q.get_nowait()
+    assert np.all(np.asarray(first[1][0]) == 1)
+    f._on_key(_ev("right alt", flow.keyboard.KEY_DOWN))
+    assert f._ctrl_q.get_nowait() == ("down", "command")
+    f.on_press("command")
+    assert f.recording is True
+    assert f.active_mode == "command"
+    rec._on_audio(np.full((80, 1), 3, dtype=np.float32))
+    f.on_release()
+    assert f.recording is False
+    second = f._job_q.get_nowait()
+    assert second[0] == "command"
+    assert len(second[1][0]) == 80
+    assert np.all(np.asarray(second[1][0]) == 3)
+
+
+def test_astra_r2_7_published_prefix_and_client_remainder_stay_intact(monkeypatch):
+    import numpy as np
+    import flow
+    f = _flow(monkeypatch)
+    worker = flow.StreamWorker(f, live=False)
+    worker._active = True
+    worker.committed_text = "Drop me."
+    worker.note_published(len("Drop me."))
+    worker._commit_phrase("Scratch that.", 10, [])
+    assert worker.committed_text.startswith("Drop me.")
+    assert "Scratch that" not in worker.committed_text
+
+    sent = []
+    monkeypatch.setattr(flow.keyboard, "send", lambda *a, **k: sent.append(a))
+    monkeypatch.setattr(flow.pyperclip, "copy", lambda *a, **k: None)
+    monkeypatch.setattr(flow.time, "sleep", lambda _s: None)
+    streamer = flow.ClientStreamer(f)
+    streamer._active = True
+    streamer.committed = "Keep this."
+    streamer.typed = len("Drop me.")
+    streamer.typed_text = "Drop me."
+    streamer._type_delta()
+    assert sent == []
+
+    f.cfg["mode"] = "client"
+    f.cfg["min_duration_s"] = 0
+    pasted = []
+    monkeypatch.setattr(f, "mic_is_deaf", lambda audio: False)
+    monkeypatch.setattr(f, "_safe_paste", lambda *a, **k: pasted.append(a))
+    streamer.sid = "s"
+    streamer.typed_text = "Drop me."
+    streamer.typed = len("Drop me.")
+    streamer.finish = lambda audio=None: ("Keep this.", streamer.typed)
+    f.process(np.ones(16, dtype=np.float32), streamer=streamer)
+    assert pasted == []
+    assert not any("s." == (p[0] if p else "") for p in pasted)
+
+
+def test_astra_r2_8_halted_client_streamer_does_not_paste(monkeypatch):
+    import flow
+    f = _flow(monkeypatch)
+    f.latched = False
+    sent = []
+    monkeypatch.setattr(flow.keyboard, "send", lambda *a, **k: sent.append(a))
+    monkeypatch.setattr(flow.pyperclip, "copy", lambda *a, **k: None)
+    streamer = flow.ClientStreamer(f)
+    streamer._active = False
+    streamer.committed = "hello"
+    streamer.typed = 0
+    streamer._type_delta()
+    assert sent == []
+    assert streamer.typed == 0
+
+
+def test_astra_r2_9_retained_result_survives_streamer_restore(monkeypatch):
+    import numpy as np
+    import flow
+    f = _flow(monkeypatch)
+    f.cfg["min_duration_s"] = 0
+    copied = []
+    monkeypatch.setattr(flow.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(flow.pyperclip, "copy", lambda text: copied.append(text))
+    monkeypatch.setattr(flow.pyperclip, "paste", lambda: "")
+    monkeypatch.setattr(f, "mic_is_deaf", lambda audio: False)
+    monkeypatch.setattr(f, "transcribe_and_store",
+                        lambda *a, **k: ("be brief", {}))
+    monkeypatch.setattr(flow, "wait_modifiers_up", lambda *a, **k: True)
+    monkeypatch.setattr(flow, "foreground_window", lambda: "Editor")
+    hwnd = {"v": 11}
+    monkeypatch.setattr(flow, "foreground_hwnd", lambda: hwnd["v"])
+    monkeypatch.setattr(flow, "capture_selection",
+                        lambda: ("Selected words", "previous", None))
+
+    def move(*a, **k):
+        hwnd["v"] = 22
+        return "BRIEF REWRITE"
+
+    monkeypatch.setattr(flow, "llm_rewrite", move)
+    said = []
+    f.overlay = types.SimpleNamespace(set=lambda state: said.append(state))
+    worker = flow.StreamWorker(f, live=False)
+    worker.saved_clip = "ORIGINAL CLIPBOARD"
+    worker.stop = lambda: None
+    f.process(np.ones(16, dtype=np.float32), streamer=worker, rewrite=True,
+              take_hwnd=11)
+    assert ("say", "Rewrite copied — window changed") in said
+    assert copied
+    assert copied[-1] == "BRIEF REWRITE"
+    assert "ORIGINAL CLIPBOARD" not in copied
+
+
+def test_astra_r2_10_each_scratch_is_judged_against_the_prefix():
+    import flow
+    src = "Keep. Scratch that. Drop. Scratch that. Continue."
+    out, kept = flow.voice_edit_keeping_screen(src, len("Keep."))
+    assert out == "Keep. Continue."
+    assert out.startswith("Keep.")
+    assert kept == len("Keep.")
+
+
+def test_astra_r2_11_vscode_copy_line_is_not_a_selection(monkeypatch):
+    import flow
+    doc = flow.capture_selection.__doc__ or ""
+    assert "VS Code" in doc
+    assert "known limitation" in doc
+    monkeypatch.setattr(flow, "wait_modifiers_up", lambda *a, **k: True)
+    monkeypatch.setattr(flow.time, "sleep", lambda _s: None)
+    clip = {"v": "previous"}
+    title = {"v": "note.py — Visual Studio Code"}
+
+    def paste():
+        return clip["v"]
+
+    def copy(text):
+        clip["v"] = text
+
+    def send(keys):
+        if keys == "ctrl+c":
+            clip["v"] = copied["v"]
+
+    copied = {"v": "the line\n"}
+    monkeypatch.setattr(flow.pyperclip, "paste", paste)
+    monkeypatch.setattr(flow.pyperclip, "copy", copy)
+    monkeypatch.setattr(flow.keyboard, "send", send)
+    monkeypatch.setattr(flow, "foreground_window", lambda: title["v"])
+    text, _saved, problem = flow.capture_selection()
+    assert text is None and problem == "nosel"
+
+    copied["v"] = "the line\n"
+    clip["v"] = "previous"
+    title["v"] = "note.txt - Notepad"
+    text, _saved, problem = flow.capture_selection()
+    assert problem is None and text == "the line\n"
+
+    copied["v"] = "the line"
+    clip["v"] = "previous"
+    title["v"] = "note.py — Visual Studio Code"
+    text, _saved, problem = flow.capture_selection()
+    assert problem is None and text == "the line"
+
+    copied["v"] = "one\ntwo\n"
+    clip["v"] = "previous"
+    text, _saved, problem = flow.capture_selection()
+    assert problem is None and text == "one\ntwo\n"
+
+
+def test_astra_r2_12_short_release_does_not_wait_for_a_gap(monkeypatch):
+    """Removed by design: an ordinary short tap is processed at key-up."""
+    import flow
+    assert not hasattr(flow.Flow, "_poll_latch")
+    f = _flow(monkeypatch)
+    slept = []
+    monkeypatch.setattr(flow.time, "sleep", lambda s: slept.append(s))
+    started = time.monotonic()
+    f._latch_event("down", 0.0)
+    f._latch_event("up", 0.2)
+    assert time.monotonic() - started < 0.15
+    assert slept == []
+    assert f.recording is False
+    assert f._job_q.get_nowait()[0] == "dictate"
+    f._latch_event("tick", 0.2 + flow._LATCH_GAP_S)
+    assert f._job_q.empty()
