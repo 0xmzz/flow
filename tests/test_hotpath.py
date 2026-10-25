@@ -30,6 +30,7 @@ def _bare(monkeypatch):
     }
     f._pressed_keys = set()
     f._active_ptt_key = None
+    f._take_key = None
     f._key_lock = threading.Lock()
     f._key_seen_at = {}
     f._os_up_streak = 0

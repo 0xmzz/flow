@@ -1212,19 +1212,29 @@ class StreamWorker:
             print(f"[stream] live type failed: {e}")
 
     def _paste_screen(self, text):
-        """Paste text that is already in screen form (replacements applied)."""
+        """Paste text that is already in screen form (replacements applied).
+
+        The copy goes through the shared clipboard writer so a delayed
+        restore from an older take sees the generation move and does nothing.
+        """
         if not text:
             return
-        pyperclip.copy(text)
+        if not _copy_clipboard(text):
+            raise RuntimeError("clipboard copy failed")
         time.sleep(0.02)
         keyboard.send("ctrl+v")
 
-    def restore_clipboard(self):
-        if self.saved_clip is not None:
-            try:
-                pyperclip.copy(self.saved_clip)
-            except Exception:
-                pass
+    def restore_clipboard(self, expect_gen=None):
+        """Put the user's clipboard back unless a newer Flow write owns it.
+
+        `expect_gen` is the generation when this restore was armed. A live
+        paste, or any other Flow clipboard write since then, makes this a
+        no-op instead of overwriting that payload.
+        """
+        if self.saved_clip is None:
+            return
+        wrote = _copy_clipboard(self.saved_clip, expect_gen=expect_gen)
+        if wrote:
             self.saved_clip = None
 
 
@@ -1301,7 +1311,8 @@ class ClientStreamer:
         if not chunk:
             return
         try:
-            pyperclip.copy(chunk)
+            if not _copy_clipboard(chunk):
+                raise RuntimeError("clipboard copy failed")
             time.sleep(0.02)
             keyboard.send("ctrl+v")  # user is already holding ctrl — paste is safe
             self.typed = len(self.committed)
@@ -1346,12 +1357,11 @@ class ClientStreamer:
             print(f"[client-stream] finish failed: {e}")
             return None, self.typed
 
-    def restore_clipboard(self):
-        if self.saved_clip is not None:
-            try:
-                pyperclip.copy(self.saved_clip)
-            except Exception:
-                pass
+    def restore_clipboard(self, expect_gen=None):
+        """See StreamWorker.restore_clipboard. A stale generation does not copy."""
+        if self.saved_clip is None:
+            return
+        _copy_clipboard(self.saved_clip, expect_gen=expect_gen)
 
 
 def describe_target(window):
@@ -2237,6 +2247,7 @@ class Flow:
         self.streamer = None
         self._pressed_keys = set()
         self._active_ptt_key = None
+        self._take_key = None  # key that owns the open take; its up may end it
         # Hook thread and the ctrl-loop watchdog both touch these. The lock is
         # held only for the set update — _on_key must stay non-blocking.
         self._key_lock = threading.Lock()
@@ -2800,6 +2811,7 @@ class Flow:
         current = None
         with self._session_lock:
             if not self.recording:
+                self._take_key = None
                 return
             if self.active_mode == "remote":
                 return  # remote session owns the recorder; the hotkey must not hijack it
@@ -2809,6 +2821,7 @@ class Flow:
             hwnd = getattr(self, "_take_hwnd", 0) or 0
             self.recording = False
             self._record_started_at = None
+            self._take_key = None
             self.latched = False
             self._latched_shown = None
             self._latch_pending = None
@@ -3093,72 +3106,6 @@ class Flow:
             "tick": _last_input_tick(),
         }
 
-    def _rewrite_target_holds(self, captured):
-        """True when the captured selection is still the paste target.
-
-        All of these have to hold: same foreground HWND, same focused-control
-        HWND, and GetLastInputInfo shows no user input since the post-Ctrl+C
-        stamp. A missing hwnd, focus or tick does not establish ownership.
-
-        This runs before the verifying Ctrl+C, so that injection is not
-        counted as user input. The read after the verification wait is
-        `_rewrite_verified`.
-
-        Residual risk: the same characters in the same control cannot be
-        told apart from the original range when the input tick does not move.
-        """
-        captured = captured or {}
-        now_hwnd = int(foreground_hwnd() or 0)
-        cap_hwnd = int(captured.get("hwnd") or 0)
-        now_focus = int(focused_control_hwnd() or 0)
-        cap_focus = int(captured.get("focus") or 0)
-        cap_tick = captured.get("tick")
-        now_tick = _last_input_tick()
-        if not cap_hwnd or not now_hwnd or now_hwnd != cap_hwnd:
-            return False
-        if not cap_focus or not now_focus or now_focus != cap_focus:
-            return False
-        if cap_tick is None or now_tick is None:
-            return False
-        if _tick_newer(now_tick, cap_tick):
-            return False
-        return True
-
-    def _rewrite_verified(self, captured, selection, again_text):
-        """Re-read ownership after the verification wait, before Ctrl+V.
-
-        Foreground HWND, focused-control HWND and the re-copied text are
-        compared to the target captured at release. GetLastInputInfo is
-        read now, after the wait. The verifying Ctrl+C is Flow's: its tick
-        was stamped before the wait, and that stamp is the one this tick
-        may match. Anything newer is user input during the wait. A mocked
-        capture leaves no stamp, so the release-time tick is used instead.
-        """
-        captured = captured or {}
-        now_hwnd = int(foreground_hwnd() or 0)
-        now_focus = int(focused_control_hwnd() or 0)
-        now_tick = _last_input_tick()
-        cap_hwnd = int(captured.get("hwnd") or 0)
-        cap_focus = int(captured.get("focus") or 0)
-        if again_text != selection:
-            return False
-        if not cap_hwnd or now_hwnd != cap_hwnd:
-            return False
-        if not cap_focus or now_focus != cap_focus:
-            return False
-        verify = getattr(capture_selection, "context", None)
-        if isinstance(verify, dict) and verify.get("tick") is not None:
-            if int(verify.get("hwnd") or 0) != cap_hwnd:
-                return False
-            if int(verify.get("focus") or 0) != cap_focus:
-                return False
-            allowed = verify.get("tick")
-        else:
-            allowed = captured.get("tick")
-        if allowed is None or now_tick is None or _tick_newer(now_tick, allowed):
-            return False
-        return True
-
     def _bind_rewrite_target(self):
         """Capture the rewrite target before transcription.
 
@@ -3193,114 +3140,68 @@ class Flow:
 
     def _rewrite_selection(self, instruction, take_hwnd=0, retain=None,
                            target=None):
-        """Paste a rewrite over the selection. None when nothing was pasted.
+        """Leave a rewrite on the clipboard. Never inserts it.
 
-        No selection and an LLM failure both leave the document alone. The
-        clipboard is restored either way; a successful paste restores after
-        ctrl+v has had a moment to read it. Ctrl, alt and shift must be up
-        before the copy and again before the paste.
+        The selection is the sentinel copy taken at release, before
+        transcription, when `target` is passed. Direct callers capture
+        here. Success leaves the rewritten text on the clipboard and the
+        overlay tells the user to press Ctrl+V. There is no ctrl+v and no
+        delayed restore. The user pastes, so `take_hwnd` is not checked.
 
-        `target`, when passed, is the selection captured at release before
-        transcription. Otherwise this captures now (direct callers). Paste
-        only if, immediately before Ctrl+V, the current foreground HWND,
-        the current focused control, the input tick after the verification
-        wait, and the re-copied text all still match that target. Otherwise
-        the result is copied and the overlay says the selection changed.
-        `retain`, when passed, collects that copied text for this job only.
-
-        Residual risk: identical text in the same control, with no input
-        tick, is not a separate range we can see.
+        No selection, an LLM failure, a modifier timeout, or any exception
+        after that capture puts the user's clipboard back and shows the
+        existing message. `retain`, when passed, collects the copied text
+        so this job does not restore a streamer's clipboard over it.
         """
-        if target is None:
-            got = capture_selection()
-            if len(got) == 2:
-                selection, saved = got
-                problem = None if selection else "nosel"
-            else:
-                selection, saved, problem = got
-            captured = self._rewrite_captured_target()
-            if problem == "modifiers":
+        saved = None
+        restore = False
+        try:
+            if target is None:
+                target, abort = self._bind_rewrite_target()
+                if abort or not target:
+                    return None
+            selection = target.get("text")
+            saved = target.get("saved")
+            restore = True
+            if not selection:
+                if self.overlay:
+                    self.overlay.set(("say", "Select text first"))
+                return None
+            if self.overlay:
+                self.overlay.set(("work", "Rewriting selection…"))
+            try:
+                rewritten = llm_rewrite(instruction, selection, self.cfg)
+            except Exception:
+                rewritten = None
+                if self.overlay:
+                    self.overlay.set((
+                        "say", "Rewrite failed — selection left unchanged"))
+                raise
+            if not rewritten:
+                if self.overlay:
+                    self.overlay.set((
+                        "say", "Rewrite failed — selection left unchanged"))
+                return None
+            if not wait_modifiers_up():
                 if self.overlay:
                     self.overlay.set((
                         "say",
                         "Let go of Ctrl, Alt and Shift — rewrite cancelled"))
-                self._restore_clip(saved)
                 return None
-            if not selection:
+            if not self._copy_kept_result(rewritten, retain):
                 if self.overlay:
-                    self.overlay.set(("say", "Select text first"))
-                self._restore_clip(saved)
+                    self.overlay.set((
+                        "say", "Rewrite failed — selection left unchanged"))
                 return None
-        else:
-            selection = target.get("text")
-            saved = target.get("saved")
-            captured = target
-            if not selection:
-                if self.overlay:
-                    self.overlay.set(("say", "Select text first"))
+            restore = False
+            print("[rewrite] copied; user pastes with ctrl+v")
+            if self.overlay:
+                self.overlay.set((
+                    "say", "Rewritten — press Ctrl+V to replace"))
+            return rewritten
+        finally:
+            if restore:
                 self._restore_clip(saved)
-                return None
-        if self.overlay:
-            self.overlay.set(("work", "Rewriting selection…"))
-        rewritten = llm_rewrite(instruction, selection, self.cfg)
-        if not rewritten:
-            if self.overlay:
-                self.overlay.set((
-                    "say", "Rewrite failed — selection left unchanged"))
-            self._restore_clip(saved)
-            return None
-        if not wait_modifiers_up():
-            if self.overlay:
-                self.overlay.set((
-                    "say",
-                    "Let go of Ctrl, Alt and Shift — rewrite cancelled"))
-            self._restore_clip(saved)
-            return None
-        now = foreground_hwnd()
-        if take_hwnd and now and now != take_hwnd:
-            self._copy_kept_result(rewritten, retain)
-            print("[rewrite] window changed; copied instead of pasting")
-            if self.overlay:
-                self.overlay.set(("say", "Rewrite copied — window changed"))
-            return rewritten
-        # Input stamp before the verifying Ctrl+C. That injection is ours.
-        if not self._rewrite_target_holds(captured):
-            self._copy_kept_result(rewritten, retain)
-            print("[rewrite] selection changed; copied instead of pasting")
-            if self.overlay:
-                self.overlay.set(("say", "Rewrite copied — selection changed"))
-            return rewritten
-        again = capture_selection()
-        if len(again) == 2:
-            again_text, _again_saved = again
-            again_problem = None if again_text else "nosel"
-        else:
-            again_text, _again_saved, again_problem = again
-        if again_problem == "modifiers":
-            if self.overlay:
-                self.overlay.set((
-                    "say",
-                    "Let go of Ctrl, Alt and Shift — rewrite cancelled"))
-            self._restore_clip(saved)
-            return None
-        now = foreground_hwnd()
-        if take_hwnd and now and now != take_hwnd:
-            self._copy_kept_result(rewritten, retain)
-            print("[rewrite] window changed; copied instead of pasting")
-            if self.overlay:
-                self.overlay.set(("say", "Rewrite copied — window changed"))
-            return rewritten
-        # After the verification wait. Current hwnd, focus and input, plus
-        # the re-copied text, against the target captured at release.
-        if not self._rewrite_verified(captured, selection, again_text):
-            self._copy_kept_result(rewritten, retain)
-            print("[rewrite] selection changed; copied instead of pasting")
-            if self.overlay:
-                self.overlay.set(("say", "Rewrite copied — selection changed"))
-            return rewritten
-        self._safe_paste(rewritten, "clipboard", restore=False)
-        self._restore_clip(saved, delay=0.6)
-        return rewritten
 
     def _apply_voice_edit(self, text, live_typed):
         """Scratch-that on text that is not already on screen.
@@ -3345,6 +3246,9 @@ class Flow:
                 # This job only. Cleared by falling out of process(); nothing
                 # on self remembers a clipboard decision for the next take.
                 retain_clip = False
+                # Clipboard saved by a rewrite capture. The finally puts it
+                # back unless the rewritten text was left for the user.
+                rewrite_saved = None
                 # Inside the try: whatever fails from here on, the finally
                 # stops the "Transcribing… (Ns)" ticker.
                 self.set_icon("work")
@@ -3370,8 +3274,12 @@ class Flow:
                             self._safe_paste(remainder, "clipboard",
                                              restore=typed == 0)
                         if typed:
+                            gen = _clipboard_generation()
                             time.sleep(0.3)
-                            streamer.restore_clipboard()
+                            try:
+                                streamer.restore_clipboard(gen)
+                            except TypeError:
+                                streamer.restore_clipboard()
                     else:
                         text = self.client_transcribe(audio, "/transcribe")
                         self._remember(text)
@@ -3394,12 +3302,14 @@ class Flow:
                     committed = (streamer.committed_text, streamer.committed_samples)
                 else:
                     committed = ("", 0)
-                # Bind before transcription. Selecting other text while ASR
-                # runs must not become the range we paste over.
+                # Sentinel-copy the selection before ASR. A later failure
+                # restores this clipboard from the finally below.
                 rewrite_target = None
                 rewrite_abort = None
                 if rewrite:
                     rewrite_target, rewrite_abort = self._bind_rewrite_target()
+                    if rewrite_target is not None and not rewrite_abort:
+                        rewrite_saved = rewrite_target.get("saved")
                 text, meta = self.transcribe_and_store(
                     audio, source="pc-hotkey", window=foreground_window(),
                     committed=committed, skip_cleanup=live_typed > 0,
@@ -3414,11 +3324,12 @@ class Flow:
                         text = ""
                         live_typed = 0
                     elif not text:
-                        self._restore_clip(rewrite_target.get("saved"))
                         self._remember("")
                         live_typed = 0
                     else:
                         kept = []
+                        # _rewrite_selection restores on its own failure.
+                        rewrite_saved = None
                         out = self._rewrite_selection(
                             text, take_hwnd, kept, rewrite_target)
                         retain_clip = bool(kept)
@@ -3426,7 +3337,7 @@ class Flow:
                         pending = (meta or {}).get("pending")
                         if pending and out:
                             pending["cleaned"] = out
-                        # The rewrite paste already happened, or nothing was
+                        # The rewrite is on the clipboard, or nothing was
                         # selected. Don't also paste the spoken instruction.
                         text = ""
                         live_typed = 0
@@ -3516,7 +3427,13 @@ class Flow:
             finally:
                 stop.set()
                 watcher.join(timeout=1.0)
+                if rewrite_saved is not None:
+                    self._restore_clip(rewrite_saved)
+                    rewrite_saved = None
                 if streamer:
+                    # Armed before the wait. A newer Flow write during it,
+                    # including the next take's live paste, makes this a no-op.
+                    gen = _clipboard_generation()
                     time.sleep(0.3)
                     if retain_clip:
                         # This job left its result on the clipboard. Drop the
@@ -3526,7 +3443,10 @@ class Flow:
                     else:
                         restore = getattr(streamer, "restore_clipboard", None)
                         if restore:
-                            restore()
+                            try:
+                                restore(gen)
+                            except TypeError:
+                                restore()
                 self.restore_base_state()
 
     def process_command(self, audio):
@@ -3788,8 +3708,12 @@ class Flow:
                 if self.cfg["streaming"]["enabled"]:
                     # Host-side streaming for the VM bridge: commits accumulate
                     # while the key is held; the daemon polls /record/partial and
-                    # types committed deltas live.
-                    self.remote_streamer = StreamWorker(self, live=False)
+                    # types committed deltas live. voice_edits is off, same as
+                    # StreamSession: the VM has already typed the published
+                    # prefix, and a scratch edit would make its delta corrupt
+                    # ("Drop me." + "s."). Local hands-free keeps edits.
+                    self.remote_streamer = StreamWorker(
+                        self, live=False, voice_edits=False)
                     self.remote_streamer._gen = take_gen
                     self.remote_streamer.start()
                 # Orphan guard: if the client dies mid-recording, don't record forever.
@@ -3923,9 +3847,19 @@ class Flow:
                     self._os_up_streak = 0
                     missed_up = True
             self._pressed_keys.add(name)
-            if self._active_ptt_key is None:
+            owner = getattr(self, "_take_key", None)
+            # A key that does not own the open take cannot adopt it. Its up
+            # then has nothing to release. Right alt during a latched summary,
+            # or a customized command key during a latch, stays a rejected
+            # secondary press.
+            if self._active_ptt_key is None and owner not in (None, name):
+                pass
+            elif self._active_ptt_key is None:
                 self._active_ptt_key = name
                 self._os_up_streak = 0
+                if not (getattr(self, "recording", False)
+                        or getattr(self, "latched", False)):
+                    self._take_key = name
                 start = True
         if missed_up:
             print(f"[hotkey] {name!r} down {gap:.1f}s after the last event; "
@@ -3946,7 +3880,11 @@ class Flow:
             if name == self._active_ptt_key:
                 self._active_ptt_key = None
                 self._os_up_streak = 0
-                release = True
+                # Only the key that owns the take. A rejected secondary press
+                # that managed to sit in _active_ptt_key must not end it.
+                owner = getattr(self, "_take_key", None)
+                if owner in (None, name):
+                    release = True
         if release:
             self._stamp_ptt(time.monotonic())
             self._ctrl_q.put(("up", mode))
